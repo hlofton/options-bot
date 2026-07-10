@@ -58,19 +58,55 @@ const TRADIER = {
 };
 
 // ── PORTFOLIO ────────────────────────────────────────────────
+// ── PORTFOLIO — Last updated July 10, 2026 ───────────────────
 const PORTFOLIO = [
-  { ticker:"OKLO", name:"Oklo Inc",                shares:150,  avgCost:68.38,  stopLoss:55.00,  target:91.36,   sector:"Nuclear",      ivProfile:"high",   optionable:true,  earningsDate:"2026-08-12" },
-  { ticker:"LLY",  name:"Eli Lilly",               shares:4.02, avgCost:987.00, stopLoss:880.00, target:1203.90, sector:"Pharma",       ivProfile:"medium", optionable:true,  earningsDate:"2026-08-06" },
-  { ticker:"PLTR", name:"Palantir",                shares:13,   avgCost:135.00, stopLoss:105.00, target:160.00,  sector:"AI/Gov",       ivProfile:"medium", optionable:true,  earningsDate:"2026-08-04" },
-  { ticker:"SPOK", name:"Spok Holdings",           shares:23.64,avgCost:13.00,  stopLoss:10.00,  target:14.00,   sector:"Healthcare",   ivProfile:"low",    optionable:true,  earningsDate:"2026-07-29" },
-  { ticker:"XLE",  name:"Energy SPDR ETF",         shares:16.37,avgCost:59.45,  stopLoss:52.00,  target:65.00,   sector:"Energy",       ivProfile:"medium", optionable:true,  earningsDate:null },
-  { ticker:"CMBT", name:"CMB.Tech NV",             shares:119.81,avgCost:119.00,stopLoss:95.00,  target:145.00,  sector:"Shipping",     ivProfile:"low",    optionable:false, earningsDate:null },
-  { ticker:"NOW",  name:"ServiceNow",              shares:0,    avgCost:89.05,  stopLoss:70.00,  target:184.13,  sector:"SaaS",         ivProfile:"medium", optionable:true,  earningsDate:"2026-07-29" },
-  { ticker:"NVDA", name:"Nvidia",                  shares:0,    avgCost:198.00, stopLoss:160.00, target:236.54,  sector:"AI/Semis",     ivProfile:"high",   optionable:true,  earningsDate:"2026-08-20" },
-  { ticker:"TSLA", name:"Tesla",                   shares:0,    avgCost:375.53, stopLoss:310.00, target:440.00,  sector:"EV/Tech",      ivProfile:"high",   optionable:true,  earningsDate:"2026-07-22" },
-  { ticker:"MSFT", name:"Microsoft",               shares:0,    avgCost:365.44, stopLoss:320.00, target:430.00,  sector:"Cloud/AI",     ivProfile:"high",   optionable:true,  earningsDate:"2026-07-28" },
-  { ticker:"AMD",  name:"Advanced Micro Devices",  shares:0,    avgCost:120.00, stopLoss:96.00,  target:160.00,  sector:"Semis",        ivProfile:"high",   optionable:true,  earningsDate:"2026-07-28" },
-  { ticker:"AAPL", name:"Apple Inc",               shares:0,    avgCost:298.01, stopLoss:262.00, target:317.40,  sector:"Consumer",     ivProfile:"medium", optionable:true,  earningsDate:"2026-07-31" },
+  // Price: $48.27 | Avg: $68.38 | Down 29% — below old stop
+  // Stop lowered to $42 (below 52wk low $44.88) | Target: analyst consensus $88
+  { ticker:"OKLO", name:"Oklo Inc",                shares:150,   avgCost:68.38,  stopLoss:42.00,  target:88.00,   sector:"Nuclear",      ivProfile:"high",   optionable:true,  earningsDate:"2026-08-12" },
+
+  // Price: ~$985 | Avg: $987 | Flat — holding
+  // Stop: $880 | Target: $1,203 — unchanged
+  { ticker:"LLY",  name:"Eli Lilly",               shares:4.02,  avgCost:987.00, stopLoss:880.00, target:1203.00, sector:"Pharma",       ivProfile:"medium", optionable:true,  earningsDate:"2026-08-06" },
+
+  // Price: $128.61-132.88 | Avg: $135 | Down 27% YTD
+  // Stop: $105 | Target: $183 (analyst consensus — updated from $160)
+  { ticker:"PLTR", name:"Palantir",                shares:13,    avgCost:135.00, stopLoss:105.00, target:183.00,  sector:"AI/Gov",       ivProfile:"medium", optionable:true,  earningsDate:"2026-08-04" },
+
+  // Price: ~$13.77 | Avg: $13.00 | Small gain
+  // Stop: $11 (raised) | Target: $16 (raised)
+  { ticker:"SPOK", name:"Spok Holdings",           shares:23.64, avgCost:13.00,  stopLoss:11.00,  target:16.00,   sector:"Healthcare",   ivProfile:"low",    optionable:true,  earningsDate:"2026-07-29" },
+
+  // Price: ~$59.45 | Avg: $59.45 | Flat
+  // Stop: $52 | Target: $65 — unchanged
+  { ticker:"XLE",  name:"Energy SPDR ETF",         shares:16.37, avgCost:59.45,  stopLoss:52.00,  target:65.00,   sector:"Energy",       ivProfile:"medium", optionable:true,  earningsDate:null },
+
+  // Price: ~$119 | Avg: $119 | Flat — no options chain
+  // Stop: $95 | Target: $145 — unchanged
+  { ticker:"CMBT", name:"CMB.Tech NV",             shares:119.81,avgCost:119.00, stopLoss:95.00,  target:145.00,  sector:"Shipping",     ivProfile:"low",    optionable:false, earningsDate:null },
+
+  // Price: $89.05 | Avg: $89.05 | Flat — 107% analyst upside
+  // Stop: $72 (raised) | Target: $184 (analyst consensus)
+  { ticker:"NOW",  name:"ServiceNow",              shares:0,     avgCost:89.05,  stopLoss:72.00,  target:184.00,  sector:"SaaS",         ivProfile:"medium", optionable:true,  earningsDate:"2026-07-29" },
+
+  // Price: $209.14 (+3.1% today) | Avg: $198 | Profitable
+  // Stop: $175 (trailing up from $160) | Target: $236 (52wk high)
+  { ticker:"NVDA", name:"Nvidia",                  shares:0,     avgCost:198.00, stopLoss:175.00, target:236.00,  sector:"AI/Semis",     ivProfile:"high",   optionable:true,  earningsDate:"2026-08-20" },
+
+  // Price: ~$375 | Avg: $375.53 | Flat — earnings Jul 22
+  // Stop: $320 | Target: $440 — unchanged
+  { ticker:"TSLA", name:"Tesla",                   shares:0,     avgCost:375.53, stopLoss:320.00, target:440.00,  sector:"EV/Tech",      ivProfile:"high",   optionable:true,  earningsDate:"2026-07-22" },
+
+  // Price: $388.84 | Avg: $365.44 | Up 6.4% — profitable
+  // Stop: $350 (trailing up from $320) | Target: $430
+  { ticker:"MSFT", name:"Microsoft",               shares:0,     avgCost:365.44, stopLoss:350.00, target:430.00,  sector:"Cloud/AI",     ivProfile:"high",   optionable:true,  earningsDate:"2026-07-28" },
+
+  // Price: $546.72 (+141.6% YTD) | OLD target $160 was completely wrong
+  // RESET: new avgCost=$546.72, stop=$480, target=$650, bull=$750
+  { ticker:"AMD",  name:"Advanced Micro Devices",  shares:0,     avgCost:546.72, stopLoss:480.00, target:650.00,  sector:"Semis",        ivProfile:"high",   optionable:true,  earningsDate:"2026-07-28" },
+
+  // Price: $298.01 | Avg: $298.01 | At cost — 52wk high $317.40
+  // Stop: $265 (raised from $262) | Target: $317 (52wk high)
+  { ticker:"AAPL", name:"Apple Inc",               shares:0,     avgCost:298.01, stopLoss:265.00, target:317.00,  sector:"Consumer",     ivProfile:"medium", optionable:true,  earningsDate:"2026-07-31" },
 ];
 
 const EARNINGS = {
@@ -921,4 +957,3 @@ Schedule: 9AM execute | 20min monitor | 4PM close`
 
 // Run initial check
 await intradayCheck();
-// Pushover v2 - Fri Jul 10 12:12:31 EDT 2026
