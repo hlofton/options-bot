@@ -118,12 +118,14 @@ const EARNINGS = {
 
 // ── STATE ─────────────────────────────────────────────────────
 const state = {
-  openPositions:    [],   // active options trades
-  dailyTrades:      [],   // trades placed today
-  alertsSent:       new Set(),
-  priceCache:       {},
-  dailyPnL:         0,
+  openPositions:      [],   // active options trades
+  dailyTrades:        [],   // trades placed today
+  alertsSent:         new Set(),
+  priceCache:         {},
+  dailyPnL:           0,
   totalDeployedToday: 0,
+  dynamicLevels:      {},   // auto-updated stops + targets per ticker
+  weeklyHighs:        {},   // highest price seen this week per ticker
 };
 
 // ── CLIENTS ──────────────────────────────────────────────────
@@ -132,6 +134,45 @@ const PUSHOVER = {
   user:  process.env.PUSHOVER_USER_KEY  || "u3h5z2iissjoagim6uu142zersmqre",
   token: process.env.PUSHOVER_API_TOKEN || "au8xzb8irkcdw1udkt7qk2htdxz5yw",
 };
+
+
+// ── DYNAMIC LEVEL HELPERS ──────────────────────────────────────
+// Returns the current effective stop-loss for a ticker
+// Uses dynamic level if set, otherwise falls back to portfolio config
+function getStopLoss(ticker, staticStop) {
+  return state.dynamicLevels[ticker]?.stopLoss ?? staticStop;
+}
+function getTarget(ticker, staticTarget) {
+  return state.dynamicLevels[ticker]?.target ?? staticTarget;
+}
+
+// ── TRAILING STOP LOGIC ───────────────────────────────────────
+// Called every intraday check — trails stop up if price moved higher
+function updateTrailingStop(ticker, currentPrice, staticStop, trailPct = 12) {
+  const weekHigh = state.weeklyHighs[ticker] || currentPrice;
+
+  // Update weekly high
+  if (currentPrice > weekHigh) {
+    state.weeklyHighs[ticker] = currentPrice;
+  }
+
+  const currentStop = getStopLoss(ticker, staticStop);
+  // New trailing stop = current price minus trail percentage
+  const newTrailingStop = parseFloat((currentPrice * (1 - trailPct / 100)).toFixed(2));
+
+  // Only move stop UP, never down
+  if (newTrailingStop > currentStop) {
+    const oldStop = currentStop;
+    state.dynamicLevels[ticker] = {
+      ...(state.dynamicLevels[ticker] || {}),
+      stopLoss:    newTrailingStop,
+      lastUpdated: new Date().toISOString(),
+    };
+    console.log(`  📈 ${ticker} trailing stop updated: $${oldStop} → $${newTrailingStop.toFixed(2)} (price: $${currentPrice})`);
+    return { updated: true, oldStop, newStop: newTrailingStop };
+  }
+  return { updated: false };
+}
 
 // ═══════════════════════════════════════════════════════════════
 // TRADIER API — OPTIONS EXECUTION ENGINE
@@ -705,13 +746,22 @@ function detectAlerts(stock, priceData) {
   const alerts = [];
   const price  = priceData.price;
 
-  if (stock.stopLoss && price <= stock.stopLoss) {
-    alerts.push({ type:"STOP_LOSS", urgency:"🚨 CRITICAL", msg:`$${price.toFixed(2)} hit stop-loss $${stock.stopLoss}. Exit or hedge immediately.` });
-  } else if (stock.stopLoss && price <= stock.stopLoss * 1.05) {
-    alerts.push({ type:"STOP_WARNING", urgency:"⚠️ WARNING", msg:`$${price.toFixed(2)} within 5% of stop-loss $${stock.stopLoss}.` });
+  // Use dynamic levels if available, fall back to static config
+  const effectiveStop   = getStopLoss(stock.ticker, stock.stopLoss);
+  const effectiveTarget = getTarget(stock.ticker, stock.target);
+
+  // Update trailing stop on every check
+  if (stock.optionable && price && effectiveStop) {
+    updateTrailingStop(stock.ticker, price, effectiveStop);
   }
-  if (stock.target && price >= stock.target) {
-    alerts.push({ type:"TARGET_HIT", urgency:"🎯 TARGET", msg:`$${price.toFixed(2)} reached target $${stock.target}. Consider selling covered calls.` });
+
+  if (effectiveStop && price <= effectiveStop) {
+    alerts.push({ type:"STOP_LOSS", urgency:"🚨 CRITICAL", msg:`$${price.toFixed(2)} hit stop-loss $${effectiveStop}. Exit or hedge immediately.` });
+  } else if (effectiveStop && price <= effectiveStop * 1.05) {
+    alerts.push({ type:"STOP_WARNING", urgency:"⚠️ WARNING", msg:`$${price.toFixed(2)} within 5% of stop-loss $${effectiveStop.toFixed(2)}.` });
+  }
+  if (effectiveTarget && price >= effectiveTarget) {
+    alerts.push({ type:"TARGET_HIT", urgency:"🎯 TARGET", msg:`$${price.toFixed(2)} reached target $${effectiveTarget}. Consider selling covered calls or trimming.` });
   }
   const absPct = Math.abs(priceData.changePct || 0);
   if (absPct >= 6) {
@@ -917,6 +967,120 @@ Not financial advice.`
   console.log("  ✅ Closing summary sent.");
 }
 
+
+// ═══════════════════════════════════════════════════════════════
+// AUTO PRICING — WEEKLY ANALYST TARGET UPDATE + SUNDAY SUMMARY
+// ═══════════════════════════════════════════════════════════════
+
+async function updateAnalystTargets() {
+  console.log("\n📊 Updating analyst targets via AI + web search...");
+
+  const tickers = PORTFOLIO.filter(p => p.optionable).map(p => p.ticker);
+
+  const prompt = `Search the web for current analyst price targets for these stocks as of today:
+${tickers.join(", ")}
+
+For each ticker find the consensus 12-month analyst price target from sources like Yahoo Finance, Stockanalysis.com, or MarketBeat.
+
+Return ONLY a JSON array, no markdown:
+[{"ticker":"NVDA","analystTarget":245,"source":"Yahoo Finance consensus","numAnalysts":42},...]
+
+If you cannot find data for a ticker, omit it from the array.`;
+
+  try {
+    const res = await fetch("https://api.anthropic.com/v1/messages", {
+      method:  "POST",
+      headers: { "Content-Type": "application/json" },
+      body:    JSON.stringify({
+        model:      "claude-sonnet-4-20250514",
+        max_tokens: 1500,
+        tools:      [{ type: "web_search_20250305", name: "web_search" }],
+        messages:   [{ role: "user", content: prompt }],
+      }),
+    });
+    const data  = await res.json();
+    const text  = data.content?.filter(b => b.type === "text").map(b => b.text || "").join("").trim();
+    const match = text.match(/\[[\s\S]*\]/);
+    if (!match) throw new Error("No JSON in response");
+
+    const targets = JSON.parse(match[0]);
+    let updatedCount = 0;
+
+    for (const t of targets) {
+      if (!t.ticker || !t.analystTarget) continue;
+      const stock = PORTFOLIO.find(p => p.ticker === t.ticker);
+      if (!stock) continue;
+
+      const currentTarget = getTarget(t.ticker, stock.target);
+      // Only update target if analyst consensus is meaningfully different (>5%)
+      if (Math.abs(t.analystTarget - currentTarget) / currentTarget > 0.05) {
+        state.dynamicLevels[t.ticker] = {
+          ...(state.dynamicLevels[t.ticker] || {}),
+          target:      t.analystTarget,
+          targetSource: t.source,
+          lastUpdated: new Date().toISOString(),
+        };
+        console.log(`  ✓ ${t.ticker} target updated: $${currentTarget} → $${t.analystTarget} (${t.source})`);
+        updatedCount++;
+      }
+    }
+    console.log(`  ✅ Analyst targets updated: ${updatedCount} changed`);
+    return targets;
+  } catch(e) {
+    console.error(`  ✗ Analyst target update failed: ${e.message}`);
+    return [];
+  }
+}
+
+async function sundaySummary() {
+  console.log("\n📋 Running Sunday portfolio review...");
+
+  // First update analyst targets
+  const targets = await updateAnalystTargets();
+
+  // Fetch current prices
+  const portfolioData = await fetchAllPrices();
+
+  // Build summary of all positions with dynamic levels
+  const positionLines = portfolioData.map(p => {
+    const effectiveStop   = getStopLoss(p.ticker, p.stopLoss);
+    const effectiveTarget = getTarget(p.ticker, p.target);
+    const price           = p.price || 0;
+    const pnlPct          = p.avgCost ? (((price - p.avgCost) / p.avgCost) * 100).toFixed(1) : "N/A";
+    const pnlSign         = parseFloat(pnlPct) >= 0 ? "+" : "";
+    const distToStop      = effectiveStop ? (((price - effectiveStop) / price) * 100).toFixed(1) : "N/A";
+    const distToTarget    = effectiveTarget ? (((effectiveTarget - price) / price) * 100).toFixed(1) : "N/A";
+    const dynamic         = state.dynamicLevels[p.ticker];
+
+    return `${p.ticker}: $${price.toFixed(2)} (${pnlSign}${pnlPct}%)
+  Stop: $${effectiveStop?.toFixed(2)||"N/A"} (${distToStop}% away)${dynamic?.stopLoss ? " 📈auto" : ""}
+  Target: $${effectiveTarget?.toFixed(2)||"N/A"} (${distToTarget}% upside)${dynamic?.target ? " 🔄updated" : ""}`;
+  }).join("\n\n");
+
+  // Count auto-updated levels
+  const autoStops   = Object.values(state.dynamicLevels).filter(l => l.stopLoss).length;
+  const autoTargets = Object.values(state.dynamicLevels).filter(l => l.target).length;
+
+  await sendSMS(
+`📋 SUNDAY PORTFOLIO REVIEW
+${new Date().toLocaleDateString("en-US",{month:"long",day:"numeric",year:"numeric"})}
+
+AUTO-UPDATED LEVELS:
+📈 Trailing stops updated: ${autoStops}
+🔄 Analyst targets refreshed: ${autoTargets}
+
+PORTFOLIO STATUS:
+${positionLines}
+
+📈 = trailing stop auto-adjusted
+🔄 = analyst target auto-updated
+All levels update automatically daily.
+Not financial advice.`
+  );
+
+  console.log("  ✅ Sunday summary sent.");
+}
+
 // ═══════════════════════════════════════════════════════════════
 // SCHEDULER
 // ═══════════════════════════════════════════════════════════════
@@ -929,17 +1093,24 @@ console.log(`◎  Mandate: $${MANDATE.dailyCapMin}–$${MANDATE.dailyCapMax}/day
 console.log(`🔗 Tradier: ${TRADIER.baseUrl}`);
 console.log("⏰ Schedule:");
 console.log("   Mon–Fri 9:00 AM  — Morning scan + auto-execute trades");
-console.log("   Mon–Fri 9:30–4PM — Monitor positions every 20 min");
-console.log("   Mon–Fri 4:05 PM  — Closing summary\n");
+console.log("   Mon–Fri 9:30–4PM — Monitor positions + trailing stops every 20 min");
+console.log("   Mon–Fri 4:05 PM  — Closing summary");
+console.log("   Sunday 8:00 AM   — Portfolio review + analyst target update\n");
 
 // Morning execution: 9:00 AM ET Mon–Fri
-cron.schedule("0 9 * * 1-5",       morningSession, { timezone:"America/New_York" });
+cron.schedule("0 9 * * 1-5",       morningSession,      { timezone:"America/New_York" });
 
-// Intraday monitor: every 20 min 9:30–4 PM ET Mon–Fri
-cron.schedule("*/20 9-16 * * 1-5", intradayCheck,  { timezone:"America/New_York" });
+// Intraday monitor + trailing stops: every 20 min 9:30–4 PM ET Mon–Fri
+cron.schedule("*/20 9-16 * * 1-5", intradayCheck,       { timezone:"America/New_York" });
 
 // Closing summary: 4:05 PM ET Mon–Fri
-cron.schedule("5 16 * * 1-5",      closingSession, { timezone:"America/New_York" });
+cron.schedule("5 16 * * 1-5",      closingSession,      { timezone:"America/New_York" });
+
+// Sunday portfolio review + analyst target update: 8:00 AM ET Sunday
+cron.schedule("0 8 * * 0",         sundaySummary,       { timezone:"America/New_York" });
+
+// Daily trailing stop refresh: 9:05 AM ET Mon–Fri (after prices open)
+cron.schedule("5 9 * * 1-5",       updateAnalystTargets, { timezone:"America/New_York" });
 
 // Startup confirmation
 await sendSMS(
