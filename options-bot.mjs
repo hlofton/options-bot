@@ -65,17 +65,17 @@ const PORTFOLIO = [
 
   // ── MEGA-CAP TECH — deepest liquidity, weekly expiries ────
   { ticker:"MSFT", name:"Microsoft",              shares:0,    avgCost:365.44, stopLoss:350.00, target:430.00,  sector:"Cloud/AI",  ivProfile:"high",   optionable:true,  earningsDate:"2026-07-28" },
-  { ticker:"AAPL", name:"Apple Inc",              shares:0,    avgCost:298.01, stopLoss:265.00, target:317.00,  sector:"Consumer",  ivProfile:"medium", optionable:true,  earningsDate:"2026-07-31" },
+  { ticker:"AAPL", name:"Apple Inc",              shares:0,    avgCost:298.01, stopLoss:277.00, target:350.00,  sector:"Consumer",  ivProfile:"medium", optionable:true,  earningsDate:"2026-07-31" },
   { ticker:"AMZN", name:"Amazon",                 shares:0,    avgCost:244.00, stopLoss:208.00, target:278.00,  sector:"Cloud/AI",  ivProfile:"high",   optionable:true,  earningsDate:"2026-07-31" },
-  { ticker:"GOOGL",name:"Alphabet",               shares:0,    avgCost:185.00, stopLoss:158.00, target:220.00,  sector:"AI/Ads",    ivProfile:"high",   optionable:true,  earningsDate:"2026-07-28" },
-  { ticker:"META", name:"Meta Platforms",         shares:0,    avgCost:620.00, stopLoss:528.00, target:740.00,  sector:"AI/Social", ivProfile:"high",   optionable:true,  earningsDate:"2026-07-29" },
+  { ticker:"GOOGL",name:"Alphabet",               shares:0,    avgCost:357.18, stopLoss:314.00, target:410.00,  sector:"AI/Ads",    ivProfile:"high",   optionable:true,  earningsDate:"2026-07-28" },
+  { ticker:"META", name:"Meta Platforms",         shares:0,    avgCost:620.00, stopLoss:588.00, target:780.00,  sector:"AI/Social", ivProfile:"high",   optionable:true,  earningsDate:"2026-07-29" },
 
   // ── HIGH VOLATILITY ───────────────────────────────────────
   { ticker:"TSLA", name:"Tesla",                  shares:0,    avgCost:375.53, stopLoss:320.00, target:440.00,  sector:"EV/Tech",   ivProfile:"high",   optionable:true,  earningsDate:"2026-07-22" },
 
   // ── CYBERSECURITY ─────────────────────────────────────────
-  { ticker:"PANW", name:"Palo Alto Networks",     shares:0,    avgCost:281.00, stopLoss:238.00, target:285.00,  sector:"Cyber",     ivProfile:"high",   optionable:true,  earningsDate:"2026-08-18" },
-  { ticker:"CRWD", name:"CrowdStrike",            shares:0,    avgCost:731.00, stopLoss:621.00, target:800.00,  sector:"Cyber",     ivProfile:"high",   optionable:true,  earningsDate:"2026-08-26" },
+  { ticker:"PANW", name:"Palo Alto Networks",     shares:0,    avgCost:325.91, stopLoss:286.00, target:370.00,  sector:"Cyber",     ivProfile:"high",   optionable:true,  earningsDate:"2026-08-18" },
+  { ticker:"CRWD", name:"CrowdStrike",            shares:0,    avgCost:187.23, stopLoss:165.00, target:235.00,  sector:"Cyber",     ivProfile:"high",   optionable:true,  earningsDate:"2026-09-02" },  // 4-for-1 split completed Jul 2026
 
   // ── INDEX ETFs — 0DTE capable, deepest liquidity ─────────
   { ticker:"SPY",  name:"S&P 500 ETF",            shares:0,    avgCost:754.95, stopLoss:680.00, target:820.00,  sector:"Index",     ivProfile:"medium", optionable:true,  earningsDate:null },
@@ -83,9 +83,9 @@ const PORTFOLIO = [
 
   // ── EXISTING HOLDINGS ─────────────────────────────────────
   { ticker:"OKLO", name:"Oklo Inc",               shares:150,  avgCost:68.38,  stopLoss:42.00,  target:88.00,   sector:"Nuclear",   ivProfile:"high",   optionable:true,  earningsDate:"2026-08-12" },
-  { ticker:"LLY",  name:"Eli Lilly",              shares:4.02, avgCost:987.00, stopLoss:880.00, target:1203.00, sector:"Pharma",    ivProfile:"medium", optionable:true,  earningsDate:"2026-08-06" },
+  { ticker:"LLY",  name:"Eli Lilly",              shares:4.02, avgCost:987.00, stopLoss:1045.00,target:1350.00, sector:"Pharma",    ivProfile:"medium", optionable:true,  earningsDate:"2026-08-06" },
   { ticker:"PLTR", name:"Palantir",               shares:13,   avgCost:135.00, stopLoss:105.00, target:183.00,  sector:"AI/Gov",    ivProfile:"medium", optionable:true,  earningsDate:"2026-08-04" },
-  { ticker:"NOW",  name:"ServiceNow",             shares:0,    avgCost:750.00, stopLoss:637.00, target:850.00,  sector:"SaaS",      ivProfile:"medium", optionable:true,  earningsDate:"2026-07-29" },
+  { ticker:"NOW",  name:"ServiceNow",             shares:0,    avgCost:750.00, stopLoss:675.00, target:900.00,  sector:"SaaS",      ivProfile:"medium", optionable:true,  earningsDate:"2026-07-29" },
 ];
 
 // ── EARNINGS CALENDAR ─────────────────────────────────────────
@@ -420,6 +420,37 @@ async function sendSMS(body) {
 }
 
 // ═══════════════════════════════════════════════════════════════
+// RETRY WRAPPER — retries Anthropic API calls on connection errors
+// Handles transient Railway network blips gracefully
+// ═══════════════════════════════════════════════════════════════
+
+async function retryAI(fn, maxAttempts = 3, delayMs = 2000) {
+  let lastError;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      return await fn();
+    } catch (e) {
+      lastError = e;
+      const isRetryable = e.message.includes("Connection error") ||
+                          e.message.includes("ECONNREFUSED") ||
+                          e.message.includes("ENOTFOUND") ||
+                          e.message.includes("fetch failed") ||
+                          e.message.includes("network") ||
+                          e.status === 529 || // Anthropic overloaded
+                          e.status === 503;
+      if (!isRetryable || attempt === maxAttempts) {
+        console.error(`  ✗ AI call failed after ${attempt} attempt(s): ${e.message}`);
+        throw e;
+      }
+      const wait = delayMs * attempt;
+      console.log(`  ⚠ AI call attempt ${attempt} failed (${e.message}) — retrying in ${wait/1000}s...`);
+      await new Promise(r => setTimeout(r, wait));
+    }
+  }
+  throw lastError;
+}
+
+// ═══════════════════════════════════════════════════════════════
 // AI TRADE GENERATION
 // ═══════════════════════════════════════════════════════════════
 
@@ -473,11 +504,11 @@ REQUIRED FIELDS — do not rename or omit any:
 - rationale: one sentence explanation
 - exitTarget: exit rule string`;
 
-  const msg = await ai.messages.create({
+  const msg = await retryAI(() => ai.messages.create({
     model:      "claude-sonnet-4-20250514",
     max_tokens: 1000,
     messages:   [{ role: "user", content: prompt }],
-  });
+  }));
 
   // Safely collect all text blocks — msg.content[0] may not be text
   // if the model adds preamble or the response shape is unexpected
@@ -635,6 +666,18 @@ async function updateAllPricingLevels(portfolioData) {
 
   // ── STEP 1: ETF price-based update ─────────────────────────
   // ETFs have no analyst targets — derive stop (10% below) and target (10% above)
+  // Quick split pre-check — flag any stock where live price is 40%+ below stored cost
+  // Full verification runs Sunday via detectAndFixSplits
+  for (const stock of PORTFOLIO) {
+    const live = portfolioData.find(p => p.ticker === stock.ticker);
+    if (!live?.price) continue;
+    const stored = getStopLoss(stock.ticker, stock.stopLoss) * (1/0.85); // approximate cost from stop
+    const drop   = (stock.avgCost - live.price) / stock.avgCost;
+    if (drop > 0.40) {
+      const ratio = detectLikelySplitRatio(stock.avgCost, live.price);
+      if (ratio) console.log(`  ⚠ ${stock.ticker} possible ${ratio}-for-1 split — price $${live.price} vs stored $${stock.avgCost}. Will verify Sunday.`);
+    }
+  }
   console.log("  Updating ETF levels (price-based)...");
   for (const ticker of ETF_TICKERS) {
     const liveData = portfolioData.find(p => p.ticker === ticker);
@@ -667,14 +710,29 @@ Return ONLY a JSON array, no markdown:
 
 Include every ticker. Use null for analystTarget if no data found.`;
 
+  // Retry wrapper — up to 3 attempts with exponential backoff
+  // Handles transient Railway network errors on outbound Anthropic API calls
+  const fetchWithRetry = async (attempt = 1) => {
+    try {
+      return await ai.messages.create({
+        model:      "claude-sonnet-4-20250514",
+        max_tokens: 2000,
+        tools:      [{ type: "web_search_20250305", name: "web_search" }],
+        messages:   [{ role: "user", content: prompt }],
+      });
+    } catch (err) {
+      if (attempt < 3) {
+        const delay = attempt * 5000; // 5s, 10s
+        console.log(`  ⚠ Analyst fetch attempt ${attempt} failed: ${err.message}. Retrying in ${delay/1000}s...`);
+        await new Promise(r => setTimeout(r, delay));
+        return fetchWithRetry(attempt + 1);
+      }
+      throw err;
+    }
+  };
+
   try {
-    // Use ai SDK client — automatically injects anthropic-version header + auth
-    const msg = await ai.messages.create({
-      model:  "claude-sonnet-4-20250514",
-      max_tokens: 2000,
-      tools:  [{ type: "web_search_20250305", name: "web_search" }],
-      messages: [{ role: "user", content: prompt }],
-    });
+    const msg = await fetchWithRetry();
     // Collect ALL content blocks — model returns tool_use blocks first,
     // then a final text block with the JSON. Filter for text only after
     // all tool calls complete. Handle empty text gracefully.
@@ -738,6 +796,8 @@ Include every ticker. Use null for analystTarget if no data found.`;
 // Alias — keeps daily 9:05 AM cron working
 async function updateAnalystTargets() {
   const portfolioData = await fetchAllPrices();
+  // Check for splits FIRST — must happen before pricing update
+  await detectAndFixSplits(portfolioData);
   await updateAllPricingLevels(portfolioData);
 }
 
@@ -813,9 +873,131 @@ async function closingSession() {
   console.log("  ✅ Closing summary sent.");
 }
 
+// ═══════════════════════════════════════════════════════════════
+// SPLIT DETECTION — runs every Sunday, catches stock splits
+// Compares live price against stored avgCost — if price is
+// dramatically lower (e.g. 75%+ drop) it flags a likely split
+// and auto-adjusts avgCost, stopLoss, and target accordingly
+// ═══════════════════════════════════════════════════════════════
+
+const COMMON_SPLIT_RATIOS = [2, 3, 4, 5, 10]; // most common split ratios
+
+function detectLikelySplitRatio(storedCost, currentPrice) {
+  for (const ratio of COMMON_SPLIT_RATIOS) {
+    const adjustedCost = storedCost / ratio;
+    const pctDiff = Math.abs(currentPrice - adjustedCost) / adjustedCost;
+    // Within 15% of adjusted price = likely that split ratio
+    if (pctDiff < 0.15) return ratio;
+  }
+  return null;
+}
+
+async function detectAndFixSplits(portfolioData) {
+  console.log("\n🔀 Checking for stock splits...");
+  const splitAlerts = [];
+
+  for (const stock of portfolioData) {
+    if (!stock.price || !stock.avgCost) continue;
+    const livePrice  = stock.price;
+    const storedCost = state.dynamicLevels[stock.ticker]?.avgCost || stock.avgCost;
+
+    // Only check if live price is dramatically LOWER than stored cost
+    // A split would make price look lower vs our stored pre-split cost
+    const priceDrop = (storedCost - livePrice) / storedCost;
+    if (priceDrop < 0.40) continue; // less than 40% drop — probably not a split
+
+    // Try to match to a common split ratio
+    const ratio = detectLikelySplitRatio(storedCost, livePrice);
+    if (!ratio) continue;
+
+    // Verify via AI web search before acting
+    const verifyPrompt = `Search the web: has ${stock.ticker} (${stock.name}) done a stock split in the last 90 days? 
+If yes, what was the split ratio (e.g. 2-for-1, 4-for-1)?
+Return ONLY JSON: {"splitDetected": true, "ratio": 4, "date": "2026-07-01", "source": "Yahoo Finance"}
+If no split found: {"splitDetected": false}`;
+
+    try {
+      const msg = await retryAI(() => ai.messages.create({
+        model:     "claude-sonnet-4-20250514",
+        max_tokens: 300,
+        tools:     [{ type: "web_search_20250305", name: "web_search" }],
+        messages:  [{ role: "user", content: verifyPrompt }],
+      }));
+
+      const text  = msg.content.filter(b => b.type === "text").map(b => b.text || "").join("").trim();
+      const match = text.match(/\{[\s\S]*?\}/);
+      if (!match) continue;
+
+      const result = JSON.parse(match[0]);
+      if (!result.splitDetected || !result.ratio) continue;
+
+      const confirmedRatio = result.ratio;
+
+      // Auto-adjust all stored levels
+      const newAvgCost  = parseFloat((storedCost    / confirmedRatio).toFixed(2));
+      const oldStop     = getStopLoss(stock.ticker, stock.stopLoss);
+      const oldTarget   = getTarget(stock.ticker, stock.target);
+      const newStop     = parseFloat((oldStop   / confirmedRatio).toFixed(2));
+      const newTarget   = parseFloat((oldTarget / confirmedRatio).toFixed(2));
+
+      state.dynamicLevels[stock.ticker] = {
+        ...(state.dynamicLevels[stock.ticker] || {}),
+        avgCost:     newAvgCost,
+        stopLoss:    newStop,
+        target:      newTarget,
+        splitRatio:  confirmedRatio,
+        splitDate:   result.date,
+        lastUpdated: new Date().toISOString(),
+      };
+
+      console.log(`  🔀 ${stock.ticker} ${confirmedRatio}-for-1 split confirmed (${result.date})`);
+      console.log(`     avgCost: $${storedCost} → $${newAvgCost}`);
+      console.log(`     stop:    $${oldStop}    → $${newStop}`);
+      console.log(`     target:  $${oldTarget}  → $${newTarget}`);
+
+      splitAlerts.push({
+        ticker:    stock.ticker,
+        ratio:     confirmedRatio,
+        date:      result.date,
+        newCost:   newAvgCost,
+        newStop,
+        newTarget,
+      });
+
+    } catch(e) {
+      console.error(`  ✗ Split check failed for ${stock.ticker}: ${e.message}`);
+    }
+
+    await new Promise(r => setTimeout(r, 1000));
+  }
+
+  if (splitAlerts.length > 0) {
+    const alertMsg = splitAlerts.map(s =>
+      `${s.ticker}: ${s.ratio}-for-1 split (${s.date})\nNew cost: $${s.newCost} | Stop: $${s.newStop} | Target: $${s.newTarget}`
+    ).join("\n\n");
+
+    await sendSMS(
+`🔀 SPLIT DETECTED & AUTO-FIXED
+${new Date().toLocaleDateString()}
+
+${alertMsg}
+
+All levels automatically adjusted.
+No action needed.
+Not financial advice.`
+    );
+  } else {
+    console.log("  ✓ No splits detected");
+  }
+
+  return splitAlerts;
+}
+
 async function sundaySummary() {
   console.log("\n📋 Sunday portfolio review...");
   const portfolioData = await fetchAllPrices();
+  // Check for splits FIRST — must happen before pricing update
+  await detectAndFixSplits(portfolioData);
   await updateAllPricingLevels(portfolioData);
 
   const lines = portfolioData.map(p => {
