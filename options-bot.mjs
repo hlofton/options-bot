@@ -78,14 +78,14 @@ const PORTFOLIO = [
   { ticker:"CRWD", name:"CrowdStrike",            shares:0,    avgCost:731.00, stopLoss:621.00, target:800.00,  sector:"Cyber",     ivProfile:"high",   optionable:true,  earningsDate:"2026-08-26" },
 
   // ── INDEX ETFs — 0DTE capable, deepest liquidity ─────────
-  { ticker:"SPY",  name:"S&P 500 ETF",            shares:0,    avgCost:565.00, stopLoss:480.00, target:600.00,  sector:"Index",     ivProfile:"medium", optionable:true,  earningsDate:null },
-  { ticker:"QQQ",  name:"Nasdaq 100 ETF",         shares:0,    avgCost:482.00, stopLoss:410.00, target:520.00,  sector:"Index",     ivProfile:"medium", optionable:true,  earningsDate:null },
+  { ticker:"SPY",  name:"S&P 500 ETF",            shares:0,    avgCost:754.95, stopLoss:680.00, target:820.00,  sector:"Index",     ivProfile:"medium", optionable:true,  earningsDate:null },
+  { ticker:"QQQ",  name:"Nasdaq 100 ETF",         shares:0,    avgCost:725.51, stopLoss:653.00, target:790.00,  sector:"Index",     ivProfile:"medium", optionable:true,  earningsDate:null },
 
   // ── EXISTING HOLDINGS ─────────────────────────────────────
   { ticker:"OKLO", name:"Oklo Inc",               shares:150,  avgCost:68.38,  stopLoss:42.00,  target:88.00,   sector:"Nuclear",   ivProfile:"high",   optionable:true,  earningsDate:"2026-08-12" },
   { ticker:"LLY",  name:"Eli Lilly",              shares:4.02, avgCost:987.00, stopLoss:880.00, target:1203.00, sector:"Pharma",    ivProfile:"medium", optionable:true,  earningsDate:"2026-08-06" },
   { ticker:"PLTR", name:"Palantir",               shares:13,   avgCost:135.00, stopLoss:105.00, target:183.00,  sector:"AI/Gov",    ivProfile:"medium", optionable:true,  earningsDate:"2026-08-04" },
-  { ticker:"NOW",  name:"ServiceNow",             shares:0,    avgCost:89.05,  stopLoss:72.00,  target:184.00,  sector:"SaaS",      ivProfile:"medium", optionable:true,  earningsDate:"2026-07-29" },
+  { ticker:"NOW",  name:"ServiceNow",             shares:0,    avgCost:750.00, stopLoss:637.00, target:850.00,  sector:"SaaS",      ivProfile:"medium", optionable:true,  earningsDate:"2026-07-29" },
 ];
 
 // ── EARNINGS CALENDAR ─────────────────────────────────────────
@@ -222,10 +222,27 @@ async function placeOptionsOrder(trade) {
   const { ticker, strategy, legs, quantity } = trade;
   console.log(`  📤 Placing ${strategy} on ${ticker}...`);
   try {
-    let params = { class:"multileg", symbol:ticker, type:"market", duration:"day" };
+    // Use limit orders in live trading to avoid bid-ask slippage on spreads.
+    // In sandbox, market orders are fine — no real fills.
+    const orderType = TRADIER.sandbox ? "market" : "limit";
+
+    // Midpoint price — calculated from legs fetched in buildOptionsLegs
+    // passed through as trade.limitPrice when available
+    const limitPrice = (!TRADIER.sandbox && trade.limitPrice)
+      ? trade.limitPrice.toFixed(2)
+      : undefined;
+
+    let params = {
+      class:    "multileg",
+      symbol:   ticker,
+      type:     orderType,
+      duration: "day",
+      ...(limitPrice ? { price: limitPrice } : {}),
+    };
     legs.forEach((leg, i) => {
       params[`option_symbol[${i}]`] = leg.symbol;
-      params[`side[${i}]`]          = leg.side;
+      // Tradier multileg API requires shorthand "buy" or "sell" not "buy_to_open"
+      params[`side[${i}]`]          = leg.side.startsWith("buy") ? "buy" : "sell";
       params[`quantity[${i}]`]      = quantity || 1;
     });
     const data    = await tradierRequest("POST", `/accounts/${TRADIER.accountId}/orders`, params);
@@ -274,7 +291,9 @@ async function buildOptionsLegs(tradeRec, stockPrice) {
         if (!lc || !sc) return null;
         const cost = (lc.ask - sc.bid) * 100;
         if (cost < MANDATE.minPerTrade || cost > MANDATE.maxPerTrade) return null;
-        return { expiration:validExp, legs:[{symbol:lc.symbol,side:"buy_to_open"},{symbol:sc.symbol,side:"sell_to_open"}], cost:Math.round(cost), maxProfit:Math.round((sc.strike-lc.strike-(lc.ask-sc.bid))*100), longSymbol:lc.symbol, shortSymbol:sc.symbol };
+        // Midpoint price for limit order — avoids slippage in live trading
+        const midpoint = parseFloat(((lc.ask - sc.bid) / 2 + (lc.bid - sc.ask) / 2).toFixed(2));
+        return { expiration:validExp, legs:[{symbol:lc.symbol,side:"buy_to_open"},{symbol:sc.symbol,side:"sell_to_open"}], cost:Math.round(cost), maxProfit:Math.round((sc.strike-lc.strike-(lc.ask-sc.bid))*100), longSymbol:lc.symbol, shortSymbol:sc.symbol, limitPrice:midpoint };
       }
       case "Bear Put Spread": {
         const lp = puts.find(p => p.strike <= stockPrice * 1.01);
@@ -367,7 +386,11 @@ async function fetchAllPrices() {
     const stock = PORTFOLIO[i];
     const data  = await fetchStockPrice(stock.ticker, i % AV_KEYS.length);
     if (data) results.push({ ...stock, ...data });
-    await new Promise(r => setTimeout(r, 1200));
+    // Scale delay linearly with portfolio size to stay under API limits.
+    // Formula: base 1200ms + 50ms per stock beyond 17 (current baseline).
+    // e.g. 20 stocks → 1350ms, 25 stocks → 1600ms, 30 stocks → 1850ms
+    const scaledDelay = 1200 + Math.max(0, (PORTFOLIO.length - 17) * 50);
+    await new Promise(r => setTimeout(r, scaledDelay));
   }
   console.log(`  ✓ Prices: ${results.length}/${PORTFOLIO.length}`);
   return results;
@@ -427,28 +450,87 @@ Strategy guide:
 - Index ETFs (SPY,QQQ): best for 0DTE iron condors — deepest liquidity
 - Avoid tickers with earnings within 7 days unless using straddle
 
-Return ONLY a valid JSON array, no markdown:
+Return ONLY a valid JSON array, no markdown, no extra text.
+Every object MUST include ALL of these exact field names:
 [{
-  "ticker":"NVDA",
-  "strategy":"Bull Call Spread",
-  "direction":"BULLISH",
-  "targetCost":900,
-  "targetReturnPct":"10.0",
-  "rationale":"NVDA up 3.1% today with high IV — bull spread captures momentum",
-  "setupScore":8,
-  "exitTarget":"Close at 50% of max profit"
-}]`;
+  "ticker": "NVDA",
+  "strategy": "Bull Call Spread",
+  "direction": "BULLISH",
+  "targetCost": 900,
+  "targetReturnPct": "10.0",
+  "setupScore": 8,
+  "rationale": "NVDA up 3.1% today with high IV — bull spread captures momentum",
+  "exitTarget": "Close at 50% of max profit"
+}]
 
-  const msg   = await ai.messages.create({ model:"claude-sonnet-4-20250514", max_tokens:1000, messages:[{role:"user",content:prompt}] });
-  const raw   = msg.content[0].text.trim().replace(/^```json\s*/i,"").replace(/```\s*$/i,"").trim();
-  const match = raw.match(/\[[\s\S]*\]/);
-  if (!match) throw new Error("No JSON in AI response");
+REQUIRED FIELDS — do not rename or omit any:
+- ticker: stock symbol string
+- strategy: options strategy name string
+- direction: BULLISH, BEARISH, or NEUTRAL
+- targetCost: integer dollar amount between ${MANDATE.minPerTrade} and ${MANDATE.maxPerTrade}
+- targetReturnPct: string percentage e.g. "9.5" (must be >= ${MANDATE.minReturnPct})
+- setupScore: integer 1-10 (must be >= 6)
+- rationale: one sentence explanation
+- exitTarget: exit rule string`;
 
-  return JSON.parse(match[0]).filter(t =>
-    t.setupScore >= 6 &&
-    t.targetCost >= MANDATE.minPerTrade &&
-    t.targetCost <= MANDATE.maxPerTrade
+  const msg = await ai.messages.create({
+    model:      "claude-sonnet-4-20250514",
+    max_tokens: 1000,
+    messages:   [{ role: "user", content: prompt }],
+  });
+
+  // Safely collect all text blocks — msg.content[0] may not be text
+  // if the model adds preamble or the response shape is unexpected
+  const allText = msg.content
+    .filter(b => b.type === "text")
+    .map(b => b.text || "")
+    .join("")
+    .trim();
+
+  if (!allText) throw new Error("No text block in generateTrades response");
+
+  // Strip markdown fences if present, then extract JSON array
+  const cleaned = allText
+    .replace(/^```json\s*/i, "")
+    .replace(/^```\s*/i, "")
+    .replace(/```\s*$/i, "")
+    .trim();
+
+  const match = cleaned.match(/\[[\s\S]*\]/);
+  if (!match) throw new Error(`No JSON array found in generateTrades. Raw: ${cleaned.slice(0, 200)}`);
+
+  let parsed;
+  try {
+    parsed = JSON.parse(match[0]);
+  } catch(e) {
+    throw new Error(`JSON parse failed in generateTrades: ${e.message}`);
+  }
+
+  // Normalise field names — model sometimes uses alternate names
+  // e.g. "cost" instead of "targetCost", "score" instead of "setupScore"
+  const normalised = parsed.map(t => ({
+    ...t,
+    targetCost:      t.targetCost      ?? t.cost        ?? t.tradeCost   ?? 0,
+    targetReturnPct: t.targetReturnPct ?? t.returnPct   ?? t.return       ?? "0",
+    setupScore:      t.setupScore      ?? t.score        ?? t.quality     ?? 0,
+    strategy:        t.strategy        ?? t.type         ?? t.tradeType   ?? "Unknown",
+    direction:       t.direction       ?? t.bias         ?? "NEUTRAL",
+    rationale:       t.rationale       ?? t.reason       ?? t.explanation ?? "",
+    exitTarget:      t.exitTarget      ?? t.exitRule     ?? t.exit        ?? "",
+  }));
+
+  const passed = normalised.filter(t =>
+    t.setupScore      >= 6 &&
+    t.targetCost      >= MANDATE.minPerTrade &&
+    t.targetCost      <= MANDATE.maxPerTrade &&
+    parseFloat(t.targetReturnPct) >= MANDATE.minReturnPct
   );
+
+  if (passed.length === 0 && normalised.length > 0) {
+    console.log(`  ⚠ All ${normalised.length} trades filtered out. Scores: ${normalised.map(t=>t.setupScore).join(",")}, Costs: ${normalised.map(t=>t.targetCost).join(",")}, Returns: ${normalised.map(t=>t.targetReturnPct).join(",")}`);
+  }
+
+  return passed;
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -541,49 +623,124 @@ async function monitorOpenPositions() {
 // ANALYST TARGET AUTO-UPDATE (runs daily 9:05 AM)
 // ═══════════════════════════════════════════════════════════════
 
-async function updateAnalystTargets() {
-  console.log("\n📊 Updating analyst targets...");
-  const tickers = PORTFOLIO.filter(p => p.optionable).map(p => p.ticker);
+// ── ETF tickers — use price-based levels, not analyst targets ──
+const ETF_TICKERS = ["SPY", "QQQ", "XLE", "IWM", "DIA"];
+const STOCK_TICKERS = PORTFOLIO
+  .filter(p => p.optionable && !ETF_TICKERS.includes(p.ticker))
+  .map(p => p.ticker);
 
-  const prompt = `Search the web for current analyst consensus price targets for these stocks as of today: ${tickers.join(", ")}
+async function updateAllPricingLevels(portfolioData) {
+  console.log("\n📊 Auto-updating ALL pricing levels...");
+  let totalUpdated = 0;
 
-For each find the 12-month consensus price target from Yahoo Finance, Stockanalysis.com, or MarketBeat.
+  // ── STEP 1: ETF price-based update ─────────────────────────
+  // ETFs have no analyst targets — derive stop (10% below) and target (10% above)
+  console.log("  Updating ETF levels (price-based)...");
+  for (const ticker of ETF_TICKERS) {
+    const liveData = portfolioData.find(p => p.ticker === ticker);
+    if (!liveData?.price) continue;
+    const price     = liveData.price;
+    const newStop   = parseFloat((price * 0.90).toFixed(2));
+    const newTarget = parseFloat((price * 1.10).toFixed(2));
+    const stock     = PORTFOLIO.find(p => p.ticker === ticker);
+    const oldStop   = getStopLoss(ticker, stock?.stopLoss);
+    const oldTarget = getTarget(ticker, stock?.target);
+    const effectiveStop = Math.max(newStop, oldStop || 0);
+    state.dynamicLevels[ticker] = {
+      ...(state.dynamicLevels[ticker] || {}),
+      stopLoss: effectiveStop, target: newTarget,
+      lastUpdated: new Date().toISOString(), source: "price-based auto",
+    };
+    console.log(`  ✓ ${ticker}: $${price} | stop $${oldStop}→$${effectiveStop} | target $${oldTarget}→$${newTarget}`);
+    totalUpdated++;
+  }
+
+  // ── STEP 2: Stock analyst consensus update ──────────────────
+  console.log("  Fetching analyst targets for stocks...");
+  const prompt = `Search the web for current analyst consensus 12-month price targets for these stocks as of today:
+${STOCK_TICKERS.join(", ")}
+
+Search Yahoo Finance, Stockanalysis.com, MarketBeat, or TipRanks for each ticker.
 
 Return ONLY a JSON array, no markdown:
-[{"ticker":"NVDA","analystTarget":245,"source":"Yahoo Finance","numAnalysts":42}]
+[{"ticker":"NVDA","currentPrice":209,"analystTarget":245,"numAnalysts":42,"source":"Yahoo Finance"}]
 
-Omit any ticker where you cannot find reliable data.`;
+Include every ticker. Use null for analystTarget if no data found.`;
 
   try {
-    const res  = await fetch("https://api.anthropic.com/v1/messages", {
-      method:"POST", headers:{"Content-Type":"application/json"},
-      body:JSON.stringify({ model:"claude-sonnet-4-20250514", max_tokens:1500, tools:[{type:"web_search_20250305",name:"web_search"}], messages:[{role:"user",content:prompt}] }),
+    // Use ai SDK client — automatically injects anthropic-version header + auth
+    const msg = await ai.messages.create({
+      model:  "claude-sonnet-4-20250514",
+      max_tokens: 2000,
+      tools:  [{ type: "web_search_20250305", name: "web_search" }],
+      messages: [{ role: "user", content: prompt }],
     });
-    const data  = await res.json();
-    const text  = data.content?.filter(b=>b.type==="text").map(b=>b.text||"").join("").trim();
-    const match = text.match(/\[[\s\S]*\]/);
-    if (!match) throw new Error("No JSON found");
+    // Collect ALL content blocks — model returns tool_use blocks first,
+    // then a final text block with the JSON. Filter for text only after
+    // all tool calls complete. Handle empty text gracefully.
+    const allText = msg.content
+      .filter(b => b.type === "text")
+      .map(b => b.text || "")
+      .join("")
+      .trim();
 
-    const targets = JSON.parse(match[0]);
-    let updated   = 0;
-    for (const t of targets) {
-      if (!t.ticker || !t.analystTarget) continue;
-      const stock         = PORTFOLIO.find(p => p.ticker === t.ticker);
+    if (!allText) {
+      console.log("  ⚠ No text block in response — model may have returned tool_use only. Skipping update.");
+      return totalUpdated;
+    }
+
+    // Extract JSON array from anywhere in the text response
+    const match = allText.match(/\[[\s\S]*?\]/);
+    if (!match) {
+      console.log("  ⚠ No JSON array found in response. Raw text:", allText.slice(0, 200));
+      return totalUpdated;
+    }
+
+    let results;
+    try {
+      results = JSON.parse(match[0]);
+    } catch(parseErr) {
+      console.error("  ✗ JSON parse failed:", parseErr.message);
+      return totalUpdated;
+    }
+    for (const r of results) {
+      if (!r.ticker || !r.analystTarget) continue;
+      const stock        = PORTFOLIO.find(p => p.ticker === r.ticker);
       if (!stock) continue;
-      const currentTarget = getTarget(t.ticker, stock.target);
-      if (Math.abs(t.analystTarget - currentTarget) / currentTarget > 0.05) {
-        state.dynamicLevels[t.ticker] = { ...(state.dynamicLevels[t.ticker]||{}), target:t.analystTarget, targetSource:t.source, lastUpdated:new Date().toISOString() };
-        console.log(`  ✓ ${t.ticker} target: $${currentTarget} → $${t.analystTarget} (${t.source})`);
-        updated++;
+      const liveData     = portfolioData.find(p => p.ticker === r.ticker);
+      const currentPrice = liveData?.price || r.currentPrice || stock.avgCost;
+      const oldTarget    = getTarget(r.ticker, stock.target);
+      const oldStop      = getStopLoss(r.ticker, stock.stopLoss);
+      const targetChanged = Math.abs(r.analystTarget - oldTarget) / oldTarget > 0.03;
+      const priceBasedStop = parseFloat((currentPrice * 0.85).toFixed(2));
+      const newStop        = Math.max(priceBasedStop, oldStop || 0);
+      const stopChanged    = newStop > oldStop;
+      if (targetChanged || stopChanged) {
+        state.dynamicLevels[r.ticker] = {
+          ...(state.dynamicLevels[r.ticker] || {}),
+          ...(targetChanged ? { target: r.analystTarget, targetSource: r.source, numAnalysts: r.numAnalysts } : {}),
+          ...(stopChanged   ? { stopLoss: newStop } : {}),
+          lastUpdated: new Date().toISOString(),
+        };
+        const changes = [];
+        if (targetChanged) changes.push(`target $${oldTarget}→$${r.analystTarget} (${r.numAnalysts} analysts)`);
+        if (stopChanged)   changes.push(`stop $${oldStop}→$${newStop}`);
+        console.log(`  ✓ ${r.ticker}: ${changes.join(" | ")}`);
+        totalUpdated++;
       }
     }
-    console.log(`  ✅ ${updated} targets updated`);
-  } catch(e) { console.error(`  ✗ Target update: ${e.message}`); }
+  } catch(e) { console.error(`  ✗ Analyst fetch failed: ${e.message}`); }
+
+  console.log(`  ✅ Auto-update complete: ${totalUpdated} positions updated`);
+  return totalUpdated;
 }
 
-// ═══════════════════════════════════════════════════════════════
-// SCHEDULED JOBS
-// ═══════════════════════════════════════════════════════════════
+// Alias — keeps daily 9:05 AM cron working
+async function updateAnalystTargets() {
+  const portfolioData = await fetchAllPrices();
+  await updateAllPricingLevels(portfolioData);
+}
+
 
 async function morningSession() {
   console.log(`\n[${new Date().toLocaleTimeString()}] 🌅 Morning session...`);
@@ -658,8 +815,8 @@ async function closingSession() {
 
 async function sundaySummary() {
   console.log("\n📋 Sunday portfolio review...");
-  await updateAnalystTargets();
   const portfolioData = await fetchAllPrices();
+  await updateAllPricingLevels(portfolioData);
 
   const lines = portfolioData.map(p => {
     const price         = p.price || 0;
@@ -715,4 +872,19 @@ Trailing stops: ENABLED | Analyst targets: AUTO-UPDATE
 
 Schedule: 9AM execute | 9:05 targets | 20min monitor | 4PM close | Sun 8AM review`);
 
-await intradayCheck();
+// ================================================================
+// SECURE BOOT — wraps startup check so cron schedules survive
+// any transient network error on boot
+// ================================================================
+(async () => {
+  try {
+    console.log("  ⏳ Running startup diagnostics...");
+    await intradayCheck();
+    console.log("  🚀 Diagnostics clear. Background crons running.");
+  } catch (bootError) {
+    console.error("  🛑 BOOT ERROR:", bootError.message);
+    await sendSMS(
+      `⚠️ OPTIONS BOT BOOT ERROR\n${bootError.message}\nSchedules registered but startup check failed. Crons still running.`
+    );
+  }
+})();
