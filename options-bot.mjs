@@ -85,7 +85,8 @@ const PORTFOLIO = [
   { ticker:"OKLO", name:"Oklo Inc",               shares:150,  avgCost:68.38,  stopLoss:42.00,  target:88.00,   sector:"Nuclear",   ivProfile:"high",   optionable:true,  earningsDate:"2026-08-12" },
   { ticker:"LLY",  name:"Eli Lilly",              shares:4.02, avgCost:987.00, stopLoss:1045.00,target:1350.00, sector:"Pharma",    ivProfile:"medium", optionable:true,  earningsDate:"2026-08-06" },
   { ticker:"PLTR", name:"Palantir",               shares:13,   avgCost:135.00, stopLoss:105.00, target:183.00,  sector:"AI/Gov",    ivProfile:"medium", optionable:true,  earningsDate:"2026-08-04" },
-  { ticker:"NOW",  name:"ServiceNow",             shares:0,    avgCost:750.00, stopLoss:675.00, target:900.00,  sector:"SaaS",      ivProfile:"medium", optionable:true,  earningsDate:"2026-07-29" },
+  // NOTE: NOW did 5-for-1 split in 2025. Price $107.71. Down 42% YTD. Earnings Jul 22.
+  { ticker:"NOW",  name:"ServiceNow",             shares:0,    avgCost:107.71, stopLoss:88.00,  target:142.00,  sector:"SaaS",      ivProfile:"medium", optionable:true,  earningsDate:"2026-07-22" },
 ];
 
 // ── EARNINGS CALENDAR ─────────────────────────────────────────
@@ -95,7 +96,7 @@ const EARNINGS = {
   GOOGL:"2026-07-28",META:"2026-07-29", TSLA:"2026-07-22",
   PANW:"2026-08-18", CRWD:"2026-08-26",
   OKLO:"2026-08-12", LLY:"2026-08-06",  PLTR:"2026-08-04",
-  NOW:"2026-07-29",
+  NOW:"2026-07-22",
 };
 
 // ── STRATEGIES BY IV PROFILE ──────────────────────────────────
