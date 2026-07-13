@@ -421,6 +421,99 @@ async function sendSMS(body) {
 }
 
 // ═══════════════════════════════════════════════════════════════
+// MARKET SENTIMENT — VIX fetch + pre-market SPY change
+// Used by generateTrades to adjust strategy selection and
+// condor wing width based on current volatility environment
+// ═══════════════════════════════════════════════════════════════
+
+// VIX thresholds
+const VIX_REGIME = {
+  calm:     18,   // VIX < 18  → normal wings, all strategies allowed
+  elevated: 25,   // VIX 18–25 → wider wings, avoid directional spreads
+  fearful:  35,   // VIX 25–35 → widest wings, income only
+                  // VIX > 35  → no new trades (extreme fear)
+};
+
+async function fetchVIX() {
+  try {
+    // Alpha Vantage supports VIX via GLOBAL_QUOTE on ^VIX
+    const key = process.env.ALPHA_VANTAGE_API_KEY;
+    const res  = await fetch(`https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol=^VIX&apikey=${key}`);
+    const data = await res.json();
+    const q    = data["Global Quote"];
+    if (!q?.["05. price"]) throw new Error("No VIX data");
+    const vix = parseFloat(q["05. price"]);
+    console.log(`  📊 VIX: ${vix}`);
+    return vix;
+  } catch(e) {
+    console.log(`  ⚠ VIX fetch failed (${e.message}) — defaulting to 18`);
+    return 18; // Conservative default
+  }
+}
+
+async function fetchSPYChange() {
+  try {
+    const key  = process.env.ALPHA_VANTAGE_API_KEY;
+    const res  = await fetch(`https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol=SPY&apikey=${key}`);
+    const data = await res.json();
+    const q    = data["Global Quote"];
+    if (!q?.["10. change percent"]) throw new Error("No SPY data");
+    const changePct = parseFloat(q["10. change percent"]);
+    console.log(`  📊 SPY day change: ${changePct.toFixed(2)}%`);
+    return changePct;
+  } catch(e) {
+    console.log(`  ⚠ SPY change fetch failed — defaulting to 0`);
+    return 0;
+  }
+}
+
+function getMarketRegime(vix, spyChangePct) {
+  // Determine regime and rules for today's trading
+  if (vix > VIX_REGIME.fearful) {
+    return {
+      label:            "EXTREME FEAR",
+      allowDirectional: false,
+      allowCondors:     false,
+      allowCSP:         false,
+      skipTrading:      true,
+      wingMultiplier:   2.0,
+      note:             `VIX ${vix} > 35 — no new trades today. Extreme fear.`,
+    };
+  }
+  if (vix > VIX_REGIME.elevated || spyChangePct < -1.0) {
+    return {
+      label:            "HIGH VOLATILITY",
+      allowDirectional: false,  // No bull/bear call/put spreads
+      allowCondors:     true,   // Condors OK with wider wings
+      allowCSP:         true,   // Cash secured puts OK — best in high IV
+      skipTrading:      false,
+      wingMultiplier:   1.5,    // 50% wider strikes than normal
+      note:             `VIX ${vix} / SPY ${spyChangePct.toFixed(1)}% — income only, wider wings`,
+    };
+  }
+  if (vix > VIX_REGIME.calm || spyChangePct < -0.5) {
+    return {
+      label:            "ELEVATED VOLATILITY",
+      allowDirectional: false,  // Avoid directional spreads
+      allowCondors:     true,
+      allowCSP:         true,
+      skipTrading:      false,
+      wingMultiplier:   1.25,   // 25% wider strikes
+      note:             `VIX ${vix} / SPY ${spyChangePct.toFixed(1)}% — prefer income, slightly wider wings`,
+    };
+  }
+  return {
+    label:            "NORMAL",
+    allowDirectional: true,
+    allowCondors:     true,
+    allowCSP:         true,
+    skipTrading:      false,
+    wingMultiplier:   1.0,
+    note:             `VIX ${vix} / SPY ${spyChangePct.toFixed(1)}% — all strategies allowed`,
+  };
+}
+
+// ═══════════════════════════════════════════════════════════════
 // RETRY WRAPPER — retries Anthropic API calls on connection errors
 // Handles transient Railway network blips gracefully
 // ═══════════════════════════════════════════════════════════════
@@ -459,28 +552,54 @@ async function generateTrades(portfolioData) {
   const optionable = portfolioData.filter(p => p.optionable && p.price);
   const today      = new Date().toLocaleDateString("en-US",{weekday:"long",month:"long",day:"numeric",year:"numeric"});
 
+  // ── Fetch VIX and SPY sentiment before generating trades ──
+  const [vix, spyChange] = await Promise.all([fetchVIX(), fetchSPYChange()]);
+  const regime = getMarketRegime(vix, spyChange);
+  console.log(`  📊 Market regime: ${regime.label} — ${regime.note}`);
+
+  // Skip trading entirely in extreme fear
+  if (regime.skipTrading) {
+    await sendSMS(`⚠️ OPTIONS BOT\nNo trades today — ${regime.note}\nBot resumes tomorrow.`);
+    return [];
+  }
+
+  // Earnings avoidance: 14 days for directional, 7 days for income
   const earningsWarnings = Object.entries(EARNINGS)
     .map(([t,d]) => ({ t, d, days:Math.ceil((new Date(d)-new Date())/(1000*60*60*24)) }))
     .filter(e => e.days > 0 && e.days <= 14)
     .map(e => `${e.t} in ${e.days} days`);
+
+  // Build allowed strategies based on regime
+  const allowedStrategies = [];
+  if (regime.allowCSP)         allowedStrategies.push("Cash Secured Put", "Covered Call");
+  if (regime.allowCondors)     allowedStrategies.push("Iron Condor");
+  if (regime.allowDirectional) allowedStrategies.push("Bull Call Spread", "Bear Put Spread");
 
   const prompt = `You are a professional options trader. Generate ${MANDATE.tradesPerDay.min}–${MANDATE.tradesPerDay.max} options trades for today.
 
 DATE: ${today}
 MANDATE: $${MANDATE.minPerTrade}–$${MANDATE.maxPerTrade}/trade | $${MANDATE.dailyCapMin}–$${MANDATE.dailyCapMax} daily | ${MANDATE.minReturnPct}%+ return | Exit at ${MANDATE.profitTargetPct}% profit | Max ${MANDATE.maxDTE} DTE
 
+MARKET REGIME: ${regime.label}
+VIX: ${vix} | SPY Day Change: ${spyChange.toFixed(2)}%
+REGIME NOTE: ${regime.note}
+WING WIDTH MULTIPLIER: ${regime.wingMultiplier}x (apply to all condor strikes — wider wings in high volatility)
+
+⚠️ ALLOWED STRATEGIES TODAY: ${allowedStrategies.join(", ")}
+${!regime.allowDirectional ? "🚫 DO NOT suggest Bull Call Spreads or Bear Put Spreads today — market conditions require income-only strategies" : ""}
+
 LIVE PRICES (${optionable.length} stocks):
 ${optionable.map(p => `${p.ticker}: $${p.price?.toFixed(2)} ${(p.changePct||0)>=0?"▲":"▼"}${Math.abs(p.changePct||0).toFixed(2)}% | IV:${p.ivProfile} | ${p.sector}`).join("\n")}
 
-${earningsWarnings.length ? `⚠️ EARNINGS SOON: ${earningsWarnings.join(", ")} — avoid or use straddles` : "No earnings this week"}
+${earningsWarnings.length ? `⚠️ EARNINGS PROXIMITY (avoid directional trades within 14 days, income trades within 7 days):\n${earningsWarnings.join(", ")}` : "No earnings this week"}
 
 CAPITAL REMAINING TODAY: $${MANDATE.dailyCapMax - state.totalDeployedToday}
 
-Strategy guide:
-- HIGH IV (NVDA,AMD,AVGO,MSFT,TSLA,PANW,CRWD,META,AMZN,GOOGL,OKLO): Iron Condor, Cash Secured Put, Covered Call
-- MEDIUM IV (AAPL,LLY,PLTR,NOW,SPY,QQQ): Bull Call Spread, Bear Put Spread, Iron Condor
-- Index ETFs (SPY,QQQ): best for 0DTE iron condors — deepest liquidity
-- Avoid tickers with earnings within 7 days unless using straddle
+Strategy guide (only use ALLOWED STRATEGIES listed above):
+- HIGH IV names (NVDA,AMD,AVGO,MSFT,TSLA,PANW,CRWD,META,AMZN,GOOGL,OKLO): Iron Condor, Cash Secured Put, Covered Call — sell premium
+- MEDIUM IV names (AAPL,LLY,PLTR,NOW,SPY,QQQ): ${regime.allowDirectional ? "Bull Call Spread, Bear Put Spread, " : ""}Iron Condor
+- Index ETFs (SPY,QQQ): best for iron condors — use ${regime.wingMultiplier}x wider strikes than normal today
+- Avoid tickers with earnings within 7 days (income) or 14 days (directional)
 
 Return ONLY a valid JSON array, no markdown, no extra text.
 Every object MUST include ALL of these exact field names:
@@ -811,6 +930,10 @@ async function morningSession() {
   const buyingPower = balances?.option_buying_power || balances?.cash || 0;
   const portfolioData = await fetchAllPrices();
   const modeFlag    = TRADIER.sandbox ? " [SANDBOX]" : "";
+  const vixNow     = await fetchVIX();
+  const spyNow     = await fetchSPYChange();
+  const regimeNow  = getMarketRegime(vixNow, spyNow);
+  console.log(`  📊 Regime: ${regimeNow.label} | VIX: ${vixNow} | SPY: ${spyNow.toFixed(2)}%`);
 
   let trades = [];
   try { trades = await generateTrades(portfolioData); }
@@ -837,8 +960,9 @@ async function morningSession() {
     await new Promise(r => setTimeout(r, 1000));
   }
 
+  const regimeFlag = regimeNow.label !== "NORMAL" ? `\nRegime: ${regimeNow.label} (VIX ${vixNow})` : "";
   const msg = executed.length > 0
-    ? `◈ MORNING${modeFlag} ${new Date().toLocaleDateString()}\n\n${executed.length} TRADES EXECUTED:\n${executed.map((t,i)=>`${i+1}. ${t.ticker} ${t.strategy}\n   Cost: $${t.executedCost} | Target: ${t.targetReturnPct}%\n   Expiry: ${t.expiration} | Order: ${t.orderId}`).join("\n\n")}\n\nDeployed: $${state.totalDeployedToday}\nMonitoring every 20 min. Auto-close at ${MANDATE.profitTargetPct}% profit.\n\nNot financial advice.`
+    ? `◈ MORNING${modeFlag}${regimeFlag} ${new Date().toLocaleDateString()}\n\n${executed.length} TRADES EXECUTED:\n${executed.map((t,i)=>`${i+1}. ${t.ticker} ${t.strategy}\n   Cost: $${t.executedCost} | Target: ${t.targetReturnPct}%\n   Expiry: ${t.expiration} | Order: ${t.orderId}`).join("\n\n")}\n\nDeployed: $${state.totalDeployedToday}\nMonitoring every 20 min. Auto-close at ${MANDATE.profitTargetPct}% profit.\n\nNot financial advice.`
     : `◈ MORNING${modeFlag} ${new Date().toLocaleDateString()}\n\nNo trades executed — no setups met the 8% mandate.\nMonitoring continues.\n\nNot financial advice.`;
   await sendSMS(msg);
 }
