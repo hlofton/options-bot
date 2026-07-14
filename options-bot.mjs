@@ -435,36 +435,47 @@ const VIX_REGIME = {
 };
 
 async function fetchVIX() {
-  try {
-    // Alpha Vantage supports VIX via GLOBAL_QUOTE on ^VIX
-    const key = process.env.ALPHA_VANTAGE_API_KEY;
-    const res  = await fetch(`https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol=^VIX&apikey=${key}`);
-    const data = await res.json();
-    const q    = data["Global Quote"];
-    if (!q?.["05. price"]) throw new Error("No VIX data");
-    const vix = parseFloat(q["05. price"]);
-    console.log(`  📊 VIX: ${vix}`);
-    return vix;
-  } catch(e) {
-    console.log(`  ⚠ VIX fetch failed (${e.message}) — defaulting to 18`);
-    return 18; // Conservative default
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const key  = process.env.ALPHA_VANTAGE_API_KEY;
+      const res  = await fetch(`https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol=^VIX&apikey=${key}`);
+      const data = await res.json();
+      const q    = data["Global Quote"];
+      if (!q?.["05. price"]) throw new Error("No VIX data");
+      const vix  = parseFloat(q["05. price"]);
+      console.log(`  📊 VIX: ${vix}`);
+      return vix;
+    } catch(e) {
+      if (attempt === 3) {
+        console.log(`  ⚠ VIX fetch failed after 3 attempts — defaulting to 18`);
+        return 18;
+      }
+      await new Promise(r => setTimeout(r, attempt * 2000));
+    }
   }
+  return 18;
 }
 
 async function fetchSPYChange() {
-  try {
-    const key  = process.env.ALPHA_VANTAGE_API_KEY;
-    const res  = await fetch(`https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol=SPY&apikey=${key}`);
-    const data = await res.json();
-    const q    = data["Global Quote"];
-    if (!q?.["10. change percent"]) throw new Error("No SPY data");
-    const changePct = parseFloat(q["10. change percent"]);
-    console.log(`  📊 SPY day change: ${changePct.toFixed(2)}%`);
-    return changePct;
-  } catch(e) {
-    console.log(`  ⚠ SPY change fetch failed — defaulting to 0`);
-    return 0;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const key     = process.env.ALPHA_VANTAGE_API_KEY;
+      const res     = await fetch(`https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol=SPY&apikey=${key}`);
+      const data    = await res.json();
+      const q       = data["Global Quote"];
+      if (!q?.["10. change percent"]) throw new Error("No SPY data");
+      const change  = parseFloat(q["10. change percent"]);
+      console.log(`  📊 SPY day change: ${change.toFixed(2)}%`);
+      return change;
+    } catch(e) {
+      if (attempt === 3) {
+        console.log(`  ⚠ SPY change fetch failed after 3 attempts — defaulting to 0`);
+        return 0;
+      }
+      await new Promise(r => setTimeout(r, attempt * 2000));
+    }
   }
+  return 0;
 }
 
 function getMarketRegime(vix, spyChangePct) {
@@ -552,8 +563,10 @@ async function generateTrades(portfolioData) {
   const optionable = portfolioData.filter(p => p.optionable && p.price);
   const today      = new Date().toLocaleDateString("en-US",{weekday:"long",month:"long",day:"numeric",year:"numeric"});
 
-  // ── Fetch VIX and SPY sentiment before generating trades ──
-  const [vix, spyChange] = await Promise.all([fetchVIX(), fetchSPYChange()]);
+  // ── Fetch VIX and SPY sentiment — fail gracefully to defaults ──
+  let vix = 18, spyChange = 0;
+  try { [vix, spyChange] = await Promise.all([fetchVIX(), fetchSPYChange()]); }
+  catch(e) { console.log(`  ⚠ Market sentiment fetch failed (${e.message}) — using defaults VIX:18 SPY:0%`); }
   const regime = getMarketRegime(vix, spyChange);
   console.log(`  📊 Market regime: ${regime.label} — ${regime.note}`);
 
@@ -771,7 +784,7 @@ async function monitorOpenPositions() {
 }
 
 // ═══════════════════════════════════════════════════════════════
-// ANALYST TARGET AUTO-UPDATE (runs daily 9:05 AM)
+// ANALYST TARGET AUTO-UPDATE (runs daily 9:15 AM)
 // ═══════════════════════════════════════════════════════════════
 
 // ── ETF tickers — use price-based levels, not analyst targets ──
@@ -913,7 +926,7 @@ Include every ticker. Use null for analystTarget if no data found.`;
   return totalUpdated;
 }
 
-// Alias — keeps daily 9:05 AM cron working
+// Alias — keeps daily 9:15 AM cron working
 async function updateAnalystTargets() {
   const portfolioData = await fetchAllPrices();
   // Check for splits FIRST — must happen before pricing update
@@ -926,18 +939,43 @@ async function morningSession() {
   console.log(`\n[${new Date().toLocaleTimeString()}] 🌅 Morning session...`);
   state.dailyTrades = []; state.totalDeployedToday = 0; state.dailyPnL = 0;
 
-  const balances    = await getAccountBalances();
+  // Wrap all external calls in try/catch — any single failure
+  // should not kill the entire morning session
+  let balances = {};
+  try { balances = await getAccountBalances(); } catch(e) { console.log(`  ⚠ Balances unavailable: ${e.message}`); }
   const buyingPower = balances?.option_buying_power || balances?.cash || 0;
+
   const portfolioData = await fetchAllPrices();
-  const modeFlag    = TRADIER.sandbox ? " [SANDBOX]" : "";
-  const vixNow     = await fetchVIX();
-  const spyNow     = await fetchSPYChange();
-  const regimeNow  = getMarketRegime(vixNow, spyNow);
+  const modeFlag      = TRADIER.sandbox ? " [SANDBOX]" : "";
+
+  // VIX and SPY change — fail gracefully to defaults if connection error
+  let vixNow = 18, spyNow = 0;
+  try { vixNow = await fetchVIX(); }      catch(e) { console.log(`  ⚠ VIX unavailable — defaulting to 18`); }
+  try { spyNow = await fetchSPYChange(); } catch(e) { console.log(`  ⚠ SPY change unavailable — defaulting to 0`); }
+  const regimeNow = getMarketRegime(vixNow, spyNow);
   console.log(`  📊 Regime: ${regimeNow.label} | VIX: ${vixNow} | SPY: ${spyNow.toFixed(2)}%`);
 
+  // Generate trades — retry up to 3x on connection errors
   let trades = [];
-  try { trades = await generateTrades(portfolioData); }
-  catch(e) { await sendSMS(`⚠️ Morning scan failed: ${e.message}`); return; }
+  let scanAttempt = 0;
+  while (scanAttempt < 3 && trades.length === 0) {
+    scanAttempt++;
+    try {
+      trades = await generateTrades(portfolioData);
+    } catch(e) {
+      const isRetryable = e.message.includes("Connection error") ||
+                          e.message.includes("ECONNREFUSED") ||
+                          e.message.includes("fetch failed") ||
+                          e.message.includes("network");
+      if (!isRetryable || scanAttempt === 3) {
+        await sendSMS(`⚠️ Morning scan failed after ${scanAttempt} attempt(s): ${e.message}`);
+        return;
+      }
+      const wait = scanAttempt * 30000; // 30s, 60s between morning retries
+      console.log(`  ⚠ Morning scan attempt ${scanAttempt} failed — retrying in ${wait/1000}s...`);
+      await new Promise(r => setTimeout(r, wait));
+    }
+  }
 
   const executed = [];
   for (const trade of trades) {
@@ -1156,15 +1194,15 @@ console.log(`◎  Mandate: $${MANDATE.dailyCapMin}–$${MANDATE.dailyCapMax}/day
 console.log(`🔗 Tradier: ${TRADIER.baseUrl}`);
 console.log(`🔑 Alpha Vantage keys: ${AV_KEYS.length}`);
 console.log("⏰ Schedule:");
-console.log("   Mon–Fri 9:00 AM — Morning scan + execute");
-console.log("   Mon–Fri 9:05 AM — Analyst targets refresh");
+console.log("   Mon–Fri 9:10 AM — Morning scan + execute");
+console.log("   Mon–Fri 9:15 AM — Analyst targets refresh");
 console.log("   Mon–Fri 9:30–4PM — Position monitor + trailing stops every 20 min");
 console.log("   Mon–Fri 4:05 PM — Closing summary");
 console.log("   Sunday 8:00 AM  — Full portfolio review + auto-update all levels\n");
 
 // Schedules
-cron.schedule("0 9 * * 1-5",       morningSession,       { timezone:"America/New_York" });
-cron.schedule("5 9 * * 1-5",       updateAnalystTargets, { timezone:"America/New_York" });
+cron.schedule("10 9 * * 1-5",      morningSession,       { timezone:"America/New_York" });
+cron.schedule("15 9 * * 1-5",      updateAnalystTargets, { timezone:"America/New_York" });
 cron.schedule("*/20 9-16 * * 1-5", intradayCheck,        { timezone:"America/New_York" });
 cron.schedule("5 16 * * 1-5",      closingSession,       { timezone:"America/New_York" });
 cron.schedule("0 8 * * 0",         sundaySummary,        { timezone:"America/New_York" });
@@ -1177,7 +1215,7 @@ Mandate: $${MANDATE.dailyCapMin}–$${MANDATE.dailyCapMax}/day | $${MANDATE.minP
 Auto-execute: ENABLED | Broker: Tradier ${modeLabel}
 Trailing stops: ENABLED | Analyst targets: AUTO-UPDATE
 
-Schedule: 9AM execute | 9:05 targets | 20min monitor | 4PM close | Sun 8AM review`);
+Schedule: 9:10AM execute | 9:15 targets | 20min monitor | 4PM close | Sun 8AM review`);
 
 // ================================================================
 // SECURE BOOT — wraps startup check so cron schedules survive
