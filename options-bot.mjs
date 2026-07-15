@@ -32,10 +32,19 @@ import cron      from "node-cron";
 import dotenv    from "dotenv";
 dotenv.config();
 
-// ── ENVIRONMENT VALIDATION ────────────────────────────────────
+// ── CRITICAL STARTUP GUARD ────────────────────────────────────
+// Exit immediately if ANTHROPIC_API_KEY is missing — prevents
+// silent failures and wasted retry loops
 if (!process.env.ANTHROPIC_API_KEY) {
-  console.error("🛑 CRITICAL: ANTHROPIC_API_KEY is not defined in your environment variables!");
+  console.error("🛑 CRITICAL: ANTHROPIC_API_KEY is not set in environment variables.");
+  console.error("   Add it to Railway Variables tab and redeploy.");
   process.exit(1);
+}
+// Show key preview for verification (never logs full key)
+const _keyPreview = `${process.env.ANTHROPIC_API_KEY.slice(0,12)}...${process.env.ANTHROPIC_API_KEY.slice(-4)}`;
+console.log(`🔑 Anthropic API key loaded: ${_keyPreview}`);
+if (!process.env.ANTHROPIC_API_KEY.startsWith("sk-ant-")) {
+  console.error("⚠️  WARNING: ANTHROPIC_API_KEY does not start with sk-ant- — may be invalid or have extra spaces.");
 }
 
 // ── MANDATE ──────────────────────────────────────────────────
@@ -126,7 +135,8 @@ const state = {
 };
 
 // ── CLIENTS ──────────────────────────────────────────────────
-const ai = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+// Trim key to remove any accidental leading/trailing spaces
+const ai = new Anthropic({ apiKey: (process.env.ANTHROPIC_API_KEY || "").trim() });
 
 const PUSHOVER = {
   user:  process.env.PUSHOVER_USER_KEY  || "u3h5z2iissjoagim6uu142zersmqre",
@@ -563,6 +573,7 @@ function checkSectorHealth(ticker, portfolioData) {
 
   const [sectorName, peers] = sectorEntry;
 
+  // Skip check for indexes and single-stock sectors
   // Skip correlation check for single-stock sectors and indexes
   if (["ev", "pharma", "nuclear", "ai", "index"].includes(sectorName)) {
     return { healthy: true, reason: "Single-stock or index sector" };
@@ -598,19 +609,26 @@ async function retryAI(fn, maxAttempts = 3, delayMs = 2000) {
       return await fn();
     } catch (e) {
       lastError = e;
+      // Log full error details to help diagnose Railway network issues
+      const errDetail = `status=${e.status || "N/A"} type=${e.constructor?.name} msg=${e.message}`;
+      console.error(`  ⚠ AI attempt ${attempt} error: ${errDetail}`);
+
       const isRetryable = e.message.includes("Connection error") ||
                           e.message.includes("ECONNREFUSED") ||
                           e.message.includes("ENOTFOUND") ||
                           e.message.includes("fetch failed") ||
                           e.message.includes("network") ||
-                          e.status === 529 || // Anthropic overloaded
-                          e.status === 503;
+                          e.message.includes("timeout") ||
+                          e.status === 529 ||
+                          e.status === 503 ||
+                          e.status === 401 || // auth errors — key issue
+                          e.status === 400;   // bad request — model ID etc
       if (!isRetryable || attempt === maxAttempts) {
-        console.error(`  ✗ AI call failed after ${attempt} attempt(s): ${e.message}`);
+        console.error(`  ✗ AI call failed after ${attempt} attempt(s): ${errDetail}`);
         throw e;
       }
       const wait = delayMs * attempt;
-      console.log(`  ⚠ AI call attempt ${attempt} failed (${e.message}) — retrying in ${wait/1000}s...`);
+      console.log(`  ⚠ AI call attempt ${attempt} failed — retrying in ${wait/1000}s...`);
       await new Promise(r => setTimeout(r, wait));
     }
   }
@@ -722,7 +740,7 @@ REQUIRED FIELDS — do not rename or omit any:
 - exitTarget: exit rule string`;
 
   const msg = await retryAI(() => ai.messages.create({
-    model:      "claude-sonnet-5",
+    model:      "claude-sonnet-4-6",
     max_tokens: 1000,
     messages:   [{ role: "user", content: prompt }],
   }));
@@ -932,7 +950,7 @@ Include every ticker. Use null for analystTarget if no data found.`;
   const fetchWithRetry = async (attempt = 1) => {
     try {
       return await ai.messages.create({
-        model:      "claude-sonnet-5",
+        model:      "claude-sonnet-4-6",
         max_tokens: 2000,
         tools:      [{ type: "web_search_20250305", name: "web_search" }],
         messages:   [{ role: "user", content: prompt }],
@@ -1165,7 +1183,7 @@ If no split found: {"splitDetected": false}`;
 
     try {
       const msg = await retryAI(() => ai.messages.create({
-        model:     "claude-sonnet-5",
+        model:     "claude-sonnet-4-6",
         max_tokens: 300,
         tools:     [{ type: "web_search_20250305", name: "web_search" }],
         messages:  [{ role: "user", content: verifyPrompt }],
@@ -1271,6 +1289,20 @@ async function sundaySummary() {
 
 const modeLabel = TRADIER.sandbox ? "SANDBOX" : "LIVE";
 
+// Validate critical env vars at startup
+const missingVars = [];
+if (!process.env.ANTHROPIC_API_KEY)    missingVars.push("ANTHROPIC_API_KEY");
+if (!process.env.PUSHOVER_USER_KEY)    missingVars.push("PUSHOVER_USER_KEY");
+if (!process.env.TRADIER_ACCESS_TOKEN) missingVars.push("TRADIER_ACCESS_TOKEN");
+if (!process.env.ALPHA_VANTAGE_API_KEY)missingVars.push("ALPHA_VANTAGE_API_KEY");
+if (missingVars.length > 0) {
+  console.error(`🚨 MISSING ENV VARS: ${missingVars.join(", ")}`);
+}
+const keyPreview = process.env.ANTHROPIC_API_KEY
+  ? `${process.env.ANTHROPIC_API_KEY.slice(0,12)}...${process.env.ANTHROPIC_API_KEY.slice(-4)}`
+  : "❌ NOT SET";
+console.log(`🔑 Anthropic key: ${keyPreview}`);
+
 console.log(`\n🚀 Options Trading Bot v2 (${modeLabel} MODE)`);
 console.log(`📋 Portfolio: ${PORTFOLIO.map(p=>p.ticker).join(", ")}`);
 console.log(`📊 ${PORTFOLIO.length} stocks | ${PORTFOLIO.filter(p=>p.optionable).length} optionable`);
@@ -1294,7 +1326,7 @@ cron.schedule("0 8 * * 0",         sundaySummary,        { timezone:"America/New
 // Startup
 await sendSMS(`◈ OPTIONS BOT v2 ACTIVE (${modeLabel})
 Portfolio: ${PORTFOLIO.filter(p=>p.optionable).map(p=>p.ticker).join(", ")}
-${PORTFOLIO.length} stocks | ${PORTFOLIO.filter(p=>p.optionable).length} optionable
+${PORTFOLIO.length} stocks | ${PORTFOLIO.filter(p=>p.ivProfile==="high").length} high-IV names
 Mandate: $${MANDATE.dailyCapMin}–$${MANDATE.dailyCapMax}/day | $${MANDATE.minPerTrade}–$${MANDATE.maxPerTrade}/trade | ${MANDATE.minReturnPct}%+ return
 Auto-execute: ENABLED | Broker: Tradier ${modeLabel}
 Trailing stops: ENABLED | Analyst targets: AUTO-UPDATE
@@ -1310,6 +1342,8 @@ Schedule: 9:10AM execute | 9:15 targets | 20min monitor | 4PM close | Sun 8AM re
     console.log("  ⏳ Running startup diagnostics...");
     await intradayCheck();
     console.log("  🚀 Diagnostics clear. Background crons running.");
+
+
   } catch (bootError) {
     console.error("  🛑 BOOT ERROR:", bootError.message);
     await sendSMS(
@@ -1317,3 +1351,17 @@ Schedule: 9:10AM execute | 9:15 targets | 20min monitor | 4PM close | Sun 8AM re
     );
   }
 })();
+
+// ================================================================
+// CONTINUOUS KEEP-ALIVE HEARTBEAT
+// Forces the Node.js event loop to stay active indefinitely so cloud
+// platforms (like Railway) do not shut down the background crons.
+// ================================================================
+console.log("⏰ Continuous Keep-Alive Heartbeat engaged. Event loop locked open.");
+setInterval(() => {
+  const hr = new Date().getHours();
+  // Keep the logs quiet overnight, print a pulse check during market hours
+  if (hr >= 9 && hr <= 17) {
+    console.log(`[${new Date().toLocaleTimeString()}] 💓 System pulse check: Event loop active.`);
+  }
+}, 10 * 60 * 1000); // Fires a quiet ping every 10 minutes
