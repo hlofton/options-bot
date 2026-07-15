@@ -1305,6 +1305,14 @@ Schedule: 9:10AM execute | 9:15 targets | 20min monitor | 4PM close | Sun 8AM re
     console.log("  ⏳ Running startup diagnostics...");
     await intradayCheck();
     console.log("  🚀 Diagnostics clear. Background crons running.");
+
+    // RUN_MORNING_ON_START=true forces morning session to fire immediately
+    // Use this in Railway Variables to trigger a manual morning scan
+    if (process.env.RUN_MORNING_ON_START === "true") {
+      console.log("  🌅 RUN_MORNING_ON_START detected — firing morning session now...");
+      await morningSession();
+      console.log("  ✅ Manual morning session complete.");
+    }
   } catch (bootError) {
     console.error("  🛑 BOOT ERROR:", bootError.message);
     await sendSMS(
