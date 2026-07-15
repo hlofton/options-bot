@@ -32,6 +32,12 @@ import cron      from "node-cron";
 import dotenv    from "dotenv";
 dotenv.config();
 
+// ── ENVIRONMENT VALIDATION ────────────────────────────────────
+if (!process.env.ANTHROPIC_API_KEY) {
+  console.error("🛑 CRITICAL: ANTHROPIC_API_KEY is not defined in your environment variables!");
+  process.exit(1);
+}
+
 // ── MANDATE ──────────────────────────────────────────────────
 const MANDATE = {
   dailyCapMin:     1000,
@@ -557,7 +563,6 @@ function checkSectorHealth(ticker, portfolioData) {
 
   const [sectorName, peers] = sectorEntry;
 
-  // Skip check for indexes and single-stock sectors
   // Skip correlation check for single-stock sectors and indexes
   if (["ev", "pharma", "nuclear", "ai", "index"].includes(sectorName)) {
     return { healthy: true, reason: "Single-stock or index sector" };
@@ -717,7 +722,7 @@ REQUIRED FIELDS — do not rename or omit any:
 - exitTarget: exit rule string`;
 
   const msg = await retryAI(() => ai.messages.create({
-    model:      "claude-sonnet-4-6",
+    model:      "claude-sonnet-5",
     max_tokens: 1000,
     messages:   [{ role: "user", content: prompt }],
   }));
@@ -927,7 +932,7 @@ Include every ticker. Use null for analystTarget if no data found.`;
   const fetchWithRetry = async (attempt = 1) => {
     try {
       return await ai.messages.create({
-        model:      "claude-sonnet-4-6",
+        model:      "claude-sonnet-5",
         max_tokens: 2000,
         tools:      [{ type: "web_search_20250305", name: "web_search" }],
         messages:   [{ role: "user", content: prompt }],
@@ -1160,7 +1165,7 @@ If no split found: {"splitDetected": false}`;
 
     try {
       const msg = await retryAI(() => ai.messages.create({
-        model:     "claude-sonnet-4-6",
+        model:     "claude-sonnet-5",
         max_tokens: 300,
         tools:     [{ type: "web_search_20250305", name: "web_search" }],
         messages:  [{ role: "user", content: verifyPrompt }],
@@ -1289,7 +1294,7 @@ cron.schedule("0 8 * * 0",         sundaySummary,        { timezone:"America/New
 // Startup
 await sendSMS(`◈ OPTIONS BOT v2 ACTIVE (${modeLabel})
 Portfolio: ${PORTFOLIO.filter(p=>p.optionable).map(p=>p.ticker).join(", ")}
-${PORTFOLIO.length} stocks | ${PORTFOLIO.filter(p=>p.ivProfile==="high").length} high-IV names
+${PORTFOLIO.length} stocks | ${PORTFOLIO.filter(p=>p.optionable).length} optionable
 Mandate: $${MANDATE.dailyCapMin}–$${MANDATE.dailyCapMax}/day | $${MANDATE.minPerTrade}–$${MANDATE.maxPerTrade}/trade | ${MANDATE.minReturnPct}%+ return
 Auto-execute: ENABLED | Broker: Tradier ${modeLabel}
 Trailing stops: ENABLED | Analyst targets: AUTO-UPDATE
@@ -1305,14 +1310,6 @@ Schedule: 9:10AM execute | 9:15 targets | 20min monitor | 4PM close | Sun 8AM re
     console.log("  ⏳ Running startup diagnostics...");
     await intradayCheck();
     console.log("  🚀 Diagnostics clear. Background crons running.");
-
-    // RUN_MORNING_ON_START=true forces morning session to fire immediately
-    // Use this in Railway Variables to trigger a manual morning scan
-    if (process.env.RUN_MORNING_ON_START === "true") {
-      console.log("  🌅 RUN_MORNING_ON_START detected — firing morning session now...");
-      await morningSession();
-      console.log("  ✅ Manual morning session complete.");
-    }
   } catch (bootError) {
     console.error("  🛑 BOOT ERROR:", bootError.message);
     await sendSMS(
