@@ -28,7 +28,7 @@
 
 import Anthropic from "@anthropic-ai/sdk";
 import cron      from "node-cron";
-import fetch     from "node-fetch";
+// fetch is native in Node 18+ — no import needed
 import dotenv    from "dotenv";
 dotenv.config();
 
@@ -100,9 +100,10 @@ const EARNINGS = {
 };
 
 // ── STRATEGIES BY IV PROFILE ──────────────────────────────────
+// Covered Calls removed — no share positions on this platform
 const STRATEGIES = {
-  high:   ["Iron Condor","Cash Secured Put","Covered Call","Bear Put Spread","Bull Call Spread"],
-  medium: ["Bull Call Spread","Bear Put Spread","Iron Condor","Debit Spread"],
+  high:   ["Iron Condor","Cash Secured Put","Bear Put Spread","Bull Call Spread"],
+  medium: ["Bull Call Spread","Bear Put Spread","Iron Condor"],
   low:    ["Long Call","Long Put","Bull Call Spread"],
 };
 
@@ -268,7 +269,7 @@ async function closeOptionsPosition(position) {
   } catch(e) { return { success:false, error:e.message }; }
 }
 
-async function buildOptionsLegs(tradeRec, stockPrice) {
+async function buildOptionsLegs(tradeRec, stockPrice, regime = null) {
   const { ticker, strategy } = tradeRec;
   try {
     const expirations = await getExpirations(ticker);
@@ -287,8 +288,9 @@ async function buildOptionsLegs(tradeRec, stockPrice) {
 
     switch(strategy) {
       case "Bull Call Spread": {
+        const bullOtm = (regime?.otmPct ?? 3) / 100;
         const lc = calls.find(c => c.strike >= stockPrice * 0.99);
-        const sc = calls.find(c => c.strike >= stockPrice * 1.04);
+        const sc = calls.find(c => c.strike >= stockPrice * (1 + bullOtm));
         if (!lc || !sc) return null;
         const cost = (lc.ask - sc.bid) * 100;
         if (cost < MANDATE.minPerTrade || cost > MANDATE.maxPerTrade) return null;
@@ -297,18 +299,23 @@ async function buildOptionsLegs(tradeRec, stockPrice) {
         return { expiration:validExp, legs:[{symbol:lc.symbol,side:"buy_to_open"},{symbol:sc.symbol,side:"sell_to_open"}], cost:Math.round(cost), maxProfit:Math.round((sc.strike-lc.strike-(lc.ask-sc.bid))*100), longSymbol:lc.symbol, shortSymbol:sc.symbol, limitPrice:midpoint };
       }
       case "Bear Put Spread": {
+        const bearOtm = (regime?.otmPct ?? 3) / 100;
         const lp = puts.find(p => p.strike <= stockPrice * 1.01);
-        const sp = puts.find(p => p.strike <= stockPrice * 0.96);
+        const sp = puts.find(p => p.strike <= stockPrice * (1 - bearOtm));
         if (!lp || !sp) return null;
         const cost = (lp.ask - sp.bid) * 100;
         if (cost < MANDATE.minPerTrade || cost > MANDATE.maxPerTrade) return null;
         return { expiration:validExp, legs:[{symbol:lp.symbol,side:"buy_to_open"},{symbol:sp.symbol,side:"sell_to_open"}], cost:Math.round(cost), maxProfit:Math.round((lp.strike-sp.strike-(lp.ask-sp.bid))*100) };
       }
       case "Iron Condor": {
-        const sc2 = calls.find(c => c.strike >= stockPrice*1.03);
-        const lc2 = calls.find(c => c.strike >= stockPrice*1.06);
-        const sp2 = puts.find(p  => p.strike  <= stockPrice*0.97);
-        const lp2 = puts.find(p  => p.strike  <= stockPrice*0.94);
+        // Dynamic OTM distance based on regime — wider wings in volatile markets
+        const otmFactor   = (regime?.otmPct ?? 3) / 100;                          // e.g. 0.03, 0.04, 0.05
+        const widthFactor = otmFactor + (0.03 * (regime?.wingMultiplier ?? 1.0)); // long wing further out
+        console.log(`  📐 Iron Condor wings: ${(otmFactor*100).toFixed(0)}% OTM / ${(widthFactor*100).toFixed(1)}% width (regime: ${regime?.label || "DEFAULT"})`);
+        const sc2 = calls.find(c => c.strike >= stockPrice * (1 + otmFactor));
+        const lc2 = calls.find(c => c.strike >= stockPrice * (1 + widthFactor));
+        const sp2 = puts.find(p  => p.strike  <= stockPrice * (1 - otmFactor));
+        const lp2 = puts.find(p  => p.strike  <= stockPrice * (1 - widthFactor));
         if (!sc2||!lc2||!sp2||!lp2) return null;
         const credit = ((sc2.bid-lc2.ask)+(sp2.bid-lp2.ask))*100;
         if (credit < MANDATE.minPerTrade*0.08) return null;
@@ -321,11 +328,7 @@ async function buildOptionsLegs(tradeRec, stockPrice) {
         if (credit < MANDATE.minPerTrade*0.08) return null;
         return { expiration:validExp, legs:[{symbol:sp3.symbol,side:"sell_to_open"}], cost:Math.round(sp3.strike*100), maxProfit:Math.round(credit), isCredit:true };
       }
-      case "Covered Call": {
-        const sc3 = calls.find(c => c.strike >= stockPrice*1.03);
-        if (!sc3) return null;
-        return { expiration:validExp, legs:[{symbol:sc3.symbol,side:"sell_to_open"}], cost:0, maxProfit:Math.round(sc3.bid*100), isCredit:true };
-      }
+      // Covered Call removed — no share positions on this platform
       default: return null;
     }
   } catch(e) { console.error(`  ✗ buildLegs ${ticker}: ${e.message}`); return null; }
@@ -437,7 +440,8 @@ const VIX_REGIME = {
 async function fetchVIX() {
   for (let attempt = 1; attempt <= 3; attempt++) {
     try {
-      const key  = process.env.ALPHA_VANTAGE_API_KEY;
+      // Use AV_KEYS rotation — don't hardcode primary key
+      const key  = AV_KEYS[AV_KEYS.length - 1] || process.env.ALPHA_VANTAGE_API_KEY;
       const res  = await fetch(`https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol=^VIX&apikey=${key}`);
       const data = await res.json();
       const q    = data["Global Quote"];
@@ -459,7 +463,8 @@ async function fetchVIX() {
 async function fetchSPYChange() {
   for (let attempt = 1; attempt <= 3; attempt++) {
     try {
-      const key     = process.env.ALPHA_VANTAGE_API_KEY;
+      // Use AV_KEYS rotation — reserve last key for sentiment fetches
+      const key     = AV_KEYS[AV_KEYS.length - 1] || process.env.ALPHA_VANTAGE_API_KEY;
       const res     = await fetch(`https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol=SPY&apikey=${key}`);
       const data    = await res.json();
       const q       = data["Global Quote"];
@@ -494,23 +499,26 @@ function getMarketRegime(vix, spyChangePct) {
   if (vix > VIX_REGIME.elevated || spyChangePct < -1.0) {
     return {
       label:            "HIGH VOLATILITY",
-      allowDirectional: false,  // No bull/bear call/put spreads
-      allowCondors:     true,   // Condors OK with wider wings
-      allowCSP:         true,   // Cash secured puts OK — best in high IV
-      skipTrading:      false,
-      wingMultiplier:   1.5,    // 50% wider strikes than normal
-      note:             `VIX ${vix} / SPY ${spyChangePct.toFixed(1)}% — income only, wider wings`,
-    };
-  }
-  if (vix > VIX_REGIME.calm || spyChangePct < -0.5) {
-    return {
-      label:            "ELEVATED VOLATILITY",
-      allowDirectional: false,  // Avoid directional spreads
+      allowDirectional: false,
       allowCondors:     true,
       allowCSP:         true,
       skipTrading:      false,
-      wingMultiplier:   1.25,   // 25% wider strikes
-      note:             `VIX ${vix} / SPY ${spyChangePct.toFixed(1)}% — prefer income, slightly wider wings`,
+      wingMultiplier:   1.5,
+      otmPct:           5,      // 5% OTM strikes
+      note:             `VIX ${vix} / SPY ${spyChangePct.toFixed(1)}% — income only, 5% OTM wings`,
+    };
+  }
+  // Lowered SPY threshold from -0.5% to -0.3% — catches borderline days like July 14
+  if (vix > VIX_REGIME.calm || spyChangePct < -0.3) {
+    return {
+      label:            "ELEVATED VOLATILITY",
+      allowDirectional: false,
+      allowCondors:     true,
+      allowCSP:         true,
+      skipTrading:      false,
+      wingMultiplier:   1.25,
+      otmPct:           4,      // 4% OTM strikes
+      note:             `VIX ${vix} / SPY ${spyChangePct.toFixed(1)}% — income only, 4% OTM wings`,
     };
   }
   return {
@@ -520,8 +528,57 @@ function getMarketRegime(vix, spyChangePct) {
     allowCSP:         true,
     skipTrading:      false,
     wingMultiplier:   1.0,
-    note:             `VIX ${vix} / SPY ${spyChangePct.toFixed(1)}% — all strategies allowed`,
+    otmPct:           3,        // 3% OTM strikes in calm markets
+    note:             `VIX ${vix} / SPY ${spyChangePct.toFixed(1)}% — all strategies allowed, 3% OTM`,
   };
+}
+
+// ═══════════════════════════════════════════════════════════════
+// SECTOR CORRELATION CHECK
+// Before placing directional spreads, verify the sector isn't
+// broadly weak. If 2+ semis are down 2%+, skip all semi directionals.
+// ═══════════════════════════════════════════════════════════════
+
+const SECTOR_GROUPS = {
+  semis:   ["NVDA", "AMD", "AVGO"],          // Pure semiconductors only
+  cyber:   ["CRWD", "PANW"],                  // Cybersecurity — separate from semis
+  megacap: ["MSFT", "AAPL", "AMZN", "GOOGL", "META"],
+  ev:      ["TSLA"],
+  pharma:  ["LLY"],
+  ai:      ["PLTR", "NOW"],
+  nuclear: ["OKLO"],
+  index:   ["SPY", "QQQ"],
+};
+
+function checkSectorHealth(ticker, portfolioData) {
+  // Find which sector group this ticker belongs to
+  const sectorEntry = Object.entries(SECTOR_GROUPS).find(([, tickers]) => tickers.includes(ticker));
+  if (!sectorEntry) return { healthy: true, reason: "No sector group" };
+
+  const [sectorName, peers] = sectorEntry;
+
+  // Skip check for indexes and single-stock sectors
+  // Skip correlation check for single-stock sectors and indexes
+  if (["ev", "pharma", "nuclear", "ai", "index"].includes(sectorName)) {
+    return { healthy: true, reason: "Single-stock or index sector" };
+  }
+
+  // Count how many peers are down 2%+ today
+  const weakPeers = peers
+    .filter(p => p !== ticker)
+    .map(p => portfolioData.find(d => d.ticker === p))
+    .filter(p => p && (p.changePct || 0) < -2.0);
+
+  if (weakPeers.length >= 2) {
+    const names = weakPeers.map(p => `${p.ticker} ${p.changePct.toFixed(1)}%`).join(", ");
+    return {
+      healthy:          false,
+      reason:           `${sectorName} sector weak — ${weakPeers.length} peers down 2%+: ${names}`,
+      blockDirectional: true,
+    };
+  }
+
+  return { healthy: true, reason: `${sectorName} sector OK — fewer than 2 peers down 2%+` };
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -576,6 +633,18 @@ async function generateTrades(portfolioData) {
     return [];
   }
 
+  // Pre-screen each ticker for sector weakness — block directional on weak sectors
+  const sectorHealth = {};
+  for (const stock of optionable) {
+    sectorHealth[stock.ticker] = checkSectorHealth(stock.ticker, optionable);
+    if (!sectorHealth[stock.ticker].healthy) {
+      console.log(`  ⚠ ${stock.ticker} sector weak: ${sectorHealth[stock.ticker].reason}`);
+    }
+  }
+  const weakSectors = Object.entries(sectorHealth)
+    .filter(([, h]) => !h.healthy)
+    .map(([t, h]) => `${t}: ${h.reason}`);
+
   // Earnings avoidance: 14 days for directional, 7 days for income
   const earningsWarnings = Object.entries(EARNINGS)
     .map(([t,d]) => ({ t, d, days:Math.ceil((new Date(d)-new Date())/(1000*60*60*24)) }))
@@ -584,7 +653,7 @@ async function generateTrades(portfolioData) {
 
   // Build allowed strategies based on regime
   const allowedStrategies = [];
-  if (regime.allowCSP)         allowedStrategies.push("Cash Secured Put", "Covered Call");
+  if (regime.allowCSP)         allowedStrategies.push("Cash Secured Put");
   if (regime.allowCondors)     allowedStrategies.push("Iron Condor");
   if (regime.allowDirectional) allowedStrategies.push("Bull Call Spread", "Bear Put Spread");
 
@@ -602,17 +671,27 @@ WING WIDTH MULTIPLIER: ${regime.wingMultiplier}x (apply to all condor strikes �
 ${!regime.allowDirectional ? "🚫 DO NOT suggest Bull Call Spreads or Bear Put Spreads today — market conditions require income-only strategies" : ""}
 
 LIVE PRICES (${optionable.length} stocks):
-${optionable.map(p => `${p.ticker}: $${p.price?.toFixed(2)} ${(p.changePct||0)>=0?"▲":"▼"}${Math.abs(p.changePct||0).toFixed(2)}% | IV:${p.ivProfile} | ${p.sector}`).join("\n")}
+${optionable.map(p => {
+    const health = sectorHealth[p.ticker];
+    const warn = (!health?.healthy) ? " ⚠️ SECTOR WEAK" : "";
+    return `${p.ticker}: $${p.price?.toFixed(2)} ${(p.changePct||0)>=0?"▲":"▼"}${Math.abs(p.changePct||0).toFixed(2)}% | IV:${p.ivProfile} | ${p.sector}${warn}`;
+  }).join("\n")}
+
+${weakSectors.length > 0 ? `⚠️ SECTOR WEAKNESS DETECTED:\n${weakSectors.join("\n")}\nDo NOT place directional spreads on tickers marked SECTOR WEAK` : "All sectors healthy"}
 
 ${earningsWarnings.length ? `⚠️ EARNINGS PROXIMITY (avoid directional trades within 14 days, income trades within 7 days):\n${earningsWarnings.join(", ")}` : "No earnings this week"}
 
 CAPITAL REMAINING TODAY: $${MANDATE.dailyCapMax - state.totalDeployedToday}
 
 Strategy guide (only use ALLOWED STRATEGIES listed above):
-- HIGH IV names (NVDA,AMD,AVGO,MSFT,TSLA,PANW,CRWD,META,AMZN,GOOGL,OKLO): Iron Condor, Cash Secured Put, Covered Call — sell premium
+- HIGH IV names (NVDA,AMD,AVGO,MSFT,TSLA,PANW,CRWD,META,AMZN,GOOGL,OKLO): Iron Condor, Cash Secured Put — sell premium (no covered calls — no share positions)
 - MEDIUM IV names (AAPL,LLY,PLTR,NOW,SPY,QQQ): ${regime.allowDirectional ? "Bull Call Spread, Bear Put Spread, " : ""}Iron Condor
-- Index ETFs (SPY,QQQ): best for iron condors — use ${regime.wingMultiplier}x wider strikes than normal today
+- Index ETFs (SPY,QQQ): best for iron condors — place short strikes ${regime.otmPct}% OTM from current price today
+- All condors: short strikes must be at least ${regime.otmPct}% away from current price (${regime.wingMultiplier}x wider than baseline)
+- Directional spreads: long strike no closer than ${Math.round(regime.otmPct * 0.5)}% from current price
 - Avoid tickers with earnings within 7 days (income) or 14 days (directional)
+- OTM distance today: ${regime.otmPct}% — place all short strikes at least this far from current price
+- For tickers marked SECTOR WEAK: income strategies only (CSP or Iron Condor), no directional spreads regardless of regime
 
 Return ONLY a valid JSON array, no markdown, no extra text.
 Every object MUST include ALL of these exact field names:
@@ -638,7 +717,7 @@ REQUIRED FIELDS — do not rename or omit any:
 - exitTarget: exit rule string`;
 
   const msg = await retryAI(() => ai.messages.create({
-    model:      "claude-sonnet-4-20250514",
+    model:      "claude-sonnet-4-6",
     max_tokens: 1000,
     messages:   [{ role: "user", content: prompt }],
   }));
@@ -848,7 +927,7 @@ Include every ticker. Use null for analystTarget if no data found.`;
   const fetchWithRetry = async (attempt = 1) => {
     try {
       return await ai.messages.create({
-        model:      "claude-sonnet-4-20250514",
+        model:      "claude-sonnet-4-6",
         max_tokens: 2000,
         tools:      [{ type: "web_search_20250305", name: "web_search" }],
         messages:   [{ role: "user", content: prompt }],
@@ -983,7 +1062,7 @@ async function morningSession() {
     const stockData = portfolioData.find(p => p.ticker === trade.ticker);
     if (!stockData?.price) continue;
 
-    const legs = await buildOptionsLegs(trade, stockData.price);
+    const legs = await buildOptionsLegs(trade, stockData.price, regimeNow);
     if (!legs || legs.cost < MANDATE.minPerTrade || legs.cost > MANDATE.maxPerTrade) continue;
 
     const result = await placeOptionsOrder({ ticker:trade.ticker, strategy:trade.strategy, legs:legs.legs, quantity:1 });
@@ -1081,7 +1160,7 @@ If no split found: {"splitDetected": false}`;
 
     try {
       const msg = await retryAI(() => ai.messages.create({
-        model:     "claude-sonnet-4-20250514",
+        model:     "claude-sonnet-4-6",
         max_tokens: 300,
         tools:     [{ type: "web_search_20250305", name: "web_search" }],
         messages:  [{ role: "user", content: verifyPrompt }],
