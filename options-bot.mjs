@@ -259,8 +259,10 @@ async function placeOptionsOrder(trade) {
     };
     legs.forEach((leg, i) => {
       params[`option_symbol[${i}]`] = leg.symbol;
-      // Tradier multileg API requires shorthand "buy" or "sell" not "buy_to_open"
-      params[`side[${i}]`]          = leg.side.startsWith("buy") ? "buy" : "sell";
+      // Tradier multileg API requires full side values: buy_to_open, sell_to_open,
+      // buy_to_close, sell_to_close — confirmed via official Tradier docs.
+      // (Previous "buy"/"sell" shorthand was incorrect and caused 400 errors.)
+      params[`side[${i}]`]          = leg.side;
       params[`quantity[${i}]`]      = quantity || 1;
     });
     const data    = await tradierRequest("POST", `/accounts/${TRADIER.accountId}/orders`, params);
@@ -1127,13 +1129,18 @@ async function morningSession() {
     if (!legs || legs.cost < MANDATE.minPerTrade || legs.cost > MANDATE.maxPerTrade) continue;
 
     const result = await placeOptionsOrder({ ticker:trade.ticker, strategy:trade.strategy, legs:legs.legs, quantity:1 });
-    if (result.success || TRADIER.sandbox) {
+    // Only log success and track position if the order actually succeeded.
+    // Sandbox mode still requires a real successful API response — do not
+    // treat sandbox as auto-success when Tradier rejects the order.
+    if (result.success) {
       const ex = { ...trade, ...legs, orderId:result.orderId||"SANDBOX", executedAt:new Date().toISOString(), executedCost:legs.cost, executedPrice:stockData.price, status:"OPEN" };
       executed.push(ex);
       state.openPositions.push(ex);
       state.dailyTrades.push(ex);
       state.totalDeployedToday += legs.cost;
       console.log(`  ✅ ${trade.ticker} ${trade.strategy} — $${legs.cost}`);
+    } else {
+      console.log(`  ✗ ${trade.ticker} ${trade.strategy} — order rejected: ${result.error}`);
     }
     await new Promise(r => setTimeout(r, 1000));
   }
