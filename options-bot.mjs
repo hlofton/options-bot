@@ -880,6 +880,91 @@ function detectAlerts(stock, priceData) {
 // POSITION MONITOR — auto-close at profit target or stop
 // ═══════════════════════════════════════════════════════════════
 
+// ═══════════════════════════════════════════════════════════════
+// LIVE POSITION SNAPSHOT
+// Pulls real-time value for every open position directly from
+// Tradier's quote API — ground truth, never estimated or stale.
+// Sent automatically at end of each intraday check when positions
+// are open, so you always have an accurate, verifiable P&L.
+// ═══════════════════════════════════════════════════════════════
+
+async function getLivePositionSnapshot() {
+  const positions = await getTradierPositions();
+  if (!positions.length) {
+    return { hasPositions: false, summary: "No open positions.", totalPnL: 0, lines: [] };
+  }
+
+  const lines = [];
+  let totalPnL = 0;
+  let totalCost = 0;
+
+  for (const pos of positions) {
+    try {
+      const quotes = await getOptionQuote(pos.symbol);
+      if (!quotes.length) {
+        lines.push(`${pos.symbol}: ⚠️ quote unavailable`);
+        continue;
+      }
+
+      const quote        = quotes[0];
+      const currentValue  = (quote.bid + quote.ask) / 2;
+      const qty           = Math.abs(pos.quantity);
+      const ourTrade      = state.openPositions.find(t => t.legs?.some(l => l.symbol === pos.symbol));
+
+      if (!ourTrade) {
+        lines.push(`${pos.symbol}: current bid/ask $${quote.bid?.toFixed(2)}/$${quote.ask?.toFixed(2)} (no local trade record)`);
+        continue;
+      }
+
+      const openDebit  = ourTrade.executedCost / qty / 100;
+      const currentPnL = (currentValue - openDebit) * qty * 100;
+      const currentPct = openDebit ? ((currentValue - openDebit) / openDebit * 100) : 0;
+
+      totalPnL  += currentPnL;
+      totalCost += ourTrade.executedCost;
+
+      lines.push(
+        `${ourTrade.ticker} ${ourTrade.strategy}: $${ourTrade.executedCost} → ` +
+        `${currentPnL>=0?"+":""}$${currentPnL.toFixed(0)} (${currentPct>=0?"+":""}${currentPct.toFixed(1)}%) — VERIFIED live`
+      );
+    } catch(e) {
+      lines.push(`${pos.symbol}: ⚠️ error fetching (${e.message})`);
+    }
+    await new Promise(r => setTimeout(r, 400));
+  }
+
+  return {
+    hasPositions: true,
+    totalPnL,
+    totalCost,
+    totalPct: totalCost ? (totalPnL / totalCost * 100) : 0,
+    lines,
+    timestamp: new Date().toISOString(),
+  };
+}
+
+async function sendLiveSnapshot() {
+  const snap = await getLivePositionSnapshot();
+
+  if (!snap.hasPositions) {
+    await sendSMS(`📊 LIVE SNAPSHOT\n${new Date().toLocaleTimeString()}\n\nNo open positions.\nAll data verified via Tradier live quotes.`);
+    return snap;
+  }
+
+  await sendSMS(
+`📊 LIVE POSITION SNAPSHOT
+${new Date().toLocaleTimeString()} — VERIFIED (Tradier live quotes)
+
+${snap.lines.join("\n")}
+
+TOTAL: ${snap.totalPnL>=0?"+":""}$${snap.totalPnL.toFixed(0)} (${snap.totalPct>=0?"+":""}${snap.totalPct.toFixed(1)}%)
+Deployed: $${snap.totalCost}
+
+Not financial advice.`
+  );
+  return snap;
+}
+
 async function monitorOpenPositions() {
   const positions = await getTradierPositions();
   if (!positions.length) return;
@@ -1155,6 +1240,13 @@ async function morningSession() {
 async function intradayCheck() {
   console.log(`\n[${new Date().toLocaleTimeString()}] ⚡ Intraday check...`);
   await monitorOpenPositions();
+
+  // Send a verified live snapshot if positions are open — ground truth,
+  // not estimated. Only sends if there's something open to report.
+  if (state.openPositions.length > 0) {
+    console.log(`  📊 Sending live snapshot for ${state.openPositions.length} open position(s)...`);
+    await sendLiveSnapshot();
+  }
 
   const portfolioData = await fetchAllPrices();
   for (const stock of portfolioData) {
