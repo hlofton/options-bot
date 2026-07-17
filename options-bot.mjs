@@ -335,16 +335,55 @@ async function buildOptionsLegs(tradeRec, stockPrice, regime = null) {
         const sp2 = puts.find(p  => p.strike  <= stockPrice * (1 - otmFactor));
         const lp2 = puts.find(p  => p.strike  <= stockPrice * (1 - widthFactor));
         if (!sc2||!lc2||!sp2||!lp2) return null;
-        const credit = ((sc2.bid-lc2.ask)+(sp2.bid-lp2.ask))*100;
-        if (credit < MANDATE.minPerTrade*0.08) return null;
-        return { expiration:validExp, legs:[{symbol:sc2.symbol,side:"sell_to_open"},{symbol:lc2.symbol,side:"buy_to_open"},{symbol:sp2.symbol,side:"sell_to_open"},{symbol:lp2.symbol,side:"buy_to_open"}], cost:Math.round(credit), maxProfit:Math.round(credit), isCredit:true };
+        const creditPerContract = ((sc2.bid-lc2.ask)+(sp2.bid-lp2.ask))*100;
+        if (creditPerContract <= 0) return null;
+        // Scale quantity so total credit lands inside the $500-$1000 mandate
+        // range instead of comparing a 1-contract credit (often $100-400)
+        // against a debit-spread-sized threshold.
+        let qty = Math.max(1, Math.round(MANDATE.minPerTrade / creditPerContract));
+        let totalCredit = creditPerContract * qty;
+        while (totalCredit > MANDATE.maxPerTrade && qty > 1) { qty--; totalCredit = creditPerContract * qty; }
+        if (totalCredit < MANDATE.minPerTrade * 0.5) return null; // too little premium even at floor qty
+        const maxLossPerContract = Math.max((lc2.strike - sc2.strike), (sp2.strike - lp2.strike)) * 100 - creditPerContract;
+        return {
+          expiration: validExp,
+          legs: [
+            { symbol: sc2.symbol, side: "sell_to_open" },
+            { symbol: lc2.symbol, side: "buy_to_open"  },
+            { symbol: sp2.symbol, side: "sell_to_open" },
+            { symbol: lp2.symbol, side: "buy_to_open"  },
+          ],
+          cost:      Math.round(totalCredit),
+          maxProfit: Math.round(totalCredit),
+          maxLoss:   Math.round(maxLossPerContract * qty),
+          quantity:  qty,
+          isCredit:  true,
+        };
       }
       case "Cash Secured Put": {
         const sp3 = puts.find(p => p.strike <= stockPrice*0.95);
         if (!sp3) return null;
-        const credit = sp3.bid*100;
-        if (credit < MANDATE.minPerTrade*0.08) return null;
-        return { expiration:validExp, legs:[{symbol:sp3.symbol,side:"sell_to_open"}], cost:Math.round(sp3.strike*100), maxProfit:Math.round(credit), isCredit:true };
+        const creditPerContract = sp3.bid * 100;
+        // Scale contract quantity so the CREDIT COLLECTED (not the
+        // collateral) lands inside the mandate's $500-$1000 range.
+        // "cost" now represents premium at risk, comparable to spreads.
+        // "collateral" tracks the real cash-secured requirement separately
+        // so account-balance checks stay accurate.
+        let qty = Math.max(1, Math.round(MANDATE.minPerTrade / Math.max(creditPerContract, 1)));
+        let totalCredit = creditPerContract * qty;
+        // Cap quantity so we never exceed maxPerTrade in credit collected
+        while (totalCredit > MANDATE.maxPerTrade && qty > 1) { qty--; totalCredit = creditPerContract * qty; }
+        if (totalCredit < MANDATE.minPerTrade * 0.5) return null; // too little premium even at floor qty
+        const collateral = sp3.strike * 100 * qty;
+        return {
+          expiration:  validExp,
+          legs:        [{ symbol: sp3.symbol, side: "sell_to_open" }],
+          cost:        Math.round(totalCredit),   // premium collected — compared against mandate
+          collateral:  Math.round(collateral),    // actual cash-secured requirement — for balance checks only
+          maxProfit:   Math.round(totalCredit),
+          quantity:    qty,
+          isCredit:    true,
+        };
       }
       // Covered Call removed — no share positions on this platform
       default: return null;
@@ -362,13 +401,20 @@ const AV_KEYS = [
   process.env.ALPHA_VANTAGE_API_KEY_3,
 ].filter(Boolean);
 
+// Guard: fail loudly at startup if no Alpha Vantage keys are configured
+// at all, rather than letting apiKey silently become "undefined" deep
+// inside fetchStockPrice / fetchVIX / fetchSPYChange.
+if (AV_KEYS.length === 0) {
+  console.error("🛑 CRITICAL: No ALPHA_VANTAGE_API_KEY(_2/_3) configured. Price fetching will fail entirely.");
+}
+
 const CACHE_TTL = 18 * 60 * 1000;
 
 async function fetchStockPrice(ticker, keyIndex = 0) {
   const cached = state.priceCache[ticker];
   if (cached && (Date.now()-cached.ts) < CACHE_TTL) return cached.data;
 
-  const apiKey = AV_KEYS[keyIndex % AV_KEYS.length] || AV_KEYS[0];
+  const apiKey = AV_KEYS.length ? AV_KEYS[keyIndex % AV_KEYS.length] : undefined;
   try {
     const res  = await fetch(`https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol=${ticker}&apikey=${apiKey}`);
     const data = await res.json();
@@ -657,16 +703,24 @@ const HIGH_BETA_TICKERS = ["NVDA", "TSLA", "CRWD"]; // 2-day loss data on NVDA d
 const DIRECTIONAL_MIN_SCORE = 8;
 const INCOME_MIN_SCORE      = 6; // CSP, Iron Condor keep original threshold
 
-async function generateTrades(portfolioData) {
+async function generateTrades(portfolioData, preComputedRegime = null) {
   const optionable = portfolioData.filter(p => p.optionable && p.price);
   const today      = new Date().toLocaleDateString("en-US",{weekday:"long",month:"long",day:"numeric",year:"numeric"});
 
-  // ── Fetch VIX and SPY sentiment — fail gracefully to defaults ──
-  let vix = 18, spyChange = 0;
-  try { [vix, spyChange] = await Promise.all([fetchVIX(), fetchSPYChange()]); }
-  catch(e) { console.log(`  ⚠ Market sentiment fetch failed (${e.message}) — using defaults VIX:18 SPY:0%`); }
-  const regime = getMarketRegime(vix, spyChange);
-  console.log(`  📊 Market regime: ${regime.label} — ${regime.note}`);
+  // ── Use pre-fetched regime if the caller already computed one this
+  // session (avoids redundant VIX/SPY API calls and prevents the AI
+  // prompt from describing a different regime than buildOptionsLegs uses) ──
+  let vix, spyChange, regime;
+  if (preComputedRegime) {
+    ({ vix, spyChange, regime } = preComputedRegime);
+    console.log(`  📊 Using pre-computed regime: ${regime.label} (passed from caller)`);
+  } else {
+    vix = 18; spyChange = 0;
+    try { [vix, spyChange] = await Promise.all([fetchVIX(), fetchSPYChange()]); }
+    catch(e) { console.log(`  ⚠ Market sentiment fetch failed (${e.message}) — using defaults VIX:18 SPY:0%`); }
+    regime = getMarketRegime(vix, spyChange);
+    console.log(`  📊 Market regime: ${regime.label} — ${regime.note}`);
+  }
 
   // Skip trading entirely in extreme fear
   if (regime.skipTrading) {
@@ -888,9 +942,68 @@ function detectAlerts(stock, priceData) {
 // are open, so you always have an accurate, verifiable P&L.
 // ═══════════════════════════════════════════════════════════════
 
-async function getLivePositionSnapshot() {
+// ═══════════════════════════════════════════════════════════════
+// MULTI-LEG POSITION GROUPING
+// Tradier reports each option leg as its own position row. This
+// helper groups those rows back into the ORIGINAL multi-leg trade
+// (Iron Condor = 4 legs, spreads = 2 legs, CSP = 1 leg) and computes
+// the NET live value across all legs — never treats a single leg's
+// price as if it were the whole spread's value.
+// ═══════════════════════════════════════════════════════════════
+
+async function getGroupedLivePositions() {
   const positions = await getTradierPositions();
-  if (!positions.length) {
+  if (!positions.length) return [];
+
+  // Build a quote lookup for every leg symbol in one batch call
+  const allSymbols = positions.map(p => p.symbol);
+  const quotes     = await getOptionQuote(allSymbols);
+  const quoteMap   = {};
+  for (const q of quotes) quoteMap[q.symbol] = q;
+
+  // Group Tradier position rows by which internal trade they belong to
+  const grouped = new Map(); // ourTrade -> { positions: [...], legValue: number }
+
+  for (const pos of positions) {
+    const ourTrade = state.openPositions.find(t => t.legs?.some(l => l.symbol === pos.symbol));
+    if (!ourTrade) continue; // untracked position — skip, don't misattribute
+
+    if (!grouped.has(ourTrade)) grouped.set(ourTrade, { positions: [], netValue: 0, missingQuote: false });
+    const g = grouped.get(ourTrade);
+    g.positions.push(pos);
+
+    const quote = quoteMap[pos.symbol];
+    if (!quote) { g.missingQuote = true; continue; }
+
+    const legMid = (quote.bid + quote.ask) / 2;
+    // Sign each leg correctly: a SHORT leg (negative Tradier quantity,
+    // i.e. we sold to open) subtracts from net spread value; a LONG
+    // leg (positive quantity, we bought to open) adds to it. This
+    // reconstructs the true net debit/credit value of the whole spread.
+    const legSign = pos.quantity > 0 ? 1 : -1;
+    g.netValue += legSign * legMid;
+  }
+
+  // Convert to array with computed P&L per GROUPED trade (not per leg)
+  const results = [];
+  for (const [ourTrade, g] of grouped.entries()) {
+    if (g.missingQuote) {
+      results.push({ ourTrade, positions: g.positions, valid: false });
+      continue;
+    }
+    const qty = Math.abs(g.positions[0]?.quantity || 1);
+    // netValue is signed per-leg-role during accumulation (long +, short -),
+    // which converges to the correct "cost to close today" for BOTH debit
+    // and credit spreads once we take the absolute value here.
+    const currentValue = Math.abs(g.netValue);
+    results.push({ ourTrade, positions: g.positions, valid: true, currentValue, qty });
+  }
+  return results;
+}
+
+async function getLivePositionSnapshot() {
+  const groups = await getGroupedLivePositions();
+  if (!groups.length) {
     return { hasPositions: false, summary: "No open positions.", totalPnL: 0, lines: [] };
   }
 
@@ -898,39 +1011,27 @@ async function getLivePositionSnapshot() {
   let totalPnL = 0;
   let totalCost = 0;
 
-  for (const pos of positions) {
-    try {
-      const quotes = await getOptionQuote(pos.symbol);
-      if (!quotes.length) {
-        lines.push(`${pos.symbol}: ⚠️ quote unavailable`);
-        continue;
-      }
-
-      const quote        = quotes[0];
-      const currentValue  = (quote.bid + quote.ask) / 2;
-      const qty           = Math.abs(pos.quantity);
-      const ourTrade      = state.openPositions.find(t => t.legs?.some(l => l.symbol === pos.symbol));
-
-      if (!ourTrade) {
-        lines.push(`${pos.symbol}: current bid/ask $${quote.bid?.toFixed(2)}/$${quote.ask?.toFixed(2)} (no local trade record)`);
-        continue;
-      }
-
-      const openDebit  = ourTrade.executedCost / qty / 100;
-      const currentPnL = (currentValue - openDebit) * qty * 100;
-      const currentPct = openDebit ? ((currentValue - openDebit) / openDebit * 100) : 0;
-
-      totalPnL  += currentPnL;
-      totalCost += ourTrade.executedCost;
-
-      lines.push(
-        `${ourTrade.ticker} ${ourTrade.strategy}: $${ourTrade.executedCost} → ` +
-        `${currentPnL>=0?"+":""}$${currentPnL.toFixed(0)} (${currentPct>=0?"+":""}${currentPct.toFixed(1)}%) — VERIFIED live`
-      );
-    } catch(e) {
-      lines.push(`${pos.symbol}: ⚠️ error fetching (${e.message})`);
+  // One line per TRADE (all legs combined), never per individual leg
+  for (const g of groups) {
+    const { ourTrade } = g;
+    if (!g.valid) {
+      lines.push(`${ourTrade.ticker} ${ourTrade.strategy}: ⚠️ quote unavailable for one or more legs`);
+      continue;
     }
-    await new Promise(r => setTimeout(r, 400));
+
+    const openCost   = ourTrade.executedCost / g.qty / 100; // per-share cost basis of the WHOLE spread
+    const currentPnL = ourTrade.isCredit
+      ? (openCost - g.currentValue) * g.qty * 100   // credit trade: profit as spread value decays toward 0
+      : (g.currentValue - openCost) * g.qty * 100;  // debit trade: profit as spread value rises
+    const currentPct = openCost ? (currentPnL / (openCost * g.qty * 100) * 100) : 0;
+
+    totalPnL  += currentPnL;
+    totalCost += ourTrade.executedCost;
+
+    lines.push(
+      `${ourTrade.ticker} ${ourTrade.strategy} (${g.positions.length} leg${g.positions.length>1?"s":""}): $${ourTrade.executedCost} → ` +
+      `${currentPnL>=0?"+":""}$${currentPnL.toFixed(0)} (${currentPct>=0?"+":""}${currentPct.toFixed(1)}%) — VERIFIED live`
+    );
   }
 
   return {
@@ -966,46 +1067,57 @@ Not financial advice.`
 }
 
 async function monitorOpenPositions() {
-  const positions = await getTradierPositions();
-  if (!positions.length) return;
-  console.log(`  Monitoring ${positions.length} open position(s)...`);
+  const groups = await getGroupedLivePositions();
+  if (!groups.length) return;
+  console.log(`  Monitoring ${groups.length} open trade(s) (grouped by all legs)...`);
 
-  for (const pos of positions) {
+  for (const g of groups) {
+    const { ourTrade } = g;
     try {
-      const quotes = await getOptionQuote(pos.symbol);
-      if (!quotes.length) continue;
+      if (!g.valid) {
+        console.log(`  ⚠ ${ourTrade.ticker} ${ourTrade.strategy}: quote unavailable for one or more legs — skipping this cycle`);
+        continue;
+      }
 
-      const quote        = quotes[0];
-      const currentValue = (quote.bid + quote.ask) / 2;
-      const qty          = Math.abs(pos.quantity);
-      const ourTrade     = state.openPositions.find(t => t.legs?.some(l => l.symbol === pos.symbol));
-      if (!ourTrade) continue;
+      const openCost      = ourTrade.executedCost / g.qty / 100;      // per-share cost basis of the WHOLE spread
+      const maxProfitShare = ourTrade.maxProfit / g.qty / 100;
+      const currentPnL     = ourTrade.isCredit
+        ? (openCost - g.currentValue) * g.qty * 100   // credit trade: profit as value decays toward 0
+        : (g.currentValue - openCost) * g.qty * 100;  // debit trade: profit as value rises
+      const currentPct     = openCost ? (currentPnL / (openCost * g.qty * 100) * 100) : 0;
+      const profitTargetPnL = maxProfitShare * g.qty * 100 * (MANDATE.profitTargetPct / 100);
+      const expDate        = new Date(ourTrade.expiration);
+      const dte            = Math.ceil((expDate - new Date()) / (1000*60*60*24));
 
-      const openDebit    = ourTrade.executedCost / qty / 100;
-      const maxProfit    = ourTrade.maxProfit / qty / 100;
-      const profitTarget = openDebit + (maxProfit * MANDATE.profitTargetPct / 100);
-      const stopLevel    = openDebit * (1 - MANDATE.stopLossPct / 100);
-      const currentPnL   = (currentValue - openDebit) * qty * 100;
-      const currentPct   = ((currentValue - openDebit) / openDebit * 100).toFixed(1);
-      const expDate      = new Date(ourTrade.expiration);
-      const dte          = Math.ceil((expDate - new Date()) / (1000*60*60*24));
-
-      console.log(`  ${pos.symbol}: $${currentValue.toFixed(2)} | P&L: ${currentPnL>=0?"+":""}$${currentPnL.toFixed(0)} (${currentPct}%) | DTE:${dte}`);
+      console.log(`  ${ourTrade.ticker} ${ourTrade.strategy} (${g.positions.length} legs): net value $${g.currentValue.toFixed(2)}/sh | P&L: ${currentPnL>=0?"+":""}$${currentPnL.toFixed(0)} (${currentPct.toFixed(1)}%) | DTE:${dte}`);
 
       let shouldClose = false, closeReason = "";
-      if (currentValue >= profitTarget) { shouldClose=true; closeReason=`🎯 PROFIT TARGET — ${currentPct}% gain = +$${currentPnL.toFixed(0)}`; }
-      else if (dte <= MANDATE.minDTE)   { shouldClose=true; closeReason=`📅 EXPIRY RISK — ${dte} DTE, closing to avoid assignment`; }
-      else if (!ourTrade.isCredit && currentValue <= stopLevel) { shouldClose=true; closeReason=`🛑 STOP LOSS — down ${Math.abs(currentPct)}% = -$${Math.abs(currentPnL).toFixed(0)}`; }
+      if (currentPnL >= profitTargetPnL) { shouldClose=true; closeReason=`🎯 PROFIT TARGET — ${currentPct.toFixed(1)}% gain = +$${currentPnL.toFixed(0)}`; }
+      else if (dte <= MANDATE.minDTE)    { shouldClose=true; closeReason=`📅 EXPIRY RISK — ${dte} DTE, closing to avoid assignment`; }
+      else if (!ourTrade.isCredit && currentPnL <= -ourTrade.executedCost) { shouldClose=true; closeReason=`🛑 STOP LOSS — down ${Math.abs(currentPct).toFixed(1)}% = -$${Math.abs(currentPnL).toFixed(0)}`; }
 
       if (shouldClose) {
-        const result = await closeOptionsPosition({ symbol:pos.symbol, underlyingSymbol:ourTrade.ticker, quantity:qty, side:pos.quantity>0?"buy_to_open":"sell_to_open" });
-        if (result.success) {
+        // Close EVERY leg of this trade together — never leave a partial spread open
+        const closeResults = [];
+        for (const pos of g.positions) {
+          const result = await closeOptionsPosition({ symbol:pos.symbol, underlyingSymbol:ourTrade.ticker, quantity:Math.abs(pos.quantity), side:pos.quantity>0?"buy_to_open":"sell_to_open" });
+          closeResults.push(result);
+          await new Promise(r => setTimeout(r, 300));
+        }
+        const allClosed = closeResults.every(r => r.success);
+        if (allClosed) {
           state.dailyPnL += currentPnL;
           state.openPositions = state.openPositions.filter(t => t !== ourTrade);
-          await sendSMS(`◈ POSITION CLOSED\n${ourTrade.ticker} ${ourTrade.strategy}\n${closeReason}\n\nP&L: ${currentPnL>=0?"+":""}$${currentPnL.toFixed(0)} (${currentPct}%)\nOrder: ${result.orderId}\nToday's P&L: ${state.dailyPnL>=0?"+":""}$${state.dailyPnL.toFixed(0)}\n\nNot financial advice.`);
+          await sendSMS(`◈ POSITION CLOSED\n${ourTrade.ticker} ${ourTrade.strategy} (${g.positions.length} legs closed)\n${closeReason}\n\nP&L: ${currentPnL>=0?"+":""}$${currentPnL.toFixed(0)} (${currentPct.toFixed(1)}%)\nToday's P&L: ${state.dailyPnL>=0?"+":""}$${state.dailyPnL.toFixed(0)}\n\nNot financial advice.`);
+        } else {
+          // CRITICAL: some legs failed to close — do NOT remove from tracking.
+          // Keep monitoring so we retry closing the remaining legs next cycle.
+          const failedCount = closeResults.filter(r => !r.success).length;
+          console.error(`  🚨 PARTIAL CLOSE FAILURE: ${failedCount}/${g.positions.length} legs failed to close on ${ourTrade.ticker}. Trade remains tracked for retry.`);
+          await sendSMS(`🚨 PARTIAL CLOSE ALERT\n${ourTrade.ticker} ${ourTrade.strategy}\n${failedCount} of ${g.positions.length} legs failed to close.\nBot will retry next cycle. Check Tradier sandbox manually if this repeats.`);
         }
       }
-    } catch(e) { console.error(`  ✗ Monitor ${pos.symbol}: ${e.message}`); }
+    } catch(e) { console.error(`  ✗ Monitor ${ourTrade?.ticker || "unknown"}: ${e.message}`); }
     await new Promise(r => setTimeout(r, 500));
   }
 }
@@ -1188,7 +1300,7 @@ async function morningSession() {
   while (scanAttempt < 3 && trades.length === 0) {
     scanAttempt++;
     try {
-      trades = await generateTrades(portfolioData);
+      trades = await generateTrades(portfolioData, { vix: vixNow, spyChange: spyNow, regime: regimeNow });
     } catch(e) {
       const isRetryable = e.message.includes("Connection error") ||
                           e.message.includes("ECONNREFUSED") ||
@@ -1213,7 +1325,7 @@ async function morningSession() {
     const legs = await buildOptionsLegs(trade, stockData.price, regimeNow);
     if (!legs || legs.cost < MANDATE.minPerTrade || legs.cost > MANDATE.maxPerTrade) continue;
 
-    const result = await placeOptionsOrder({ ticker:trade.ticker, strategy:trade.strategy, legs:legs.legs, quantity:1 });
+    const result = await placeOptionsOrder({ ticker:trade.ticker, strategy:trade.strategy, legs:legs.legs, quantity:legs.quantity || 1 });
     // Only log success and track position if the order actually succeeded.
     // Sandbox mode still requires a real successful API response — do not
     // treat sandbox as auto-success when Tradier rejects the order.
@@ -1235,6 +1347,110 @@ async function morningSession() {
     ? `◈ MORNING${modeFlag}${regimeFlag} ${new Date().toLocaleDateString()}\n\n${executed.length} TRADES EXECUTED:\n${executed.map((t,i)=>`${i+1}. ${t.ticker} ${t.strategy}\n   Cost: $${t.executedCost} | Target: ${t.targetReturnPct}%\n   Expiry: ${t.expiration} | Order: ${t.orderId}`).join("\n\n")}\n\nDeployed: $${state.totalDeployedToday}\nMonitoring every 20 min. Auto-close at ${MANDATE.profitTargetPct}% profit.\n\nNot financial advice.`
     : `◈ MORNING${modeFlag} ${new Date().toLocaleDateString()}\n\nNo trades executed — no setups met the 8% mandate.\nMonitoring continues.\n\nNot financial advice.`;
   await sendSMS(msg);
+}
+
+// ═══════════════════════════════════════════════════════════════
+// OPPORTUNISTIC MID-DAY SCAN
+// Runs every 2 hours during market hours (11 AM, 1 PM, 3 PM ET).
+// Only opens a NEW trade if:
+//   1. Daily capital budget has room remaining
+//   2. A genuinely exceptional setup exists (big move + elevated IV)
+//   3. Max 1 opportunistic trade per scan — stays disciplined
+// This captures real-time opportunities (like a stock dropping 5%+
+// with rich premium) without turning the bot into a high-frequency
+// system. Respects all existing regime, sector, and high-beta rules.
+// ═══════════════════════════════════════════════════════════════
+
+async function opportunisticScan() {
+  console.log(`\n[${new Date().toLocaleTimeString()}] 🔍 Opportunistic scan...`);
+
+  const budgetRemaining = MANDATE.dailyCapMax - state.totalDeployedToday;
+  if (budgetRemaining < MANDATE.minPerTrade) {
+    console.log(`  ⏭  Skipping — daily budget exhausted ($${state.totalDeployedToday} deployed, $${budgetRemaining} remaining)`);
+    return;
+  }
+
+  // Don't over-trade — cap opportunistic entries separately from morning trades
+  const opportunisticToday = state.dailyTrades.filter(t => t.source === "opportunistic").length;
+  if (opportunisticToday >= 2) {
+    console.log(`  ⏭  Skipping — already placed ${opportunisticToday} opportunistic trades today (max 2)`);
+    return;
+  }
+
+  const portfolioData = await fetchAllPrices();
+
+  // Look for exceptional setups: big move (5%+) — these create rich premium
+  const exceptionalMoves = portfolioData.filter(p =>
+    p.optionable && p.price && Math.abs(p.changePct || 0) >= 5.0
+  );
+
+  if (!exceptionalMoves.length) {
+    console.log(`  ✓ No exceptional setups right now (need 5%+ move). Nothing to do.`);
+    return;
+  }
+
+  console.log(`  🎯 Found ${exceptionalMoves.length} exceptional move(s): ${exceptionalMoves.map(p=>`${p.ticker} ${p.changePct.toFixed(1)}%`).join(", ")}`);
+
+  // Re-check regime and sector health — same rules as morning session
+  let vixNow = 18, spyNow = 0;
+  try { vixNow = await fetchVIX(); } catch(e) {}
+  try { spyNow = await fetchSPYChange(); } catch(e) {}
+  const regime = getMarketRegime(vixNow, spyNow);
+
+  if (regime.skipTrading) {
+    console.log(`  ⏭  Skipping — regime is ${regime.label}, no new trades`);
+    return;
+  }
+
+  // Generate a trade recommendation using the same AI + mandate logic
+  let trades = [];
+  try {
+    trades = await generateTrades(portfolioData, { vix: vixNow, spyChange: spyNow, regime });
+  } catch(e) {
+    console.log(`  ✗ Opportunistic scan generation failed: ${e.message}`);
+    return;
+  }
+
+  // Only take the SINGLE best-scoring trade from an exceptional mover
+  const candidate = trades
+    .filter(t => exceptionalMoves.some(m => m.ticker === t.ticker))
+    .sort((a,b) => b.setupScore - a.setupScore)[0];
+
+  if (!candidate) {
+    console.log(`  ✓ AI found no qualifying setup among exceptional movers. Standing down.`);
+    return;
+  }
+
+  const stockData = portfolioData.find(p => p.ticker === candidate.ticker);
+  const legs = await buildOptionsLegs(candidate, stockData.price, regime);
+  if (!legs || legs.cost < MANDATE.minPerTrade || legs.cost > MANDATE.maxPerTrade || legs.cost > budgetRemaining) {
+    console.log(`  ✗ ${candidate.ticker} setup did not pass final checks. Standing down.`);
+    return;
+  }
+
+  const result = await placeOptionsOrder({ ticker:candidate.ticker, strategy:candidate.strategy, legs:legs.legs, quantity:legs.quantity || 1 });
+
+  if (result.success) {
+    const ex = { ...candidate, ...legs, orderId:result.orderId, executedAt:new Date().toISOString(), executedCost:legs.cost, executedPrice:stockData.price, status:"OPEN", source:"opportunistic" };
+    state.openPositions.push(ex);
+    state.dailyTrades.push(ex);
+    state.totalDeployedToday += legs.cost;
+
+    await sendSMS(
+`🎯 OPPORTUNISTIC TRADE
+${candidate.ticker} ${(stockData.changePct>=0?"▲":"▼")}${Math.abs(stockData.changePct).toFixed(1)}% move triggered scan
+
+${candidate.strategy}
+Cost: $${legs.cost} | Target: ${candidate.targetReturnPct}%
+Rationale: ${candidate.rationale}
+
+Deployed today: $${state.totalDeployedToday} / $${MANDATE.dailyCapMax}
+Not financial advice.`
+    );
+    console.log(`  ✅ Opportunistic trade placed: ${candidate.ticker} ${candidate.strategy} — $${legs.cost}`);
+  } else {
+    console.log(`  ✗ Order failed: ${result.error}`);
+  }
 }
 
 async function intradayCheck() {
@@ -1450,6 +1666,7 @@ console.log("⏰ Schedule:");
 console.log("   Mon–Fri 9:10 AM — Morning scan + execute");
 console.log("   Mon–Fri 9:15 AM — Analyst targets refresh");
 console.log("   Mon–Fri 9:30–4PM — Position monitor + trailing stops every 20 min");
+console.log("   Mon–Fri 11AM,1PM,3PM — Opportunistic scan (5%+ moves only)");
 console.log("   Mon–Fri 4:05 PM — Closing summary");
 console.log("   Sunday 8:00 AM  — Full portfolio review + auto-update all levels\n");
 
@@ -1457,6 +1674,10 @@ console.log("   Sunday 8:00 AM  — Full portfolio review + auto-update all leve
 cron.schedule("10 9 * * 1-5",      morningSession,       { timezone:"America/New_York" });
 cron.schedule("15 9 * * 1-5",      updateAnalystTargets, { timezone:"America/New_York" });
 cron.schedule("*/20 9-16 * * 1-5", intradayCheck,        { timezone:"America/New_York" });
+
+// Opportunistic mid-day scan: 11 AM, 1 PM, 3 PM ET Mon-Fri
+// Only fires on exceptional setups (5%+ moves) with remaining daily budget
+cron.schedule("0 11,13,15 * * 1-5", opportunisticScan,   { timezone:"America/New_York" });
 cron.schedule("5 16 * * 1-5",      closingSession,       { timezone:"America/New_York" });
 cron.schedule("0 8 * * 0",         sundaySummary,        { timezone:"America/New_York" });
 
