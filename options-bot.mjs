@@ -148,9 +148,20 @@ const state = {
 // single global lock serializes every scheduled run — nothing ever
 // executes concurrently with anything else, regardless of timing.
 // ═══════════════════════════════════════════════════════════════
+// Jobs that fire only once per day with no built-in retry — if a lock
+// collision skips one of these, it simply does not happen at all that
+// day. Worth an explicit alert rather than a silent console line.
+const CRITICAL_ONCE_DAILY_JOBS = new Set([
+  "morningSession", "updateAnalystTargets", "closingSession", "sundaySummary",
+]);
+
 async function runExclusive(jobName, fn) {
   if (state.jobRunning) {
-    console.log(`  ⏭  Skipping ${jobName} — "${state.jobRunning}" is still running`);
+    const msg = `Skipping ${jobName} — "${state.jobRunning}" is still running`;
+    console.log(`  ⏭  ${msg}`);
+    if (CRITICAL_ONCE_DAILY_JOBS.has(jobName)) {
+      await sendSMS(`⚠️ SCHEDULE COLLISION\n${msg}\n${jobName} will NOT run again today — no automatic retry for this job.`);
+    }
     return;
   }
   state.jobRunning = jobName;
@@ -400,11 +411,16 @@ async function buildOptionsLegs(tradeRec, stockPrice, regime = null) {
             { symbol: sp2.symbol, side: "sell_to_open" },
             { symbol: lp2.symbol, side: "buy_to_open"  },
           ],
-          cost:      Math.round(totalCredit),
-          maxProfit: Math.round(totalCredit),
-          maxLoss:   Math.round(maxLossPerContract * qty),
-          quantity:  qty,
-          isCredit:  true,
+          cost:            Math.round(totalCredit),
+          maxProfit:       Math.round(totalCredit),
+          maxLoss:         Math.round(maxLossPerContract * qty),
+          quantity:        qty,
+          isCredit:        true,
+          // Short strikes — if the underlying trades beyond either of
+          // these, the condor is structurally breached and should be
+          // closed immediately regardless of dollar P&L thresholds.
+          shortCallStrike: sc2.strike,
+          shortPutStrike:  sp2.strike,
         };
       }
       case "Cash Secured Put": {
@@ -1154,8 +1170,29 @@ async function monitorOpenPositions() {
       const debitStopLossPnL  = -(ourTrade.executedCost * (MANDATE.stopLossPct / 100));
       const creditStopLossPnL = -(maxProfitShare * g.qty * 100 * (MANDATE.creditStopLossPct / 100));
 
+      // BREACHED STRIKE CHECK — Lesson from PANW (Jul): an Iron Condor can
+      // still be inside the dollar stop-loss threshold while the underlying
+      // has already traded beyond a short strike, at which point the trade
+      // is structurally compromised and rarely recovers. This checks the
+      // LIVE underlying price (not just P&L) and closes immediately if
+      // either short strike has been breached, regardless of dollar loss.
+      let strikeBreached = false;
+      if (ourTrade.strategy === "Iron Condor" && ourTrade.shortCallStrike && ourTrade.shortPutStrike) {
+        const liveStock = await fetchStockPrice(ourTrade.ticker);
+        if (liveStock?.price) {
+          if (liveStock.price >= ourTrade.shortCallStrike) {
+            strikeBreached = true;
+            console.log(`  🚨 ${ourTrade.ticker} price $${liveStock.price} breached short CALL strike $${ourTrade.shortCallStrike}`);
+          } else if (liveStock.price <= ourTrade.shortPutStrike) {
+            strikeBreached = true;
+            console.log(`  🚨 ${ourTrade.ticker} price $${liveStock.price} breached short PUT strike $${ourTrade.shortPutStrike}`);
+          }
+        }
+      }
+
       let shouldClose = false, closeReason = "";
-      if (currentPnL >= profitTargetPnL) { shouldClose=true; closeReason=`🎯 PROFIT TARGET — ${currentPct.toFixed(1)}% gain = +$${currentPnL.toFixed(0)}`; }
+      if (strikeBreached)                { shouldClose=true; closeReason=`🚨 STRIKE BREACHED — underlying moved past a short strike, closing before further loss`; }
+      else if (currentPnL >= profitTargetPnL) { shouldClose=true; closeReason=`🎯 PROFIT TARGET — ${currentPct.toFixed(1)}% gain = +$${currentPnL.toFixed(0)}`; }
       else if (dte <= MANDATE.minDTE)    { shouldClose=true; closeReason=`📅 EXPIRY RISK — ${dte} DTE, closing to avoid assignment`; }
       else if (!ourTrade.isCredit && currentPnL <= debitStopLossPnL)  { shouldClose=true; closeReason=`🛑 STOP LOSS — down ${MANDATE.stopLossPct}%+ of debit = -$${Math.abs(currentPnL).toFixed(0)}`; }
       else if (ourTrade.isCredit  && currentPnL <= creditStopLossPnL) { shouldClose=true; closeReason=`🛑 CREDIT STOP LOSS — down ${MANDATE.creditStopLossPct}%+ of credit = -$${Math.abs(currentPnL).toFixed(0)}`; }
@@ -1728,7 +1765,7 @@ console.log(`🔗 Tradier: ${TRADIER.baseUrl}`);
 console.log(`🔑 Alpha Vantage keys: ${AV_KEYS.length}`);
 console.log("⏰ Schedule:");
 console.log("   Mon–Fri 9:10 AM — Morning scan + execute");
-console.log("   Mon–Fri 9:15 AM — Analyst targets refresh");
+console.log("   Mon–Fri 9:25 AM — Analyst targets refresh");
 console.log("   Mon–Fri 9:30–4PM — Position monitor + trailing stops every 20 min");
 console.log("   Mon–Fri 11AM,1PM,3PM — Opportunistic scan (5%+ moves only)");
 console.log("   Mon–Fri 4:05 PM — Closing summary");
@@ -1736,7 +1773,7 @@ console.log("   Sunday 8:00 AM  — Full portfolio review + auto-update all leve
 
 // Schedules
 cron.schedule("10 9 * * 1-5",      () => runExclusive("morningSession",       morningSession),       { timezone:"America/New_York" });
-cron.schedule("15 9 * * 1-5",      () => runExclusive("updateAnalystTargets", updateAnalystTargets), { timezone:"America/New_York" });
+cron.schedule("25 9 * * 1-5",      () => runExclusive("updateAnalystTargets", updateAnalystTargets), { timezone:"America/New_York" });
 cron.schedule("*/20 9-16 * * 1-5", () => runExclusive("intradayCheck",        intradayCheck),        { timezone:"America/New_York" });
 
 // Opportunistic mid-day scan: 11 AM, 1 PM, 3 PM ET Mon-Fri — NOTE this
@@ -1755,7 +1792,7 @@ Mandate: $${MANDATE.dailyCapMin}–$${MANDATE.dailyCapMax}/day | $${MANDATE.minP
 Auto-execute: ENABLED | Broker: Tradier ${modeLabel}
 Trailing stops: ENABLED | Analyst targets: AUTO-UPDATE
 
-Schedule: 9:10AM execute | 9:15 targets | 20min monitor | 4PM close | Sun 8AM review`);
+Schedule: 9:10AM execute | 9:25 targets | 20min monitor | 4PM close | Sun 8AM review`);
 
 // ================================================================
 // SECURE BOOT — wraps startup check so cron schedules survive
