@@ -56,7 +56,8 @@ const MANDATE = {
   minReturnPct:    8,
   tradesPerDay:    { min: 3, max: 4 },
   profitTargetPct: 50,   // close at 50% of max profit
-  stopLossPct:     100,  // close if 100% of debit lost
+  stopLossPct:     100,  // DEBIT strategies (spreads): close if this % of the debit is lost
+  creditStopLossPct: 200, // CREDIT strategies (Iron Condor, CSP): close if loss reaches this % of credit received
   maxDTE:          21,
   minDTE:          1,
 };
@@ -132,7 +133,35 @@ const state = {
   totalDeployedToday: 0,
   dynamicLevels:      {},   // auto-updated stops + targets
   weeklyHighs:        {},   // highest price seen this week
+  jobRunning:         null, // name of the currently executing scheduled job, or null
 };
+
+// ═══════════════════════════════════════════════════════════════
+// SCHEDULER CONCURRENCY GUARD
+// node-cron fires each schedule independently and does NOT wait for
+// a previous invocation to finish before dispatching the next one.
+// Two schedules ("intradayCheck" every 20 min, "opportunisticScan"
+// at 11/1/3) land on the EXACT same minute three times a day, and
+// any job could in principle run long enough to overlap with the
+// next tick of itself. All scheduled jobs mutate shared state
+// (openPositions, dailyTrades, totalDeployedToday, dailyPnL), so a
+// single global lock serializes every scheduled run — nothing ever
+// executes concurrently with anything else, regardless of timing.
+// ═══════════════════════════════════════════════════════════════
+async function runExclusive(jobName, fn) {
+  if (state.jobRunning) {
+    console.log(`  ⏭  Skipping ${jobName} — "${state.jobRunning}" is still running`);
+    return;
+  }
+  state.jobRunning = jobName;
+  try {
+    await fn();
+  } catch(e) {
+    console.error(`  ✗ ${jobName} crashed: ${e.message}`);
+  } finally {
+    state.jobRunning = null;
+  }
+}
 
 // ── CLIENTS ──────────────────────────────────────────────────
 // Trim key to remove any accidental leading/trailing spaces
@@ -250,21 +279,39 @@ async function placeOptionsOrder(trade) {
       ? trade.limitPrice.toFixed(2)
       : undefined;
 
-    let params = {
-      class:    "multileg",
-      symbol:   ticker,
-      type:     orderType,
-      duration: "day",
-      ...(limitPrice ? { price: limitPrice } : {}),
-    };
-    legs.forEach((leg, i) => {
-      params[`option_symbol[${i}]`] = leg.symbol;
-      // Tradier multileg API requires full side values: buy_to_open, sell_to_open,
-      // buy_to_close, sell_to_close — confirmed via official Tradier docs.
-      // (Previous "buy"/"sell" shorthand was incorrect and caused 400 errors.)
-      params[`side[${i}]`]          = leg.side;
-      params[`quantity[${i}]`]      = quantity || 1;
-    });
+    let params;
+    if (legs.length === 1) {
+      // Tradier REQUIRES class:"option" for single-leg orders — "multileg"
+      // with 1 leg is rejected with a 400 error ("number of legs must be
+      // greater than 1"). Single-leg orders also use different param names:
+      // option_symbol / side / quantity (no [i] index suffix).
+      params = {
+        class:         "option",
+        symbol:        ticker,
+        option_symbol: legs[0].symbol,
+        side:          legs[0].side,
+        quantity:      quantity || 1,
+        type:          orderType,
+        duration:      "day",
+        ...(limitPrice ? { price: limitPrice } : {}),
+      };
+    } else {
+      params = {
+        class:    "multileg",
+        symbol:   ticker,
+        type:     orderType,
+        duration: "day",
+        ...(limitPrice ? { price: limitPrice } : {}),
+      };
+      legs.forEach((leg, i) => {
+        params[`option_symbol[${i}]`] = leg.symbol;
+        // Tradier multileg API requires full side values: buy_to_open, sell_to_open,
+        // buy_to_close, sell_to_close — confirmed via official Tradier docs.
+        params[`side[${i}]`]          = leg.side;
+        params[`quantity[${i}]`]      = quantity || 1;
+      });
+    }
+
     const data    = await tradierRequest("POST", `/accounts/${TRADIER.accountId}/orders`, params);
     const orderId = data?.order?.id;
     console.log(`  ✅ Order placed: ${orderId}`);
@@ -627,13 +674,19 @@ function checkSectorHealth(ticker, portfolioData) {
     return { healthy: true, reason: "Single-stock or index sector" };
   }
 
-  // Count how many peers are down 2%+ today
-  const weakPeers = peers
-    .filter(p => p !== ticker)
+  // Count how many OTHER members of this sector are down 2%+ today.
+  // Threshold scales with group size so small groups (e.g. 2-member
+  // "cyber": CRWD/PANW) aren't structurally unable to ever trigger —
+  // requiring a fixed ">=2" would be mathematically impossible when
+  // there's only 1 other peer to check. Large groups (3+ members)
+  // keep the original ">=2" bar to preserve verified behavior.
+  const otherPeers   = peers.filter(p => p !== ticker);
+  const weakPeers    = otherPeers
     .map(p => portfolioData.find(d => d.ticker === p))
     .filter(p => p && (p.changePct || 0) < -2.0);
+  const weakThreshold = Math.min(2, otherPeers.length); // 2-member group -> 1, 3+ member group -> 2
 
-  if (weakPeers.length >= 2) {
+  if (weakPeers.length >= weakThreshold && weakThreshold > 0) {
     const names = weakPeers.map(p => `${p.ticker} ${p.changePct.toFixed(1)}%`).join(", ");
     return {
       healthy:          false,
@@ -1091,10 +1144,21 @@ async function monitorOpenPositions() {
 
       console.log(`  ${ourTrade.ticker} ${ourTrade.strategy} (${g.positions.length} legs): net value $${g.currentValue.toFixed(2)}/sh | P&L: ${currentPnL>=0?"+":""}$${currentPnL.toFixed(0)} (${currentPct.toFixed(1)}%) | DTE:${dte}`);
 
+      // Credit strategies (Iron Condor, CSP) need their OWN stop-loss.
+      // Standard professional heuristic: close a credit spread when the
+      // loss reaches 2x the credit received (200% of max profit) — this
+      // caps the damage well before reaching true max loss, which for a
+      // 4-wide Iron Condor wing can be 5-10x the credit collected.
+      // Both stop-loss thresholds now driven entirely by MANDATE — no
+      // hardcoded percentages, so both are tunable from one place.
+      const debitStopLossPnL  = -(ourTrade.executedCost * (MANDATE.stopLossPct / 100));
+      const creditStopLossPnL = -(maxProfitShare * g.qty * 100 * (MANDATE.creditStopLossPct / 100));
+
       let shouldClose = false, closeReason = "";
       if (currentPnL >= profitTargetPnL) { shouldClose=true; closeReason=`🎯 PROFIT TARGET — ${currentPct.toFixed(1)}% gain = +$${currentPnL.toFixed(0)}`; }
       else if (dte <= MANDATE.minDTE)    { shouldClose=true; closeReason=`📅 EXPIRY RISK — ${dte} DTE, closing to avoid assignment`; }
-      else if (!ourTrade.isCredit && currentPnL <= -ourTrade.executedCost) { shouldClose=true; closeReason=`🛑 STOP LOSS — down ${Math.abs(currentPct).toFixed(1)}% = -$${Math.abs(currentPnL).toFixed(0)}`; }
+      else if (!ourTrade.isCredit && currentPnL <= debitStopLossPnL)  { shouldClose=true; closeReason=`🛑 STOP LOSS — down ${MANDATE.stopLossPct}%+ of debit = -$${Math.abs(currentPnL).toFixed(0)}`; }
+      else if (ourTrade.isCredit  && currentPnL <= creditStopLossPnL) { shouldClose=true; closeReason=`🛑 CREDIT STOP LOSS — down ${MANDATE.creditStopLossPct}%+ of credit = -$${Math.abs(currentPnL).toFixed(0)}`; }
 
       if (shouldClose) {
         // Close EVERY leg of this trade together — never leave a partial spread open
@@ -1671,15 +1735,17 @@ console.log("   Mon–Fri 4:05 PM — Closing summary");
 console.log("   Sunday 8:00 AM  — Full portfolio review + auto-update all levels\n");
 
 // Schedules
-cron.schedule("10 9 * * 1-5",      morningSession,       { timezone:"America/New_York" });
-cron.schedule("15 9 * * 1-5",      updateAnalystTargets, { timezone:"America/New_York" });
-cron.schedule("*/20 9-16 * * 1-5", intradayCheck,        { timezone:"America/New_York" });
+cron.schedule("10 9 * * 1-5",      () => runExclusive("morningSession",       morningSession),       { timezone:"America/New_York" });
+cron.schedule("15 9 * * 1-5",      () => runExclusive("updateAnalystTargets", updateAnalystTargets), { timezone:"America/New_York" });
+cron.schedule("*/20 9-16 * * 1-5", () => runExclusive("intradayCheck",        intradayCheck),        { timezone:"America/New_York" });
 
-// Opportunistic mid-day scan: 11 AM, 1 PM, 3 PM ET Mon-Fri
-// Only fires on exceptional setups (5%+ moves) with remaining daily budget
-cron.schedule("0 11,13,15 * * 1-5", opportunisticScan,   { timezone:"America/New_York" });
-cron.schedule("5 16 * * 1-5",      closingSession,       { timezone:"America/New_York" });
-cron.schedule("0 8 * * 0",         sundaySummary,        { timezone:"America/New_York" });
+// Opportunistic mid-day scan: 11 AM, 1 PM, 3 PM ET Mon-Fri — NOTE this
+// collides on-the-minute with intradayCheck's */20 schedule at 11:00,
+// 13:00, 15:00. runExclusive() ensures only one of them actually runs
+// when that happens; the other is safely skipped and logged.
+cron.schedule("0 11,13,15 * * 1-5", () => runExclusive("opportunisticScan",    opportunisticScan),    { timezone:"America/New_York" });
+cron.schedule("5 16 * * 1-5",      () => runExclusive("closingSession",       closingSession),       { timezone:"America/New_York" });
+cron.schedule("0 8 * * 0",         () => runExclusive("sundaySummary",        sundaySummary),        { timezone:"America/New_York" });
 
 // Startup
 await sendSMS(`◈ OPTIONS BOT v2 ACTIVE (${modeLabel})
@@ -1698,7 +1764,7 @@ Schedule: 9:10AM execute | 9:15 targets | 20min monitor | 4PM close | Sun 8AM re
 (async () => {
   try {
     console.log("  ⏳ Running startup diagnostics...");
-    await intradayCheck();
+    await runExclusive("startupDiagnostics", intradayCheck);
     console.log("  🚀 Diagnostics clear. Background crons running.");
 
 
