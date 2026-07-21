@@ -392,16 +392,25 @@ async function buildOptionsLegs(tradeRec, stockPrice, regime = null) {
         const lc2 = calls.find(c => c.strike >= stockPrice * (1 + widthFactor));
         const sp2 = puts.find(p  => p.strike  <= stockPrice * (1 - otmFactor));
         const lp2 = puts.find(p  => p.strike  <= stockPrice * (1 - widthFactor));
-        if (!sc2||!lc2||!sp2||!lp2) return null;
+        if (!sc2||!lc2||!sp2||!lp2) {
+          console.log(`  ✗ ${tradeRec.ticker} Iron Condor REJECTED — missing strike(s) in chain: shortCall=${!!sc2} longCall=${!!lc2} shortPut=${!!sp2} longPut=${!!lp2} (${calls.length} calls, ${puts.length} puts available)`);
+          return null;
+        }
         const creditPerContract = ((sc2.bid-lc2.ask)+(sp2.bid-lp2.ask))*100;
-        if (creditPerContract <= 0) return null;
+        if (creditPerContract <= 0) {
+          console.log(`  ✗ ${tradeRec.ticker} Iron Condor REJECTED — non-positive credit: $${creditPerContract.toFixed(2)}/contract (call spread ${(sc2.bid-lc2.ask).toFixed(2)}, put spread ${(sp2.bid-lp2.ask).toFixed(2)})`);
+          return null;
+        }
         // Scale quantity so total credit lands inside the $500-$1000 mandate
         // range instead of comparing a 1-contract credit (often $100-400)
         // against a debit-spread-sized threshold.
         let qty = Math.max(1, Math.round(MANDATE.minPerTrade / creditPerContract));
         let totalCredit = creditPerContract * qty;
         while (totalCredit > MANDATE.maxPerTrade && qty > 1) { qty--; totalCredit = creditPerContract * qty; }
-        if (totalCredit < MANDATE.minPerTrade * 0.5) return null; // too little premium even at floor qty
+        if (totalCredit < MANDATE.minPerTrade * 0.5) {
+          console.log(`  ✗ ${tradeRec.ticker} Iron Condor REJECTED — credit too low even at floor qty: $${creditPerContract.toFixed(2)}/contract × ${qty} = $${totalCredit.toFixed(0)} (need ≥ $${(MANDATE.minPerTrade*0.5).toFixed(0)})`);
+          return null; // too little premium even at floor qty
+        }
         const maxLossPerContract = Math.max((lc2.strike - sc2.strike), (sp2.strike - lp2.strike)) * 100 - creditPerContract;
         return {
           expiration: validExp,
@@ -1424,7 +1433,11 @@ async function morningSession() {
     if (!stockData?.price) continue;
 
     const legs = await buildOptionsLegs(trade, stockData.price, regimeNow);
-    if (!legs || legs.cost < MANDATE.minPerTrade || legs.cost > MANDATE.maxPerTrade) continue;
+    if (!legs) { console.log(`  ⏭  ${trade.ticker} ${trade.strategy} — buildOptionsLegs returned null, skipping (see rejection reason above)`); continue; }
+    if (legs.cost < MANDATE.minPerTrade || legs.cost > MANDATE.maxPerTrade) {
+      console.log(`  ⏭  ${trade.ticker} ${trade.strategy} — cost $${legs.cost} outside mandate range $${MANDATE.minPerTrade}-$${MANDATE.maxPerTrade}, skipping`);
+      continue;
+    }
 
     const result = await placeOptionsOrder({ ticker:trade.ticker, strategy:trade.strategy, legs:legs.legs, quantity:legs.quantity || 1 });
     // Only log success and track position if the order actually succeeded.
