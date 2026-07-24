@@ -1808,12 +1808,71 @@ Trailing stops: ENABLED | Analyst targets: AUTO-UPDATE
 Schedule: 9:10AM execute | 9:25 targets | 20min monitor | 4PM close | Sun 8AM review`);
 
 // ================================================================
+// ═══════════════════════════════════════════════════════════════
+// ORPHANED POSITION RECONCILIATION
+// state.openPositions lives in memory only — every Railway redeploy
+// resets it to []. Any Tradier position opened before a restart
+// becomes permanently invisible to monitorOpenPositions (profit
+// target, stop-loss, breached-strike, DTE checks all key off
+// state.openPositions, so an orphan gets NONE of them). This runs
+// once at boot: fetch real Tradier positions, compare against the
+// (freshly emptied) in-memory state, and loudly alert on anything
+// found that the bot has no record of — rather than silently
+// managing zero risk on a real, live position.
+// ═══════════════════════════════════════════════════════════════
+
+async function reconcileOrphanedPositions() {
+  console.log("\n🔍 Checking for orphaned Tradier positions (untracked after restart)...");
+  try {
+    const positions = await getTradierPositions();
+    if (!positions.length) {
+      console.log("  ✓ No open Tradier positions — nothing to reconcile.");
+      return;
+    }
+
+    // Group by underlying symbol for a readable alert
+    const bySymbol = {};
+    for (const pos of positions) {
+      const underlying = pos.symbol.match(/^[A-Z]+/)?.[0] || pos.symbol;
+      if (!bySymbol[underlying]) bySymbol[underlying] = [];
+      bySymbol[underlying].push(pos);
+    }
+
+    const orphanSummaries = [];
+    for (const [underlying, legs] of Object.entries(bySymbol)) {
+      const tracked = legs.every(pos => state.openPositions.some(t => t.legs?.some(l => l.symbol === pos.symbol)));
+      if (!tracked) {
+        orphanSummaries.push(`${underlying}: ${legs.length} leg(s) — NOT tracked, no automated exit rules will apply`);
+      }
+    }
+
+    if (orphanSummaries.length > 0) {
+      console.error(`  🚨 ${orphanSummaries.length} orphaned position group(s) found — bot restarted and lost tracking:`);
+      orphanSummaries.forEach(s => console.error(`     ${s}`));
+      await sendSMS(
+`🚨 ORPHANED POSITIONS DETECTED
+Bot restarted — in-memory tracking was reset.
+
+${orphanSummaries.join("\n")}
+
+These positions are REAL and OPEN in Tradier but have NO automated stop-loss, profit-target, or breach protection until manually reviewed.
+Check Tradier sandbox directly and close or manage manually.`
+      );
+    } else {
+      console.log(`  ✓ All ${positions.length} live Tradier position(s) are properly tracked.`);
+    }
+  } catch(e) {
+    console.error(`  ✗ Reconciliation check failed: ${e.message}`);
+  }
+}
+
 // SECURE BOOT — wraps startup check so cron schedules survive
 // any transient network error on boot
 // ================================================================
 (async () => {
   try {
     console.log("  ⏳ Running startup diagnostics...");
+    await reconcileOrphanedPositions();
     await runExclusive("startupDiagnostics", intradayCheck);
     console.log("  🚀 Diagnostics clear. Background crons running.");
 
