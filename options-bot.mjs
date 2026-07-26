@@ -372,7 +372,7 @@ async function buildOptionsLegs(tradeRec, stockPrice, regime = null) {
         if (cost < MANDATE.minPerTrade || cost > MANDATE.maxPerTrade) return null;
         // Midpoint price for limit order — avoids slippage in live trading
         const midpoint = parseFloat(((lc.ask - sc.bid) / 2 + (lc.bid - sc.ask) / 2).toFixed(2));
-        return { expiration:validExp, legs:[{symbol:lc.symbol,side:"buy_to_open"},{symbol:sc.symbol,side:"sell_to_open"}], cost:Math.round(cost), maxProfit:Math.round((sc.strike-lc.strike-(lc.ask-sc.bid))*100), longSymbol:lc.symbol, shortSymbol:sc.symbol, limitPrice:midpoint };
+        return { expiration:validExp, legs:[{symbol:lc.symbol,side:"buy_to_open"},{symbol:sc.symbol,side:"sell_to_open"}], cost:Math.round(cost), maxProfit:Math.round((sc.strike-lc.strike-(lc.ask-sc.bid))*100), longSymbol:lc.symbol, shortSymbol:sc.symbol, limitPrice:midpoint, quantity:1 };
       }
       case "Bear Put Spread": {
         const bearOtm = (regime?.otmPct ?? 3) / 100;
@@ -381,7 +381,7 @@ async function buildOptionsLegs(tradeRec, stockPrice, regime = null) {
         if (!lp || !sp) return null;
         const cost = (lp.ask - sp.bid) * 100;
         if (cost < MANDATE.minPerTrade || cost > MANDATE.maxPerTrade) return null;
-        return { expiration:validExp, legs:[{symbol:lp.symbol,side:"buy_to_open"},{symbol:sp.symbol,side:"sell_to_open"}], cost:Math.round(cost), maxProfit:Math.round((lp.strike-sp.strike-(lp.ask-sp.bid))*100) };
+        return { expiration:validExp, legs:[{symbol:lp.symbol,side:"buy_to_open"},{symbol:sp.symbol,side:"sell_to_open"}], cost:Math.round(cost), maxProfit:Math.round((lp.strike-sp.strike-(lp.ask-sp.bid))*100), quantity:1 };
       }
       case "Iron Condor": {
         // Dynamic OTM distance based on regime — wider wings in volatile markets
@@ -1069,7 +1069,15 @@ async function getGroupedLivePositions() {
       results.push({ ourTrade, positions: g.positions, valid: false });
       continue;
     }
-    const qty = Math.abs(g.positions[0]?.quantity || 1);
+    // Prefer OUR OWN recorded quantity (set at order time in buildOptionsLegs)
+    // over Tradier's raw reported quantity for this symbol. If an old
+    // untracked/orphaned leg ever shares the exact same option contract
+    // as a leg in a trade we ARE tracking, Tradier merges them into one
+    // combined position row — using that raw combined quantity would
+    // silently corrupt P&L math (profit target, stop-loss, breach checks)
+    // for the whole grouped trade. Falling back to Tradier's quantity only
+    // when we have no record of our own (e.g. very old trade objects).
+    const qty = ourTrade.quantity || Math.abs(g.positions[0]?.quantity || 1);
     // netValue is signed per-leg-role during accumulation (long +, short -),
     // which converges to the correct "cost to close today" for BOTH debit
     // and credit spreads once we take the absolute value here.
