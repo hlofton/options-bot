@@ -5,7 +5,7 @@
 //             TSLA PANW CRWD SPY QQQ OKLO LLY PLTR NOW
 // Removed   : SPOK (illiquid), CMBT (no options), XLE (replaced by SPY/QQQ)
 // Added     : AMZN GOOGL META AVGO PANW CRWD SPY QQQ
-// Mandate   : $1,000–$2,000/day · $500–$1,000/trade · 8%+ return
+// Mandate   : $1,000–$5,000/day · $400–$1,200/trade · 8%+ return
 // Execution : Tradier API (sandbox or live)
 // Alerts    : Pushover push notifications
 // Schedule  : 9AM execute | 20min monitor | 4PM close | Sunday review
@@ -28,6 +28,7 @@
 
 import Anthropic from "@anthropic-ai/sdk";
 import cron      from "node-cron";
+import fs        from "fs";
 // fetch is native in Node 18+ — no import needed
 import dotenv    from "dotenv";
 dotenv.config();
@@ -50,11 +51,10 @@ if (!process.env.ANTHROPIC_API_KEY.startsWith("sk-ant-")) {
 // ── MANDATE ──────────────────────────────────────────────────
 const MANDATE = {
   dailyCapMin:     1000,
-  dailyCapMax:     2000,
-  maxPerTrade:     1000,
-  minPerTrade:     500,
+  dailyCapMax:     5000,
+  maxPerTrade:     1200,
+  minPerTrade:     400,
   minReturnPct:    8,
-  tradesPerDay:    { min: 3, max: 4 },
   profitTargetPct: 50,   // close at 50% of max profit
   stopLossPct:     100,  // DEBIT strategies (spreads): close if this % of the debit is lost
   creditStopLossPct: 200, // CREDIT strategies (Iron Condor, CSP): close if loss reaches this % of credit received
@@ -135,6 +135,70 @@ const state = {
   weeklyHighs:        {},   // highest price seen this week
   jobRunning:         null, // name of the currently executing scheduled job, or null
 };
+
+// ═══════════════════════════════════════════════════════════════
+// PERSISTENT STATE — survives Railway redeploys
+// state.openPositions previously lived in memory ONLY, meaning every
+// redeploy silently orphaned any open trade (see this week's AVGO,
+// NVDA, QQQ, PANW, SPY incidents — thousands of dollars in
+// unmonitored losses, all traced back to this single gap).
+//
+// REQUIRES a Railway Volume mounted at the path below. Without one,
+// this degrades gracefully to the old in-memory-only behavior (with
+// a loud warning), since a plain container filesystem is wiped on
+// every redeploy exactly like memory was.
+// ═══════════════════════════════════════════════════════════════
+
+const STATE_FILE = process.env.STATE_FILE_PATH || "/data/bot-state.json";
+
+function saveState() {
+  try {
+    const persistable = {
+      openPositions:      state.openPositions,
+      dailyTrades:        state.dailyTrades,
+      totalDeployedToday: state.totalDeployedToday,
+      dailyPnL:           state.dailyPnL,
+      dynamicLevels:       state.dynamicLevels,
+      weeklyHighs:         state.weeklyHighs,
+      savedAt:            new Date().toISOString(),
+    };
+    fs.writeFileSync(STATE_FILE, JSON.stringify(persistable, null, 2));
+  } catch(e) {
+    console.error(`  ✗ Failed to save state to ${STATE_FILE}: ${e.message}`);
+  }
+}
+
+function loadState() {
+  try {
+    if (!fs.existsSync(STATE_FILE)) {
+      console.log(`  ℹ No persisted state file at ${STATE_FILE} — starting fresh (expected on first-ever boot or if no Volume is mounted)`);
+      return false;
+    }
+    const persisted = JSON.parse(fs.readFileSync(STATE_FILE, "utf-8"));
+
+    state.openPositions = persisted.openPositions || [];
+    state.dynamicLevels = persisted.dynamicLevels || {};
+    state.weeklyHighs   = persisted.weeklyHighs   || {};
+
+    // Daily counters (trades placed today, capital deployed today) only
+    // make sense if the saved state is from TODAY — a redeploy that
+    // happens to land on a new trading day should start those at zero
+    // naturally, not carry yesterday's totals forward.
+    const savedDate = persisted.savedAt ? new Date(persisted.savedAt).toDateString() : null;
+    const today      = new Date().toDateString();
+    if (savedDate === today) {
+      state.dailyTrades        = persisted.dailyTrades || [];
+      state.totalDeployedToday = persisted.totalDeployedToday || 0;
+      state.dailyPnL           = persisted.dailyPnL || 0;
+    }
+
+    console.log(`  ✓ Restored state from disk: ${state.openPositions.length} open position(s) — saved ${persisted.savedAt}`);
+    return true;
+  } catch(e) {
+    console.error(`  ✗ Failed to load persisted state: ${e.message}`);
+    return false;
+  }
+}
 
 // ═══════════════════════════════════════════════════════════════
 // SCHEDULER CONCURRENCY GUARD
@@ -220,7 +284,7 @@ function updateTrailingStop(ticker, currentPrice, staticStop, trailPct = 12) {
 // TRADIER API
 // ═══════════════════════════════════════════════════════════════
 
-async function tradierRequest(method, path, params = {}) {
+async function tradierRequest(method, path, params = {}, attempt = 1) {
   const url     = `${TRADIER.baseUrl}${path}`;
   const headers = { "Authorization": `Bearer ${TRADIER.token}`, "Accept": "application/json" };
   let res;
@@ -231,6 +295,25 @@ async function tradierRequest(method, path, params = {}) {
     headers["Content-Type"] = "application/x-www-form-urlencoded";
     res = await fetch(url, { method, headers, body: new URLSearchParams(params).toString() });
   }
+
+  // Explicit rate-limit handling — with the trade-count cap removed, a
+  // busy morning session can now fire significantly more Tradier calls
+  // (3 per trade attempt: expirations + chain + order, across potentially
+  // 8-12+ trades). Without this, a 429 partway through would look
+  // identical to a normal rejection in the log, silently degrading the
+  // exact benefit removing the cap was meant to provide. Retries up to
+  // 3x respecting Retry-After when present, otherwise exponential backoff.
+  if (res.status === 429) {
+    if (attempt >= 3) {
+      throw new Error(`Tradier ${method} ${path} (429): rate limited after ${attempt} attempts, giving up`);
+    }
+    const retryAfterHeader = res.headers.get("Retry-After");
+    const wait = retryAfterHeader ? parseInt(retryAfterHeader, 10) * 1000 : attempt * 2000;
+    console.log(`  ⚠ Tradier rate limited (429) on ${path} — retrying in ${wait/1000}s (attempt ${attempt}/3)`);
+    await new Promise(r => setTimeout(r, wait));
+    return tradierRequest(method, path, params, attempt + 1);
+  }
+
   if (!res.ok) throw new Error(`Tradier ${method} ${path} (${res.status}): ${await res.text()}`);
   return res.json();
 }
@@ -401,7 +484,7 @@ async function buildOptionsLegs(tradeRec, stockPrice, regime = null) {
           console.log(`  ✗ ${tradeRec.ticker} Iron Condor REJECTED — non-positive credit: $${creditPerContract.toFixed(2)}/contract (call spread ${(sc2.bid-lc2.ask).toFixed(2)}, put spread ${(sp2.bid-lp2.ask).toFixed(2)})`);
           return null;
         }
-        // Scale quantity so total credit lands inside the $500-$1000 mandate
+        // Scale quantity so total credit lands inside the $400-$1200 mandate
         // range instead of comparing a 1-contract credit (often $100-400)
         // against a debit-spread-sized threshold.
         let qty = Math.max(1, Math.round(MANDATE.minPerTrade / creditPerContract));
@@ -437,7 +520,7 @@ async function buildOptionsLegs(tradeRec, stockPrice, regime = null) {
         if (!sp3) return null;
         const creditPerContract = sp3.bid * 100;
         // Scale contract quantity so the CREDIT COLLECTED (not the
-        // collateral) lands inside the mandate's $500-$1000 range.
+        // collateral) lands inside the mandate's $400-$1200 range.
         // "cost" now represents premium at risk, comparable to spreads.
         // "collateral" tracks the real cash-secured requirement separately
         // so account-balance checks stay accurate.
@@ -830,7 +913,7 @@ async function generateTrades(portfolioData, preComputedRegime = null) {
   if (regime.allowCondors)     allowedStrategies.push("Iron Condor");
   if (regime.allowDirectional) allowedStrategies.push("Bull Call Spread", "Bear Put Spread");
 
-  const prompt = `You are a professional options trader. Generate ${MANDATE.tradesPerDay.min}–${MANDATE.tradesPerDay.max} options trades for today.
+  const prompt = `You are a professional options trader. Generate as many high-quality options trades as fit within today's remaining capital — there is no fixed trade count, only the dollar budget and mandate criteria below. Do not pad the count with marginal setups just to use the budget; only include trades that genuinely meet the return and quality bar.
 
 DATE: ${today}
 MANDATE: $${MANDATE.minPerTrade}–$${MANDATE.maxPerTrade}/trade | $${MANDATE.dailyCapMin}–$${MANDATE.dailyCapMax} daily | ${MANDATE.minReturnPct}%+ return | Exit at ${MANDATE.profitTargetPct}% profit | Max ${MANDATE.maxDTE} DTE
@@ -895,9 +978,14 @@ REQUIRED FIELDS — do not rename or omit any:
 - rationale: one sentence explanation
 - exitTarget: exit rule string`;
 
+  // max_tokens raised from 1000 -> 3000: with the trade-count cap removed,
+  // a rich-premium day can legitimately produce 8-12+ trades at the new
+  // $400 floor. Each trade object is ~80-100 tokens; 1000 tokens was only
+  // safe for ~8-10 before silent JSON truncation — exactly the days this
+  // change was meant to help would have broken the response instead.
   const msg = await retryAI(() => ai.messages.create({
     model:      "claude-sonnet-4-6",
-    max_tokens: 1000,
+    max_tokens: 3000,
     messages:   [{ role: "user", content: prompt }],
   }));
 
@@ -1379,6 +1467,7 @@ Include every ticker. Use null for analystTarget if no data found.`;
     }
   } catch(e) { console.error(`  ✗ Analyst fetch failed: ${e.message}`); }
 
+  saveState(); // persist updated stops/targets
   console.log(`  ✅ Auto-update complete: ${totalUpdated} positions updated`);
   return totalUpdated;
 }
@@ -1469,6 +1558,7 @@ async function morningSession() {
     ? `◈ MORNING${modeFlag}${regimeFlag} ${new Date().toLocaleDateString()}\n\n${executed.length} TRADES EXECUTED:\n${executed.map((t,i)=>`${i+1}. ${t.ticker} ${t.strategy}\n   Cost: $${t.executedCost} | Target: ${t.targetReturnPct}%\n   Expiry: ${t.expiration} | Order: ${t.orderId}`).join("\n\n")}\n\nDeployed: $${state.totalDeployedToday}\nMonitoring every 20 min. Auto-close at ${MANDATE.profitTargetPct}% profit.\n\nNot financial advice.`
     : `◈ MORNING${modeFlag} ${new Date().toLocaleDateString()}\n\nNo trades executed — no setups met the 8% mandate.\nMonitoring continues.\n\nNot financial advice.`;
   await sendSMS(msg);
+  saveState(); // persist any new trades before this cycle ends
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -1570,6 +1660,7 @@ Deployed today: $${state.totalDeployedToday} / $${MANDATE.dailyCapMax}
 Not financial advice.`
     );
     console.log(`  ✅ Opportunistic trade placed: ${candidate.ticker} ${candidate.strategy} — $${legs.cost}`);
+    saveState(); // persist the new trade immediately
   } else {
     console.log(`  ✗ Order failed: ${result.error}`);
   }
@@ -1578,6 +1669,9 @@ Not financial advice.`
 async function intradayCheck() {
   console.log(`\n[${new Date().toLocaleTimeString()}] ⚡ Intraday check...`);
   await monitorOpenPositions();
+  saveState(); // persist immediately after any positions may have closed —
+               // this is the most important save point, since it runs
+               // every 20 minutes and captures every close event right away
 
   // Send a verified live snapshot if positions are open — ground truth,
   // not estimated. Only sends if there's something open to report.
@@ -1610,6 +1704,7 @@ async function closingSession() {
 
   await sendSMS(`🔔 CLOSING${modeFlag} ${new Date().toLocaleDateString()}\n\nOPTIONS:\nTrades: ${state.dailyTrades.length} | Open: ${state.openPositions.length}\nRealized P&L: ${state.dailyPnL>=0?"+":""}$${state.dailyPnL.toFixed(0)}\nDeployed: $${state.totalDeployedToday}\n\nSTOCKS:\n🟢 ${winners.slice(0,3).map(p=>`${p.ticker} +${(p.changePct||0).toFixed(1)}%`).join(", ")||"None"}\n🔴 ${losers.slice(0,3).map(p=>`${p.ticker} ${(p.changePct||0).toFixed(1)}%`).join(", ")||"None"}\n\nNot financial advice.`);
   state.alertsSent.clear();
+  saveState(); // persist end-of-day state
   console.log("  ✅ Closing summary sent.");
 }
 
@@ -1755,6 +1850,7 @@ async function sundaySummary() {
   const autoTargets = Object.values(state.dynamicLevels).filter(l=>l.target).length;
 
   await sendSMS(`📋 SUNDAY REVIEW\n${new Date().toLocaleDateString("en-US",{month:"long",day:"numeric",year:"numeric"})}\n\nAUTO-UPDATES:\n📈 Trailing stops: ${autoStops}\n🔄 Analyst targets: ${autoTargets}\n\n${lines}\n\n📈=auto stop 🔄=updated target\nNot financial advice.`);
+  saveState();
   console.log("  ✅ Sunday summary sent.");
 }
 
@@ -1788,7 +1884,7 @@ console.log("⏰ Schedule:");
 console.log("   Mon–Fri 9:10 AM — Morning scan + execute");
 console.log("   Mon–Fri 9:25 AM — Analyst targets refresh");
 console.log("   Mon–Fri 9:30–4PM — Position monitor + trailing stops every 20 min");
-console.log("   Mon–Fri 11AM,1PM,3PM — Opportunistic scan (5%+ moves only)");
+console.log("   Mon–Fri 11:02,1:02,3:02 — Opportunistic scan (5%+ moves only)");
 console.log("   Mon–Fri 4:05 PM — Closing summary");
 console.log("   Sunday 8:00 AM  — Full portfolio review + auto-update all levels\n");
 
@@ -1797,11 +1893,15 @@ cron.schedule("10 9 * * 1-5",      () => runExclusive("morningSession",       mo
 cron.schedule("25 9 * * 1-5",      () => runExclusive("updateAnalystTargets", updateAnalystTargets), { timezone:"America/New_York" });
 cron.schedule("*/20 9-16 * * 1-5", () => runExclusive("intradayCheck",        intradayCheck),        { timezone:"America/New_York" });
 
-// Opportunistic mid-day scan: 11 AM, 1 PM, 3 PM ET Mon-Fri — NOTE this
-// collides on-the-minute with intradayCheck's */20 schedule at 11:00,
-// 13:00, 15:00. runExclusive() ensures only one of them actually runs
-// when that happens; the other is safely skipped and logged.
-cron.schedule("0 11,13,15 * * 1-5", () => runExclusive("opportunisticScan",    opportunisticScan),    { timezone:"America/New_York" });
+// Opportunistic mid-day scan: 11:02 AM, 1:02 PM, 3:02 PM ET Mon-Fri.
+// CONFIRMED BUG (Jul 27 2026 live log): this used to fire at :00 exactly,
+// the SAME minute as intradayCheck's */20 schedule, every single day.
+// Since intradayCheck is registered first, it deterministically won the
+// runExclusive lock every time — opportunisticScan was skipped at BOTH
+// 11:00 and 1:00 today, missing a real AMD reversal (premarket +3% to
+// intraday -7%) that was exactly the kind of setup this scan exists to
+// catch. Offsetting by 2 minutes guarantees no collision, ever.
+cron.schedule("2 11,13,15 * * 1-5", () => runExclusive("opportunisticScan",    opportunisticScan),    { timezone:"America/New_York" });
 cron.schedule("5 16 * * 1-5",      () => runExclusive("closingSession",       closingSession),       { timezone:"America/New_York" });
 cron.schedule("0 8 * * 0",         () => runExclusive("sundaySummary",        sundaySummary),        { timezone:"America/New_York" });
 
@@ -1880,6 +1980,10 @@ Check Tradier sandbox directly and close or manage manually.`
 (async () => {
   try {
     console.log("  ⏳ Running startup diagnostics...");
+    // Restore state BEFORE reconciliation — so a legitimate restart with
+    // a working persisted state finds its own positions already tracked,
+    // rather than falsely flagging them as orphaned.
+    loadState();
     await reconcileOrphanedPositions();
     await runExclusive("startupDiagnostics", intradayCheck);
     console.log("  🚀 Diagnostics clear. Background crons running.");
