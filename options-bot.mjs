@@ -296,13 +296,22 @@ async function tradierRequest(method, path, params = {}, attempt = 1) {
     res = await fetch(url, { method, headers, body: new URLSearchParams(params).toString() });
   }
 
-  // Explicit rate-limit handling — with the trade-count cap removed, a
-  // busy morning session can now fire significantly more Tradier calls
-  // (3 per trade attempt: expirations + chain + order, across potentially
-  // 8-12+ trades). Without this, a 429 partway through would look
-  // identical to a normal rejection in the log, silently degrading the
-  // exact benefit removing the cap was meant to provide. Retries up to
-  // 3x respecting Retry-After when present, otherwise exponential backoff.
+  // Explicit rate-limit handling. Confirmed via Tradier's own docs:
+  // /markets endpoints are capped at 60 req/min (sandbox) / 120 req/min
+  // (production) — a per-minute window, not a daily one. Batched
+  // multi-symbol requests (as fetchAllPrices now uses) count as ONE
+  // request regardless of symbol count, so normal usage sits well under
+  // this. Still worth handling explicitly: with the trade-count cap
+  // removed, a busy morning session can fire more Tradier calls than
+  // before, and a 429 mid-session would otherwise look identical to a
+  // normal rejection in the log.
+  //
+  // NOTE: Tradier's docs mention custom response headers for gauging
+  // rate-limit usage but don't confirm the exact header name for
+  // "seconds until reset" — checking the standard Retry-After header
+  // is a harmless best-effort first attempt (used if present), and the
+  // exponential fallback below is the real safety net either way, so
+  // this retries correctly regardless of which header Tradier sends.
   if (res.status === 429) {
     if (attempt >= 3) {
       throw new Error(`Tradier ${method} ${path} (429): rate limited after ${attempt} attempts, giving up`);
@@ -547,7 +556,8 @@ async function buildOptionsLegs(tradeRec, stockPrice, regime = null) {
 }
 
 // ═══════════════════════════════════════════════════════════════
-// PRICE FEEDS — Alpha Vantage with multi-key rotation + cache
+// PRICE FEEDS — Stock prices via Tradier (batched); VIX/SPY sentiment
+// still via Alpha Vantage (low-volume, unaffected by the daily cap issue)
 // ═══════════════════════════════════════════════════════════════
 
 const AV_KEYS = [
@@ -557,6 +567,7 @@ const AV_KEYS = [
 ].filter(Boolean);
 
 // Guard: fail loudly at startup if no Alpha Vantage keys are configured
+// (only affects fetchVIX/fetchSPYChange now — stock prices use Tradier)
 // at all, rather than letting apiKey silently become "undefined" deep
 // inside fetchStockPrice / fetchVIX / fetchSPYChange.
 if (AV_KEYS.length === 0) {
@@ -565,34 +576,36 @@ if (AV_KEYS.length === 0) {
 
 const CACHE_TTL = 18 * 60 * 1000;
 
-async function fetchStockPrice(ticker, keyIndex = 0) {
+// ═══════════════════════════════════════════════════════════════
+// STOCK PRICES — now via Tradier (migrated from Alpha Vantage Jul 28
+// 2026). Alpha Vantage's free tier (25 req/day per key, 75/day across
+// all 3 keys) could not sustain fetching 17 stocks every 20 minutes —
+// exhausted by ~4 checks into the trading day, leaving the bot blind
+// (0/17 prices) for the rest of every session. Tradier has no such
+// daily cap and already powers order execution + option quotes, so
+// this removes an entire class of failure and a whole key-rotation
+// subsystem. Sandbox data carries Tradier's standard 15-min delay —
+// same delay Alpha Vantage's free tier already had, so no regression;
+// production/live trading gets real-time data automatically.
+// ═══════════════════════════════════════════════════════════════
+
+async function fetchStockPrice(ticker) {
   const cached = state.priceCache[ticker];
   if (cached && (Date.now()-cached.ts) < CACHE_TTL) return cached.data;
 
-  const apiKey = AV_KEYS.length ? AV_KEYS[keyIndex % AV_KEYS.length] : undefined;
   try {
-    const res  = await fetch(`https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol=${ticker}&apikey=${apiKey}`);
-    const data = await res.json();
-
-    if (data?.Note || data?.Information) {
-      if (AV_KEYS.length > 1 && keyIndex < AV_KEYS.length - 1) {
-        await new Promise(r => setTimeout(r, 500));
-        return fetchStockPrice(ticker, keyIndex + 1);
-      }
-      return cached?.data || null;
-    }
-
-    const q = data["Global Quote"];
-    if (!q?.["05. price"]) throw new Error("No data");
+    const quotes = await getOptionQuote(ticker); // works for plain equity symbols too
+    const q = quotes[0];
+    if (!q || q.last == null) throw new Error("No data");
 
     const result = {
       ticker,
-      price:     parseFloat(q["05. price"]),
-      change:    parseFloat(q["09. change"]),
-      changePct: parseFloat(q["10. change percent"]),
-      volume:    parseInt(q["06. volume"]),
-      high:      parseFloat(q["03. high"]),
-      low:       parseFloat(q["04. low"]),
+      price:     parseFloat(q.last),
+      change:    parseFloat(q.change ?? 0),
+      changePct: parseFloat(q.change_percentage ?? 0),
+      volume:    parseInt(q.volume ?? 0),
+      high:      parseFloat(q.high ?? q.last),
+      low:       parseFloat(q.low ?? q.last),
     };
     state.priceCache[ticker] = { ts:Date.now(), data:result };
     return result;
@@ -603,20 +616,34 @@ async function fetchStockPrice(ticker, keyIndex = 0) {
 }
 
 async function fetchAllPrices() {
-  console.log(`  Fetching ${PORTFOLIO.length} prices (${AV_KEYS.length} key(s))...`);
-  const results = [];
-  for (let i = 0; i < PORTFOLIO.length; i++) {
-    const stock = PORTFOLIO[i];
-    const data  = await fetchStockPrice(stock.ticker, i % AV_KEYS.length);
-    if (data) results.push({ ...stock, ...data });
-    // Scale delay linearly with portfolio size to stay under API limits.
-    // Formula: base 1200ms + 50ms per stock beyond 17 (current baseline).
-    // e.g. 20 stocks → 1350ms, 25 stocks → 1600ms, 30 stocks → 1850ms
-    const scaledDelay = 1200 + Math.max(0, (PORTFOLIO.length - 17) * 50);
-    await new Promise(r => setTimeout(r, scaledDelay));
+  console.log(`  Fetching ${PORTFOLIO.length} prices (Tradier, batched)...`);
+  try {
+    const tickers = PORTFOLIO.map(s => s.ticker);
+    const quotes  = await getOptionQuote(tickers); // single batched call, no per-symbol rate limit
+    const now     = Date.now();
+    const results = [];
+
+    for (const stock of PORTFOLIO) {
+      const q = quotes.find(x => x.symbol === stock.ticker);
+      if (!q || q.last == null) continue;
+      const data = {
+        ticker:    stock.ticker,
+        price:     parseFloat(q.last),
+        change:    parseFloat(q.change ?? 0),
+        changePct: parseFloat(q.change_percentage ?? 0),
+        volume:    parseInt(q.volume ?? 0),
+        high:      parseFloat(q.high ?? q.last),
+        low:       parseFloat(q.low ?? q.last),
+      };
+      state.priceCache[stock.ticker] = { ts: now, data };
+      results.push({ ...stock, ...data });
+    }
+    console.log(`  ✓ Prices: ${results.length}/${PORTFOLIO.length}`);
+    return results;
+  } catch(e) {
+    console.error(`  ✗ Batched price fetch failed: ${e.message} — falling back to cache`);
+    return PORTFOLIO.map(s => ({ ...s, ...(state.priceCache[s.ticker]?.data || {}) })).filter(s => s.price);
   }
-  console.log(`  ✓ Prices: ${results.length}/${PORTFOLIO.length}`);
-  return results;
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -1879,7 +1906,7 @@ console.log(`📋 Portfolio: ${PORTFOLIO.map(p=>p.ticker).join(", ")}`);
 console.log(`📊 ${PORTFOLIO.length} stocks | ${PORTFOLIO.filter(p=>p.optionable).length} optionable`);
 console.log(`◎  Mandate: $${MANDATE.dailyCapMin}–$${MANDATE.dailyCapMax}/day | $${MANDATE.minPerTrade}–$${MANDATE.maxPerTrade}/trade | ${MANDATE.minReturnPct}%+ | Exit ${MANDATE.profitTargetPct}% profit`);
 console.log(`🔗 Tradier: ${TRADIER.baseUrl}`);
-console.log(`🔑 Alpha Vantage keys: ${AV_KEYS.length}`);
+console.log(`🔑 Alpha Vantage keys: ${AV_KEYS.length} (VIX/SPY sentiment only — stock prices via Tradier)`);
 console.log("⏰ Schedule:");
 console.log("   Mon–Fri 9:10 AM — Morning scan + execute");
 console.log("   Mon–Fri 9:25 AM — Analyst targets refresh");
