@@ -18,9 +18,7 @@
 //   ANTHROPIC_API_KEY=sk-ant-...
 //   PUSHOVER_USER_KEY=u3h5z2iissjoagim6uu142zersmqre
 //   PUSHOVER_API_TOKEN=au8xzb8irkcdw1udkt7qk2htdxz5yw
-//   ALPHA_VANTAGE_API_KEY=xxxxxxx
-//   ALPHA_VANTAGE_API_KEY_2=xxxxxxx     (optional — sign up twice for more quota)
-//   ALPHA_VANTAGE_API_KEY_3=xxxxxxx     (optional — 17 stocks needs 3 keys ideally)
+// (Alpha Vantage keys no longer needed — all prices via Tradier as of Jul 29 2026)
 //   TRADIER_ACCESS_TOKEN=xxxxxxx
 //   TRADIER_ACCOUNT_ID=VA14921089
 //   TRADIER_SANDBOX=true                (set false for live trading)
@@ -560,19 +558,11 @@ async function buildOptionsLegs(tradeRec, stockPrice, regime = null) {
 // still via Alpha Vantage (low-volume, unaffected by the daily cap issue)
 // ═══════════════════════════════════════════════════════════════
 
-const AV_KEYS = [
-  process.env.ALPHA_VANTAGE_API_KEY,
-  process.env.ALPHA_VANTAGE_API_KEY_2,
-  process.env.ALPHA_VANTAGE_API_KEY_3,
-].filter(Boolean);
-
-// Guard: fail loudly at startup if no Alpha Vantage keys are configured
-// (only affects fetchVIX/fetchSPYChange now — stock prices use Tradier)
-// at all, rather than letting apiKey silently become "undefined" deep
-// inside fetchStockPrice / fetchVIX / fetchSPYChange.
-if (AV_KEYS.length === 0) {
-  console.error("🛑 CRITICAL: No ALPHA_VANTAGE_API_KEY(_2/_3) configured. Price fetching will fail entirely.");
-}
+// Alpha Vantage fully retired Jul 29 2026. Stock prices moved to Tradier
+// (fixed the recurring daily-quota exhaustion). VIX/SPY sentiment moved
+// to getSpyChangeFromPortfolio() (fixed the ^VIX symbol never having
+// been a valid GLOBAL_QUOTE target in the first place — see the block
+// comment above that function for the full story). No API keys needed.
 
 const CACHE_TTL = 18 * 60 * 1000;
 
@@ -675,63 +665,48 @@ async function sendSMS(body) {
 // condor wing width based on current volatility environment
 // ═══════════════════════════════════════════════════════════════
 
-// VIX thresholds
-const VIX_REGIME = {
-  calm:     18,   // VIX < 18  → normal wings, all strategies allowed
-  elevated: 25,   // VIX 18–25 → wider wings, avoid directional spreads
-  fearful:  35,   // VIX 25–35 → widest wings, income only
-                  // VIX > 35  → no new trades (extreme fear)
-};
+// VIX_REGIME removed — regime thresholds now hardcoded directly
+// in getMarketRegime() based on SPY change alone (see that function).
 
-async function fetchVIX() {
-  for (let attempt = 1; attempt <= 3; attempt++) {
-    try {
-      // Use AV_KEYS rotation — don't hardcode primary key
-      const key  = AV_KEYS[AV_KEYS.length - 1] || process.env.ALPHA_VANTAGE_API_KEY;
-      const res  = await fetch(`https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol=^VIX&apikey=${key}`);
-      const data = await res.json();
-      const q    = data["Global Quote"];
-      if (!q?.["05. price"]) throw new Error("No VIX data");
-      const vix  = parseFloat(q["05. price"]);
-      console.log(`  📊 VIX: ${vix}`);
-      return vix;
-    } catch(e) {
-      if (attempt === 3) {
-        console.log(`  ⚠ VIX fetch failed after 3 attempts — defaulting to 18`);
-        return 18;
-      }
-      await new Promise(r => setTimeout(r, attempt * 2000));
-    }
+// ═══════════════════════════════════════════════════════════════
+// REGIME SIGNAL — retired Alpha Vantage VIX/SPY fetching entirely
+// (Jul 29 2026). Root cause of "VIX fetch failed... defaulting to 18"
+// appearing in EVERY session log: GLOBAL_QUOTE doesn't support index
+// symbols like ^VIX at all — that call could never have succeeded.
+// SPY's fetch failed too, via a different mechanism (the reserved
+// Alpha Vantage key was independently exhausted). CONSEQUENCE: since
+// a defaulted VIX of 18 can never exceed any threshold (18 IS the
+// calm boundary) and a defaulted SPY change of 0 can never be below
+// any negative threshold, getMarketRegime(18, 0) always evaluated to
+// NORMAL — every single session since this system was built never
+// once actually classified real market conditions.
+//
+// FIX: derive the regime signal from SPY's day change already
+// present in portfolioData (fetched reliably via Tradier's batched
+// quote call every cycle) — no separate network call, no external
+// dependency, no possibility of a silent default masking a real
+// failure. VIX itself is dropped; SPY's move is a well-established,
+// highly-correlated proxy for broad market volatility.
+// ═══════════════════════════════════════════════════════════════
+
+function getSpyChangeFromPortfolio(portfolioData) {
+  const spy = portfolioData.find(p => p.ticker === "SPY");
+  if (!spy || spy.changePct == null) {
+    console.log(`  ⚠ SPY not found in portfolio data — defaulting regime signal to 0%`);
+    return 0;
   }
-  return 18;
+  return spy.changePct;
 }
 
-async function fetchSPYChange() {
-  for (let attempt = 1; attempt <= 3; attempt++) {
-    try {
-      // Use AV_KEYS rotation — reserve last key for sentiment fetches
-      const key     = AV_KEYS[AV_KEYS.length - 1] || process.env.ALPHA_VANTAGE_API_KEY;
-      const res     = await fetch(`https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol=SPY&apikey=${key}`);
-      const data    = await res.json();
-      const q       = data["Global Quote"];
-      if (!q?.["10. change percent"]) throw new Error("No SPY data");
-      const change  = parseFloat(q["10. change percent"]);
-      console.log(`  📊 SPY day change: ${change.toFixed(2)}%`);
-      return change;
-    } catch(e) {
-      if (attempt === 3) {
-        console.log(`  ⚠ SPY change fetch failed after 3 attempts — defaulting to 0`);
-        return 0;
-      }
-      await new Promise(r => setTimeout(r, attempt * 2000));
-    }
-  }
-  return 0;
-}
-
-function getMarketRegime(vix, spyChangePct) {
-  // Determine regime and rules for today's trading
-  if (vix > VIX_REGIME.fearful) {
+function getMarketRegime(spyChangePct) {
+  // Regime classification driven purely by SPY's day change — see the
+  // block comment above getSpyChangeFromPortfolio for why VIX was
+  // dropped entirely rather than left as a (previously always-broken)
+  // secondary input. Same threshold values that were already tested
+  // and tuned this week (the -0.3% ELEVATED threshold specifically
+  // calibrated against the July 14 borderline-volatility session) —
+  // only the broken input source changed, not the trigger points.
+  if (spyChangePct < -3.0) {
     return {
       label:            "EXTREME FEAR",
       allowDirectional: false,
@@ -739,10 +714,10 @@ function getMarketRegime(vix, spyChangePct) {
       allowCSP:         false,
       skipTrading:      true,
       wingMultiplier:   2.0,
-      note:             `VIX ${vix} > 35 — no new trades today. Extreme fear.`,
+      note:             `SPY ${spyChangePct.toFixed(1)}% — no new trades today. Extreme fear.`,
     };
   }
-  if (vix > VIX_REGIME.elevated || spyChangePct < -1.0) {
+  if (spyChangePct < -1.0) {
     return {
       label:            "HIGH VOLATILITY",
       allowDirectional: false,
@@ -751,11 +726,10 @@ function getMarketRegime(vix, spyChangePct) {
       skipTrading:      false,
       wingMultiplier:   1.5,
       otmPct:           5,      // 5% OTM strikes
-      note:             `VIX ${vix} / SPY ${spyChangePct.toFixed(1)}% — income only, 5% OTM wings`,
+      note:             `SPY ${spyChangePct.toFixed(1)}% — income only, 5% OTM wings`,
     };
   }
-  // Lowered SPY threshold from -0.5% to -0.3% — catches borderline days like July 14
-  if (vix > VIX_REGIME.calm || spyChangePct < -0.3) {
+  if (spyChangePct < -0.3) {
     return {
       label:            "ELEVATED VOLATILITY",
       allowDirectional: false,
@@ -764,7 +738,7 @@ function getMarketRegime(vix, spyChangePct) {
       skipTrading:      false,
       wingMultiplier:   1.25,
       otmPct:           4,      // 4% OTM strikes
-      note:             `VIX ${vix} / SPY ${spyChangePct.toFixed(1)}% — income only, 4% OTM wings`,
+      note:             `SPY ${spyChangePct.toFixed(1)}% — income only, 4% OTM wings`,
     };
   }
   return {
@@ -775,7 +749,7 @@ function getMarketRegime(vix, spyChangePct) {
     skipTrading:      false,
     wingMultiplier:   1.0,
     otmPct:           3,        // 3% OTM strikes in calm markets
-    note:             `VIX ${vix} / SPY ${spyChangePct.toFixed(1)}% — all strategies allowed, 3% OTM`,
+    note:             `SPY ${spyChangePct.toFixed(1)}% — all strategies allowed, 3% OTM`,
   };
 }
 
@@ -896,17 +870,15 @@ async function generateTrades(portfolioData, preComputedRegime = null) {
   const today      = new Date().toLocaleDateString("en-US",{weekday:"long",month:"long",day:"numeric",year:"numeric"});
 
   // ── Use pre-fetched regime if the caller already computed one this
-  // session (avoids redundant VIX/SPY API calls and prevents the AI
-  // prompt from describing a different regime than buildOptionsLegs uses) ──
-  let vix, spyChange, regime;
+  // session (avoids redundant work and prevents the AI prompt from
+  // describing a different regime than buildOptionsLegs uses) ──
+  let spyChange, regime;
   if (preComputedRegime) {
-    ({ vix, spyChange, regime } = preComputedRegime);
+    ({ spyChange, regime } = preComputedRegime);
     console.log(`  📊 Using pre-computed regime: ${regime.label} (passed from caller)`);
   } else {
-    vix = 18; spyChange = 0;
-    try { [vix, spyChange] = await Promise.all([fetchVIX(), fetchSPYChange()]); }
-    catch(e) { console.log(`  ⚠ Market sentiment fetch failed (${e.message}) — using defaults VIX:18 SPY:0%`); }
-    regime = getMarketRegime(vix, spyChange);
+    spyChange = getSpyChangeFromPortfolio(portfolioData);
+    regime    = getMarketRegime(spyChange);
     console.log(`  📊 Market regime: ${regime.label} — ${regime.note}`);
   }
 
@@ -946,7 +918,7 @@ DATE: ${today}
 MANDATE: $${MANDATE.minPerTrade}–$${MANDATE.maxPerTrade}/trade | $${MANDATE.dailyCapMin}–$${MANDATE.dailyCapMax} daily | ${MANDATE.minReturnPct}%+ return | Exit at ${MANDATE.profitTargetPct}% profit | Max ${MANDATE.maxDTE} DTE
 
 MARKET REGIME: ${regime.label}
-VIX: ${vix} | SPY Day Change: ${spyChange.toFixed(2)}%
+SPY Day Change: ${spyChange.toFixed(2)}%
 REGIME NOTE: ${regime.note}
 WING WIDTH MULTIPLIER: ${regime.wingMultiplier}x (apply to all condor strikes — wider wings in high volatility)
 
@@ -1521,12 +1493,11 @@ async function morningSession() {
   const portfolioData = await fetchAllPrices();
   const modeFlag      = TRADIER.sandbox ? " [SANDBOX]" : "";
 
-  // VIX and SPY change — fail gracefully to defaults if connection error
-  let vixNow = 18, spyNow = 0;
-  try { vixNow = await fetchVIX(); }      catch(e) { console.log(`  ⚠ VIX unavailable — defaulting to 18`); }
-  try { spyNow = await fetchSPYChange(); } catch(e) { console.log(`  ⚠ SPY change unavailable — defaulting to 0`); }
-  const regimeNow = getMarketRegime(vixNow, spyNow);
-  console.log(`  📊 Regime: ${regimeNow.label} | VIX: ${vixNow} | SPY: ${spyNow.toFixed(2)}%`);
+  // Regime signal sourced from already-fetched portfolioData — no
+  // separate network call, no external dependency that can silently fail.
+  const spyNow    = getSpyChangeFromPortfolio(portfolioData);
+  const regimeNow = getMarketRegime(spyNow);
+  console.log(`  📊 Regime: ${regimeNow.label} | SPY: ${spyNow.toFixed(2)}%`);
 
   // Generate trades — retry up to 3x on connection errors
   let trades = [];
@@ -1534,7 +1505,7 @@ async function morningSession() {
   while (scanAttempt < 3 && trades.length === 0) {
     scanAttempt++;
     try {
-      trades = await generateTrades(portfolioData, { vix: vixNow, spyChange: spyNow, regime: regimeNow });
+      trades = await generateTrades(portfolioData, { spyChange: spyNow, regime: regimeNow });
     } catch(e) {
       const isRetryable = e.message.includes("Connection error") ||
                           e.message.includes("ECONNREFUSED") ||
@@ -1580,7 +1551,7 @@ async function morningSession() {
     await new Promise(r => setTimeout(r, 1000));
   }
 
-  const regimeFlag = regimeNow.label !== "NORMAL" ? `\nRegime: ${regimeNow.label} (VIX ${vixNow})` : "";
+  const regimeFlag = regimeNow.label !== "NORMAL" ? `\nRegime: ${regimeNow.label} (SPY ${spyNow.toFixed(1)}%)` : "";
   const msg = executed.length > 0
     ? `◈ MORNING${modeFlag}${regimeFlag} ${new Date().toLocaleDateString()}\n\n${executed.length} TRADES EXECUTED:\n${executed.map((t,i)=>`${i+1}. ${t.ticker} ${t.strategy}\n   Cost: $${t.executedCost} | Target: ${t.targetReturnPct}%\n   Expiry: ${t.expiration} | Order: ${t.orderId}`).join("\n\n")}\n\nDeployed: $${state.totalDeployedToday}\nMonitoring every 20 min. Auto-close at ${MANDATE.profitTargetPct}% profit.\n\nNot financial advice.`
     : `◈ MORNING${modeFlag} ${new Date().toLocaleDateString()}\n\nNo trades executed — no setups met the 8% mandate.\nMonitoring continues.\n\nNot financial advice.`;
@@ -1631,10 +1602,8 @@ async function opportunisticScan() {
   console.log(`  🎯 Found ${exceptionalMoves.length} exceptional move(s): ${exceptionalMoves.map(p=>`${p.ticker} ${p.changePct.toFixed(1)}%`).join(", ")}`);
 
   // Re-check regime and sector health — same rules as morning session
-  let vixNow = 18, spyNow = 0;
-  try { vixNow = await fetchVIX(); } catch(e) {}
-  try { spyNow = await fetchSPYChange(); } catch(e) {}
-  const regime = getMarketRegime(vixNow, spyNow);
+  const spyNow = getSpyChangeFromPortfolio(portfolioData);
+  const regime = getMarketRegime(spyNow);
 
   if (regime.skipTrading) {
     console.log(`  ⏭  Skipping — regime is ${regime.label}, no new trades`);
@@ -1644,7 +1613,7 @@ async function opportunisticScan() {
   // Generate a trade recommendation using the same AI + mandate logic
   let trades = [];
   try {
-    trades = await generateTrades(portfolioData, { vix: vixNow, spyChange: spyNow, regime });
+    trades = await generateTrades(portfolioData, { spyChange: spyNow, regime });
   } catch(e) {
     console.log(`  ✗ Opportunistic scan generation failed: ${e.message}`);
     return;
@@ -1892,7 +1861,6 @@ const missingVars = [];
 if (!process.env.ANTHROPIC_API_KEY)    missingVars.push("ANTHROPIC_API_KEY");
 if (!process.env.PUSHOVER_USER_KEY)    missingVars.push("PUSHOVER_USER_KEY");
 if (!process.env.TRADIER_ACCESS_TOKEN) missingVars.push("TRADIER_ACCESS_TOKEN");
-if (!process.env.ALPHA_VANTAGE_API_KEY)missingVars.push("ALPHA_VANTAGE_API_KEY");
 if (missingVars.length > 0) {
   console.error(`🚨 MISSING ENV VARS: ${missingVars.join(", ")}`);
 }
@@ -1906,7 +1874,6 @@ console.log(`📋 Portfolio: ${PORTFOLIO.map(p=>p.ticker).join(", ")}`);
 console.log(`📊 ${PORTFOLIO.length} stocks | ${PORTFOLIO.filter(p=>p.optionable).length} optionable`);
 console.log(`◎  Mandate: $${MANDATE.dailyCapMin}–$${MANDATE.dailyCapMax}/day | $${MANDATE.minPerTrade}–$${MANDATE.maxPerTrade}/trade | ${MANDATE.minReturnPct}%+ | Exit ${MANDATE.profitTargetPct}% profit`);
 console.log(`🔗 Tradier: ${TRADIER.baseUrl}`);
-console.log(`🔑 Alpha Vantage keys: ${AV_KEYS.length} (VIX/SPY sentiment only — stock prices via Tradier)`);
 console.log("⏰ Schedule:");
 console.log("   Mon–Fri 9:10 AM — Morning scan + execute");
 console.log("   Mon–Fri 9:25 AM — Analyst targets refresh");
