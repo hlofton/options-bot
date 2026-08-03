@@ -350,9 +350,19 @@ async function getTradierPositions() {
   try {
     const data = await tradierRequest("GET", `/accounts/${TRADIER.accountId}/positions`);
     const p = data?.positions?.position;
-    if (!p) return [];
+    if (!p) return []; // confirmed by Tradier: genuinely zero positions
     return Array.isArray(p) ? p : [p];
-  } catch(e) { console.error(`  ✗ Positions: ${e.message}`); return []; }
+  } catch(e) {
+    console.error(`  ✗ Positions: ${e.message}`);
+    // CRITICAL DISTINCTION: null means "fetch failed, unknown state" —
+    // NEVER treat this the same as a confirmed-empty [] response. A
+    // transient network/API failure must not be interpreted as proof
+    // the account is flat — any caller that mutates state.openPositions
+    // based on "no positions found" MUST check for null first and skip
+    // any destructive action, only proceeding on a genuine [] (or a
+    // real array of positions).
+    return null;
+  }
 }
 
 async function getOptionQuote(symbols) {
@@ -1118,7 +1128,39 @@ function detectAlerts(stock, priceData) {
 
 async function getGroupedLivePositions() {
   const positions = await getTradierPositions();
-  if (!positions.length) return [];
+
+  // CRITICAL: positions can now be null (fetch failed) or [] (confirmed
+  // empty) — these must NEVER be treated the same. null means "unknown
+  // state, do nothing." Only a genuine [] (or non-empty array) is safe
+  // to act on. This distinction exists specifically because an earlier
+  // version of this function conflated the two, which would have wiped
+  // state.openPositions on nothing more than a transient network blip.
+  if (positions === null) {
+    console.log(`  ⚠ Tradier positions fetch failed — skipping this cycle, state.openPositions left untouched.`);
+    return [];
+  }
+
+  if (!positions.length) {
+    // Confirmed by Tradier: the account genuinely has zero positions.
+    // Safe to clean up any tracked trades, since this is verified data,
+    // not a fetch failure masquerading as an empty result.
+    if (state.openPositions.length > 0) {
+      const staleList = state.openPositions.map(t => `${t.ticker} ${t.strategy}`).join(", ");
+      console.error(`  🧹 STALE TRACKED POSITIONS: Tradier confirms account is flat but ${state.openPositions.length} trade(s) still tracked — removing: ${staleList}`);
+      state.openPositions = [];
+      await sendSMS(
+`🧹 STALE POSITION CLEANUP
+${staleList}
+
+Tradier confirms the account is fully flat but these were still tracked as open — likely closed successfully despite an earlier reported close failure.
+
+Removed from tracking. Verify final P&L manually if needed.
+Not financial advice.`
+      );
+      saveState();
+    }
+    return [];
+  }
 
   // Build a quote lookup for every leg symbol in one batch call
   const allSymbols = positions.map(p => p.symbol);
@@ -1171,6 +1213,39 @@ async function getGroupedLivePositions() {
     const currentValue = Math.abs(g.netValue);
     results.push({ ourTrade, positions: g.positions, valid: true, currentValue, qty });
   }
+
+  // ── STALE POSITION CLEANUP (bidirectional reconciliation) ──────
+  // reconcileOrphanedPositions only ever checks ONE direction: "does
+  // Tradier have something we don't know about." It never checks the
+  // opposite — "do we think something is open that Tradier says is
+  // gone." Confirmed real-world case (Aug 3 2026): a burst of 4
+  // positions closing in the same monitoring cycle caused
+  // closeOptionsPosition to report failure for legs that had ACTUALLY
+  // filled at Tradier — leaving state.openPositions tracking 5 phantom
+  // trades indefinitely, generating repeated false "partial close"
+  // alerts for positions that no longer existed. Any trade in
+  // state.openPositions with ZERO matching legs anywhere in Tradier's
+  // real position list is almost certainly already closed — clean it
+  // up here rather than let it silently persist forever.
+  const trulyGrouped = new Set(grouped.keys());
+  const staleTrades   = state.openPositions.filter(t => !trulyGrouped.has(t));
+  if (staleTrades.length > 0) {
+    for (const stale of staleTrades) {
+      console.error(`  🧹 STALE TRACKED POSITION: ${stale.ticker} ${stale.strategy} has no matching legs left in Tradier — assuming already closed, removing from tracking.`);
+    }
+    state.openPositions = state.openPositions.filter(t => trulyGrouped.has(t));
+    await sendSMS(
+`🧹 STALE POSITION CLEANUP
+${staleTrades.map(t => `${t.ticker} ${t.strategy}`).join(", ")}
+
+These were tracked as open but no longer exist in Tradier — likely closed successfully even though the bot previously reported a close failure for them.
+
+Removed from tracking. Verify final P&L manually if needed.
+Not financial advice.`
+    );
+    saveState();
+  }
+
   return results;
 }
 
@@ -1302,12 +1377,22 @@ async function monitorOpenPositions() {
       else if (ourTrade.isCredit  && currentPnL <= creditStopLossPnL) { shouldClose=true; closeReason=`🛑 CREDIT STOP LOSS — down ${MANDATE.creditStopLossPct}%+ of credit = -$${Math.abs(currentPnL).toFixed(0)}`; }
 
       if (shouldClose) {
-        // Close EVERY leg of this trade together — never leave a partial spread open
+        // Close EVERY leg of this trade together — never leave a partial spread open.
+        // 500ms between legs (was 300ms) + logging the ACTUAL error text per leg —
+        // previously only a count of failures was logged, making a real diagnosis
+        // impossible. Root cause suspected but NOT yet confirmed: the close orders
+        // hit /accounts/{id}/orders (a trading endpoint), whose rate limit was never
+        // separately verified from the /markets data endpoint's documented 60/min —
+        // 4 positions all exiting in the same cycle could burst 14+ close orders in
+        // a few seconds. This logging will confirm or rule that out next occurrence.
         const closeResults = [];
         for (const pos of g.positions) {
           const result = await closeOptionsPosition({ symbol:pos.symbol, underlyingSymbol:ourTrade.ticker, quantity:Math.abs(pos.quantity), side:pos.quantity>0?"buy_to_open":"sell_to_open" });
+          if (!result.success) {
+            console.error(`  ✗ Close failed for ${pos.symbol}: ${result.error}`);
+          }
           closeResults.push(result);
-          await new Promise(r => setTimeout(r, 300));
+          await new Promise(r => setTimeout(r, 500));
         }
         const allClosed = closeResults.every(r => r.success);
         if (allClosed) {
@@ -1317,10 +1402,14 @@ async function monitorOpenPositions() {
         } else {
           // CRITICAL: some legs failed to close — do NOT remove from tracking.
           // Keep monitoring so we retry closing the remaining legs next cycle.
-          const failedCount = closeResults.filter(r => !r.success).length;
-          console.error(`  🚨 PARTIAL CLOSE FAILURE: ${failedCount}/${g.positions.length} legs failed to close on ${ourTrade.ticker}. Trade remains tracked for retry.`);
-          await sendSMS(`🚨 PARTIAL CLOSE ALERT\n${ourTrade.ticker} ${ourTrade.strategy}\n${failedCount} of ${g.positions.length} legs failed to close.\nBot will retry next cycle. Check Tradier sandbox manually if this repeats.`);
+          const failedCount   = closeResults.filter(r => !r.success).length;
+          const failureReasons = closeResults.filter(r => !r.success).map(r => r.error).join(" | ");
+          console.error(`  🚨 PARTIAL CLOSE FAILURE: ${failedCount}/${g.positions.length} legs failed to close on ${ourTrade.ticker}. Reasons: ${failureReasons}. Trade remains tracked for retry.`);
+          await sendSMS(`🚨 PARTIAL CLOSE ALERT\n${ourTrade.ticker} ${ourTrade.strategy}\n${failedCount} of ${g.positions.length} legs failed to close.\nReason: ${failureReasons.slice(0,200)}\nBot will retry next cycle.`);
         }
+        // Small pause between DIFFERENT positions closing in the same monitoring
+        // cycle — same burst-risk precaution, applied at the position level too.
+        await new Promise(r => setTimeout(r, 500));
       }
     } catch(e) { console.error(`  ✗ Monitor ${ourTrade?.ticker || "unknown"}: ${e.message}`); }
     await new Promise(r => setTimeout(r, 500));
@@ -1927,6 +2016,10 @@ async function reconcileOrphanedPositions() {
   console.log("\n🔍 Checking for orphaned Tradier positions (untracked after restart)...");
   try {
     const positions = await getTradierPositions();
+    if (positions === null) {
+      console.log("  ⚠ Tradier positions fetch failed — skipping reconciliation this cycle.");
+      return;
+    }
     if (!positions.length) {
       console.log("  ✓ No open Tradier positions — nothing to reconcile.");
       return;
