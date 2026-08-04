@@ -1171,9 +1171,25 @@ Not financial advice.`
   // Group Tradier position rows by which internal trade they belong to
   const grouped = new Map(); // ourTrade -> { positions: [...], legValue: number }
 
+  // ── INLINE RECONCILIATION ────────────────────────────────────────
+  // Collect Tradier positions that don't match any tracked trade.
+  // After grouping, these are rebuilt and added to state.openPositions
+  // so monitoring picks them up this cycle — same logic as
+  // reconcileOrphanedPositions on startup, but triggered here during
+  // any intraday check where we find untracked Tradier positions.
+  // Covers the case where stale cleanup (pre-Aug-4-fix) dropped a
+  // tracked position that still exists in Tradier.
+  const untrackedByUnderlying = {};
+
   for (const pos of positions) {
     const ourTrade = state.openPositions.find(t => t.legs?.some(l => l.symbol === pos.symbol));
-    if (!ourTrade) continue; // untracked position — skip, don't misattribute
+    if (!ourTrade) {
+      // Collect untracked for inline reconciliation below
+      const underlying = pos.symbol.match(/^[A-Z]+/)?.[0] || pos.symbol;
+      if (!untrackedByUnderlying[underlying]) untrackedByUnderlying[underlying] = [];
+      untrackedByUnderlying[underlying].push(pos);
+      continue; // don't misattribute to a wrong tracked trade
+    }
 
     if (!grouped.has(ourTrade)) grouped.set(ourTrade, { positions: [], netValue: 0, missingQuote: false });
     const g = grouped.get(ourTrade);
@@ -1189,6 +1205,42 @@ Not financial advice.`
     // reconstructs the true net debit/credit value of the whole spread.
     const legSign = pos.quantity > 0 ? 1 : -1;
     g.netValue += legSign * legMid;
+  }
+
+  // ── INLINE REBUILD: restore any untracked positions found above ──
+  const inlineRestored = [];
+  for (const [underlying, legs] of Object.entries(untrackedByUnderlying)) {
+    const rebuilt = rebuildTradeFromPositions(underlying, legs);
+    if (rebuilt) {
+      state.openPositions.push(rebuilt);
+      inlineRestored.push(`${underlying} ${rebuilt.strategy}`);
+      console.log(`  🔄 Inline restore: ${underlying} ${rebuilt.strategy} (${legs.length} legs) — now monitored`);
+      // Also add to grouped so it gets monitored THIS cycle, not just next
+      if (!grouped.has(rebuilt)) grouped.set(rebuilt, { positions: [], netValue: 0, missingQuote: false });
+      const g2 = grouped.get(rebuilt);
+      for (const pos of legs) {
+        g2.positions.push(pos);
+        const q2 = quoteMap[pos.symbol];
+        if (!q2) { g2.missingQuote = true; continue; }
+        const mid2 = (q2.bid + q2.ask) / 2;
+        g2.netValue += (pos.quantity > 0 ? 1 : -1) * mid2;
+      }
+    } else {
+      console.error(`  ⚠ Inline restore failed for ${underlying} (${legs.length} legs) — manual intervention needed`);
+    }
+  }
+  if (inlineRestored.length > 0) {
+    saveState();
+    await sendSMS(
+`🔄 INLINE POSITION RESTORE
+${inlineRestored.length} position(s) found in Tradier with no tracking record — auto-restored mid-session:
+
+${inlineRestored.join("\n")}
+
+Monitoring (breach, DTE, stop) now active.
+Note: cost basis reconstructed from Tradier data.
+Not financial advice.`
+    );
   }
 
   // Convert to array with computed P&L per GROUPED trade (not per leg)
@@ -1227,13 +1279,54 @@ Not financial advice.`
   // state.openPositions with ZERO matching legs anywhere in Tradier's
   // real position list is almost certainly already closed — clean it
   // up here rather than let it silently persist forever.
+  //
+  // GRACE PERIOD (Aug 4 2026): Tradier has a confirmed fill-to-position
+  // lag for multileg condor orders — symbols in /markets/options/chains
+  // don't always match /accounts/.../positions within the first ~20 min.
+  // Three Iron Condors were wiped from tracking at 9:20 AM (10 min after
+  // placement at 9:10) because of this mismatch.
+  //
+  // TWO-PART FIX:
+  //   1. Grace period extended to 60 min (was 20 — too close to the lag)
+  //   2. *** BUG FIX ***: the original filter used trulyGrouped.has(t),
+  //      which removed ALL unmatched trades — including grace-period ones —
+  //      whenever ANY stale trade existed. Now only the confirmed-stale
+  //      trades (in the staleTrades Set) are removed; grace-period trades
+  //      are explicitly preserved.
+  const STALE_GRACE_MS    = 60 * 60 * 1000; // 60 minutes
+  const nowMs             = Date.now();
+  const allTradierSymbols = positions.map(p => p.symbol); // for diagnostics
+
   const trulyGrouped = new Set(grouped.keys());
-  const staleTrades   = state.openPositions.filter(t => !trulyGrouped.has(t));
+  const staleTrades  = state.openPositions.filter(t => {
+    if (trulyGrouped.has(t)) return false; // matched — definitely not stale
+
+    const ageMs  = t.executedAt ? nowMs - new Date(t.executedAt).getTime() : Infinity;
+    const ageMin = Math.round(ageMs / 60000);
+    if (ageMs < STALE_GRACE_MS) {
+      console.log(`  ⏳ ${t.ticker} ${t.strategy}: no Tradier symbol match yet (placed ${ageMin}m ago — within 60-min grace, keeping)`);
+      // ── SYMBOL MISMATCH DIAGNOSTICS ──────────────────────────────
+      // Log both sides so we can see exactly why the match fails.
+      // If the two lists share the same strike/expiry in different formats,
+      // that's the sandbox symbol-format bug. If our symbols are absent
+      // entirely, it may be a propagation delay.
+      const ourSymbols = (t.legs || []).map(l => l.symbol);
+      console.log(`    Our legs  : ${ourSymbols.join(" | ")}`);
+      console.log(`    Tradier   : ${allTradierSymbols.join(" | ")}`);
+      return false; // within grace period — not stale
+    }
+    return true; // old enough that "not in Tradier" genuinely means closed
+  });
+
   if (staleTrades.length > 0) {
+    // *** CRITICAL: filter by the staleTrades Set, NOT by trulyGrouped ***
+    // Using trulyGrouped.has(t) here was the original bug — it removed
+    // grace-period trades too whenever any stale trade was found.
+    const staleSet = new Set(staleTrades);
     for (const stale of staleTrades) {
       console.error(`  🧹 STALE TRACKED POSITION: ${stale.ticker} ${stale.strategy} has no matching legs left in Tradier — assuming already closed, removing from tracking.`);
     }
-    state.openPositions = state.openPositions.filter(t => trulyGrouped.has(t));
+    state.openPositions = state.openPositions.filter(t => !staleSet.has(t));
     await sendSMS(
 `🧹 STALE POSITION CLEANUP
 ${staleTrades.map(t => `${t.ticker} ${t.strategy}`).join(", ")}
@@ -2012,6 +2105,78 @@ Schedule: 9:10AM execute | 9:25 targets | 20min monitor | 4PM close | Sun 8AM re
 // managing zero risk on a real, live position.
 // ═══════════════════════════════════════════════════════════════
 
+// ═══════════════════════════════════════════════════════════════
+// TRADE RECONSTRUCTION FROM TRADIER POSITIONS
+// When a position is orphaned (exists in Tradier but not in
+// state.openPositions), this rebuilds a minimal tracking record
+// from the raw Tradier position legs so the bot can resume
+// monitoring it with stop-loss and profit-target logic.
+// ═══════════════════════════════════════════════════════════════
+function rebuildTradeFromPositions(underlying, legs) {
+  try {
+    // Parse expiration from OCC symbol: UNDERLYING YYMMDD C/P STRIKE
+    const symMatch = legs[0]?.symbol?.match(/[A-Z]+(\d{2})(\d{2})(\d{2})[CP]/);
+    if (!symMatch) return null;
+    const expiration = `20${symMatch[1]}-${symMatch[2]}-${symMatch[3]}`;
+
+    const qty     = Math.max(...legs.map(p => Math.abs(p.quantity)));
+    const hasCall = legs.some(p => /[A-Z]+\d+C\d/.test(p.symbol));
+    const hasPut  = legs.some(p => /[A-Z]+\d+P\d/.test(p.symbol));
+
+    let strategy;
+    if (hasCall && hasPut && legs.length >= 4) strategy = "Iron Condor";
+    else if (hasCall && legs.length >= 2)      strategy = "Bull Call Spread";
+    else if (hasPut  && legs.length >= 2)      strategy = "Bear Put Spread";
+    else if (hasPut  && legs.length === 1)     strategy = "Cash Secured Put";
+    else return null;
+
+    const reconstructedLegs = legs.map(p => ({
+      symbol: p.symbol,
+      side:   p.quantity > 0 ? "buy_to_open" : "sell_to_open",
+    }));
+
+    // Iron Condor: extract short strikes for breach detection
+    let shortCallStrike, shortPutStrike;
+    if (strategy === "Iron Condor") {
+      const shortCalls = legs.filter(p => /[A-Z]+\d+C\d/.test(p.symbol) && p.quantity < 0);
+      const shortPuts  = legs.filter(p => /[A-Z]+\d+P\d/.test(p.symbol) && p.quantity < 0);
+      if (shortCalls.length) {
+        const m = shortCalls[0].symbol.match(/C(\d{8})/);
+        shortCallStrike = m ? parseInt(m[1]) / 1000 : undefined;
+      }
+      if (shortPuts.length) {
+        const m = shortPuts[0].symbol.match(/P(\d{8})/);
+        shortPutStrike = m ? parseInt(m[1]) / 1000 : undefined;
+      }
+    }
+
+    // Net cost basis: Tradier uses negative cost_basis for short (sold) legs.
+    // Summing gives the net credit received (negative total = net credit strategy).
+    const netCostBasis = legs.reduce((sum, p) => sum + (p.cost_basis || 0), 0);
+    const isCredit     = netCostBasis < 0;
+    const executedCost = Math.abs(Math.round(netCostBasis));
+
+    return {
+      ticker:          underlying,
+      strategy,
+      legs:            reconstructedLegs,
+      quantity:        qty,
+      expiration,
+      executedAt:      new Date().toISOString(), // use now as placeholder — age check won't flag it
+      executedCost,
+      maxProfit:       isCredit ? executedCost : 0,
+      isCredit,
+      shortCallStrike,
+      shortPutStrike,
+      status:          "OPEN",
+      reconstructed:   true, // flag: P&L basis may be approximate
+    };
+  } catch (e) {
+    console.error(`  ✗ rebuildTradeFromPositions(${underlying}): ${e.message}`);
+    return null;
+  }
+}
+
 async function reconcileOrphanedPositions() {
   console.log("\n🔍 Checking for orphaned Tradier positions (untracked after restart)...");
   try {
@@ -2033,16 +2198,46 @@ async function reconcileOrphanedPositions() {
       bySymbol[underlying].push(pos);
     }
 
+    const reTracked     = [];
     const orphanSummaries = [];
+
     for (const [underlying, legs] of Object.entries(bySymbol)) {
-      const tracked = legs.every(pos => state.openPositions.some(t => t.legs?.some(l => l.symbol === pos.symbol)));
-      if (!tracked) {
-        orphanSummaries.push(`${underlying}: ${legs.length} leg(s) — NOT tracked, no automated exit rules will apply`);
+      const allTracked = legs.every(pos =>
+        state.openPositions.some(t => t.legs?.some(l => l.symbol === pos.symbol))
+      );
+      if (allTracked) continue; // already fully tracked
+
+      // Attempt to rebuild a tracking record from Tradier position data
+      const rebuilt = rebuildTradeFromPositions(underlying, legs);
+      if (rebuilt) {
+        state.openPositions.push(rebuilt);
+        reTracked.push(
+          `${underlying} ${rebuilt.strategy} (${legs.length} legs, exp ${rebuilt.expiration})` +
+          (rebuilt.shortCallStrike ? ` SC:$${rebuilt.shortCallStrike}` : "") +
+          (rebuilt.shortPutStrike  ? ` SP:$${rebuilt.shortPutStrike}`  : "")
+        );
+        console.log(`  ✅ Re-tracked orphaned ${underlying} ${rebuilt.strategy} — ${legs.length} legs`);
+      } else {
+        orphanSummaries.push(`${underlying}: ${legs.length} leg(s) — could not auto-retrack (unsupported structure)`);
       }
     }
 
+    if (reTracked.length > 0) {
+      saveState();
+      await sendSMS(
+`✅ ORPHANED POSITIONS RE-TRACKED
+Bot restarted and recovered ${reTracked.length} position(s) from Tradier:
+
+${reTracked.join("\n")}
+
+Now monitoring with automated stop-loss, profit-target, and breach checks.
+Note: cost basis is reconstructed from Tradier data — P&L estimates may be approximate.
+Not financial advice.`
+      );
+    }
+
     if (orphanSummaries.length > 0) {
-      console.error(`  🚨 ${orphanSummaries.length} orphaned position group(s) found — bot restarted and lost tracking:`);
+      console.error(`  🚨 ${orphanSummaries.length} orphaned position group(s) found — unable to auto-retrack:`);
       orphanSummaries.forEach(s => console.error(`     ${s}`));
       await sendSMS(
 `🚨 ORPHANED POSITIONS DETECTED
@@ -2053,7 +2248,9 @@ ${orphanSummaries.join("\n")}
 These positions are REAL and OPEN in Tradier but have NO automated stop-loss, profit-target, or breach protection until manually reviewed.
 Check Tradier sandbox directly and close or manage manually.`
       );
-    } else {
+    }
+
+    if (reTracked.length === 0 && orphanSummaries.length === 0) {
       console.log(`  ✓ All ${positions.length} live Tradier position(s) are properly tracked.`);
     }
   } catch(e) {
