@@ -440,6 +440,23 @@ async function placeOptionsOrder(trade) {
 
     const data    = await tradierRequest("POST", `/accounts/${TRADIER.accountId}/orders`, params);
     const orderId = data?.order?.id;
+    const status  = data?.order?.status;
+
+    // Tradier returns an orderId even for REJECTED orders — previously we
+    // checked only for orderId presence and declared success, causing the
+    // bot to remove positions from tracking after rejected closes.
+    // Confirmed Aug 7 2026: SPY and AMZN close orders rejected 4 times each;
+    // bot removed them from state.openPositions → inline restore fired every
+    // cycle. Fix: verify status === "ok" before declaring success.
+    if (!orderId) {
+      console.error(`  ✗ No order ID returned from Tradier`);
+      return { success:false, error:"No order ID returned" };
+    }
+    if (status && status !== "ok") {
+      console.error(`  ✗ Order ${orderId} rejected by Tradier (status: ${status})`);
+      return { success:false, error:`Order rejected: ${status}`, orderId };
+    }
+
     console.log(`  ✅ Order placed: ${orderId}`);
     return { success:true, orderId };
   } catch(e) {
@@ -449,15 +466,45 @@ async function placeOptionsOrder(trade) {
 }
 
 async function closeOptionsPosition(position) {
-  try {
-    const closeSide = position.side === "buy_to_open" ? "sell_to_close" : "buy_to_close";
-    const data = await tradierRequest("POST", `/accounts/${TRADIER.accountId}/orders`, {
-      class:"option", symbol:position.underlyingSymbol || position.ticker,
-      option_symbol:position.symbol, side:closeSide,
-      quantity:Math.abs(position.quantity), type:"market", duration:"day",
-    });
-    return { success:true, orderId:data?.order?.id };
-  } catch(e) { return { success:false, error:e.message }; }
+  const closeSide = position.side === "buy_to_open" ? "sell_to_close" : "buy_to_close";
+  const orderParams = {
+    class:"option", symbol:position.underlyingSymbol || position.ticker,
+    option_symbol:position.symbol, side:closeSide,
+    quantity:Math.abs(position.quantity), type:"market", duration:"day",
+  };
+
+  // Retry up to 3 times with backoff — Tradier sandbox occasionally rejects
+  // close orders on first submission due to transient liquidity/matching issues,
+  // then accepts on retry. Confirmed Aug 7 2026: SPY $712P and AMZN spread
+  // each rejected 3-4 times before eventually filling. Without retries the bot
+  // was removing positions from tracking after the first rejection and then
+  // inline-restoring them every 20-min cycle indefinitely.
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const data    = await tradierRequest("POST", `/accounts/${TRADIER.accountId}/orders`, orderParams);
+      const orderId = data?.order?.id;
+      const status  = data?.order?.status;
+
+      if (!orderId) {
+        console.error(`  ✗ Close attempt ${attempt}: no order ID returned`);
+      } else if (status && status !== "ok") {
+        console.error(`  ✗ Close attempt ${attempt}: order ${orderId} rejected (status: ${status})`);
+      } else {
+        // Success
+        return { success:true, orderId };
+      }
+    } catch(e) {
+      console.error(`  ✗ Close attempt ${attempt}: ${e.message}`);
+    }
+
+    if (attempt < 3) {
+      const wait = attempt * 5000; // 5s, 10s
+      console.log(`  ⏳ Retrying close in ${wait/1000}s...`);
+      await new Promise(r => setTimeout(r, wait));
+    }
+  }
+
+  return { success:false, error:"Close order rejected after 3 attempts" };
 }
 
 async function buildOptionsLegs(tradeRec, stockPrice, regime = null) {
