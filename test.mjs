@@ -56,12 +56,25 @@ function computePnL(ourTrade, g) {
   return { openCost, maxProfitShare, currentPnL, currentPct, profitTargetPnL };
 }
 
-function getMarketRegime(spyChangePct) {
-  if (spyChangePct < -3.0) return { label:"EXTREME FEAR",       allowDirectional:false, allowCondors:false, allowCSP:false, skipTrading:true,  wingMultiplier:2.0,  otmPct:5 };
-  if (spyChangePct > 1.0)  return { label:"STRONG RALLY",       allowDirectional:true,  allowCondors:false, allowCSP:true,  skipTrading:false, wingMultiplier:1.0,  otmPct:3 };
-  if (spyChangePct < -1.0) return { label:"HIGH VOLATILITY",    allowDirectional:false, allowCondors:false, allowCSP:true,  skipTrading:false, wingMultiplier:1.5,  otmPct:5 };
-  if (spyChangePct < -0.3) return { label:"ELEVATED VOLATILITY",allowDirectional:false, allowCondors:true,  allowCSP:true,  skipTrading:false, wingMultiplier:1.25, otmPct:4 };
-  return                          { label:"NORMAL",              allowDirectional:true,  allowCondors:true,  allowCSP:true,  skipTrading:false, wingMultiplier:1.0,  otmPct:3 };
+function getVIXLabel(vix) {
+  if (!vix)     return { label:"UNKNOWN",  note:"VIX unavailable" };
+  if (vix > 40) return { label:"EXTREME",  note:`VIX ${vix.toFixed(1)} — crash level` };
+  if (vix > 30) return { label:"EXTREME",  note:`VIX ${vix.toFixed(1)} — extreme fear` };
+  if (vix > 20) return { label:"ELEVATED", note:`VIX ${vix.toFixed(1)} — elevated IV` };
+  if (vix > 15) return { label:"NORMAL",   note:`VIX ${vix.toFixed(1)} — normal` };
+  return         { label:"LOW",      note:`VIX ${vix.toFixed(1)} — compressed premium` };
+}
+
+function getMarketRegime(spyChangePct, vix = null) {
+  const vixInfo = getVIXLabel(vix);
+  if (spyChangePct < -5.0) return { label:"MARKET CRASH",       allowDirectional:false, allowCondors:false, allowCSP:false, skipTrading:true,  wingMultiplier:2.0,  otmPct:7, vix:vixInfo };
+  if (spyChangePct < -3.0) return { label:"EXTREME FEAR",       allowDirectional:false, allowCondors:false, allowCSP:true,  skipTrading:false, wingMultiplier:2.0,  otmPct:7, vix:vixInfo };
+  if (vix && vix > 40)     return { label:"MARKET CRASH",       allowDirectional:false, allowCondors:false, allowCSP:false, skipTrading:true,  wingMultiplier:2.0,  otmPct:7, vix:vixInfo };
+  if (vix && vix > 30)     return { label:"EXTREME FEAR",       allowDirectional:false, allowCondors:false, allowCSP:true,  skipTrading:false, wingMultiplier:2.0,  otmPct:7, vix:vixInfo };
+  if (spyChangePct > 1.0)  return { label:"STRONG RALLY",       allowDirectional:false, allowCondors:false, allowCSP:true,  skipTrading:false, wingMultiplier:1.0,  otmPct:3, vix:vixInfo };
+  if (spyChangePct < -1.0) return { label:"HIGH VOLATILITY",    allowDirectional:false, allowCondors:false, allowCSP:true,  skipTrading:false, wingMultiplier:1.5,  otmPct:5, vix:vixInfo };
+  if (spyChangePct < -0.7) return { label:"ELEVATED VOLATILITY",allowDirectional:false, allowCondors:true,  allowCSP:true,  skipTrading:false, wingMultiplier:1.25, otmPct:4, vix:vixInfo };
+  return                          { label:"NORMAL",              allowDirectional:false, allowCondors:true,  allowCSP:true,  skipTrading:false, wingMultiplier:1.0,  otmPct:3, vix:vixInfo };
 }
 
 function detectLikelySplitRatio(storedCost, currentPrice) {
@@ -73,7 +86,7 @@ function detectLikelySplitRatio(storedCost, currentPrice) {
   return null;
 }
 
-function normaliseAndFilterTrades(parsed) {
+function normaliseAndFilterTrades(parsed, effectiveMin = MANDATE.minPerTrade) {
   const isDirectional = s => ["Bull Call Spread", "Bear Put Spread"].includes(s);
   const normalised = parsed.map(t => ({
     ...t,
@@ -86,7 +99,7 @@ function normaliseAndFilterTrades(parsed) {
     exitTarget:      t.exitTarget      ?? "",
   }));
   return normalised.filter(t => {
-    if (t.targetCost < MANDATE.minPerTrade || t.targetCost > MANDATE.maxPerTrade) return false;
+    if (t.targetCost < effectiveMin || t.targetCost > MANDATE.maxPerTrade) return false;
     if (parseFloat(t.targetReturnPct) < MANDATE.minReturnPct) return false;
     if (isDirectional(t.strategy) && HIGH_BETA_TICKERS.includes(t.ticker)) return false;
     const minScore = isDirectional(t.strategy) ? DIRECTIONAL_MIN_SCORE : INCOME_MIN_SCORE;
@@ -99,13 +112,34 @@ function normaliseAndFilterTrades(parsed) {
 
 console.log("\n📊 getMarketRegime");
 
-test("EXTREME FEAR: SPY -3.5%", () => {
+test("MARKET CRASH: SPY -5.5% — all trading halted", () => {
+  const r = getMarketRegime(-5.5);
+  assert.equal(r.label, "MARKET CRASH");
+  assert.equal(r.skipTrading, true);
+  assert.equal(r.allowCSP, false, "even CSPs halted in crash");
+  assert.equal(typeof r.otmPct, "number", "otmPct must exist on all regimes");
+});
+
+test("EXTREME FEAR: SPY -3.5% — CSP allowed, condors not", () => {
   const r = getMarketRegime(-3.5);
   assert.equal(r.label, "EXTREME FEAR");
-  assert.equal(r.skipTrading, true);
+  assert.equal(r.skipTrading, false, "CSPs valid in extreme fear — fat premium");
+  assert.equal(r.allowCSP, true);
   assert.equal(r.allowCondors, false);
-  assert.equal(r.allowCSP, false);
   assert.equal(typeof r.otmPct, "number", "otmPct must exist on all regimes");
+});
+
+test("MARKET CRASH: VIX > 40 regardless of SPY", () => {
+  const r = getMarketRegime(0.5, 42);
+  assert.equal(r.label, "MARKET CRASH");
+  assert.equal(r.skipTrading, true);
+});
+
+test("EXTREME FEAR: VIX 31-40 — CSP allowed", () => {
+  const r = getMarketRegime(0.0, 35);
+  assert.equal(r.label, "EXTREME FEAR");
+  assert.equal(r.allowCSP, true);
+  assert.equal(r.skipTrading, false);
 });
 
 test("HIGH VOLATILITY: SPY -1.5%", () => {
@@ -116,8 +150,8 @@ test("HIGH VOLATILITY: SPY -1.5%", () => {
   assert.equal(r.skipTrading, false);
 });
 
-test("ELEVATED VOLATILITY: SPY -0.5%", () => {
-  const r = getMarketRegime(-0.5);
+test("ELEVATED VOLATILITY: SPY -0.8%", () => {
+  const r = getMarketRegime(-0.8);
   assert.equal(r.label, "ELEVATED VOLATILITY");
   assert.equal(r.allowCondors, true);
   assert.equal(r.allowDirectional, false);
@@ -127,7 +161,7 @@ test("NORMAL: SPY flat 0%", () => {
   const r = getMarketRegime(0);
   assert.equal(r.label, "NORMAL");
   assert.equal(r.allowCondors, true);
-  assert.equal(r.allowDirectional, true);
+  assert.equal(r.allowDirectional, false);
   assert.equal(r.skipTrading, false);
   assert.equal(r.otmPct, 3);
 });
@@ -136,15 +170,20 @@ test("STRONG RALLY: SPY +1.5%", () => {
   const r = getMarketRegime(1.5);
   assert.equal(r.label, "STRONG RALLY");
   assert.equal(r.allowCondors, false, "condors must be blocked on strong rallies");
-  assert.equal(r.allowDirectional, true, "bull spreads valid in rally");
+  assert.equal(r.allowDirectional, false, "directional spreads retired Aug 2026");
 });
 
 test("all regimes have otmPct defined", () => {
-  for (const spy of [-4, -1.5, -0.5, 0.0, 1.5]) {
+  for (const spy of [-6, -4, -1.5, -0.8, 0.0, 1.5]) {
     const r = getMarketRegime(spy);
     assert.ok(typeof r.otmPct === "number" && r.otmPct > 0,
       `${r.label} (SPY ${spy}%) missing otmPct`);
   }
+});
+
+test("boundary: -0.71% is ELEVATED, -0.70% is NORMAL (strict less-than)", () => {
+  assert.equal(getMarketRegime(-0.71).label, "ELEVATED VOLATILITY");
+  assert.equal(getMarketRegime(-0.70).label, "NORMAL");
 });
 
 test("boundary: exactly -1.0% is ELEVATED not HIGH", () => {

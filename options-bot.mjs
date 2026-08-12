@@ -3,12 +3,14 @@
 // ================================================================
 // Portfolio : 17 stocks — NVDA AMD AVGO MSFT AAPL AMZN GOOGL META
 //             TSLA PANW CRWD SPY QQQ OKLO LLY PLTR NOW
-// Removed   : SPOK (illiquid), CMBT (no options), XLE (replaced by SPY/QQQ)
-// Added     : AMZN GOOGL META AVGO PANW CRWD SPY QQQ
-// Mandate   : $1,000–$5,000/day · $400–$1,200/trade · 8%+ return
+// Strategies: Iron Condor (SPY/QQQ only, 1-3 DTE) | Cash Secured Put
+//             Bull/Bear Spreads RETIRED Aug 2026 (net negative P&L)
+//             Single-stock ICs BANNED Aug 2026 (breach risk too high)
+// Mandate   : $1,000–$5,000/day · $250 sandbox / $600 live per trade
+//             8%+ return · 50% profit target · 1 condor/day max
 // Execution : Tradier API (sandbox or live)
 // Alerts    : Pushover push notifications
-// Schedule  : 9AM execute | 20min monitor | 4PM close | Sunday review
+// Schedule  : 9:10AM execute | 20min monitor | 4PM close | Sun review
 // ================================================================
 //
 // INSTALL:  npm install
@@ -61,7 +63,11 @@ const MANDATE = {
   dailyCapMin:     1000,
   dailyCapMax:     5000,
   maxPerTrade:     1200,
-  minPerTrade:     400,
+  minPerTrade:     250,  // Lowered from $400 Aug 2026 — SPY/QQQ 1-DTE condors were
+                         // coming in at $399 credit and getting blocked by a $1 margin.
+                         // Short-DTE index condors naturally generate less premium due
+                         // to compressed theta; $250 floor captures these without
+                         // sacrificing quality on longer-dated trades.
   minReturnPct:    8,
   profitTargetPct: 50,   // close at 50% of max profit
   stopLossPct:     50,   // DEBIT strategies: close at 50% loss (data: AMZN -95.7% Aug 4 before 100% fired)
@@ -70,7 +76,8 @@ const MANDATE = {
                                      // Data: META/AMZN ICs both down 40%+ within 2 days of entry
                                      // with 6 DTE remaining. Keeping 200% stop on singles meant
                                      // riding losers far too long on high-IV individual names.
-  maxDTE:                21,
+  cspMaxDTE:             21,  // CSP expiry target: up to 21 DTE for income premium
+                               // (condors use condorMaxDTE=3 separately)
   minDTE:                1,
   condorMaxDTE:           3,  // Iron Condors target 1-3 DTE only — data shows 7 DTE single-stock
                                // ICs consistently breached (META $610C breached day 2, AMZN $285C
@@ -80,6 +87,12 @@ const MANDATE = {
   maxSingleStockPositions: 2,  // No more than 2 individual-name positions open at once.
                                 // Reduces concentration risk — previously could have META, AMZN,
                                 // NVDA, CRWD all open simultaneously = 4 bets on single names.
+  maxCondorsPerDay:        1,  // One index condor per day max — SPY and QQQ move together 95%
+                                // of the time, placing both is doubling the same directional bet
+                                // with twice the transaction costs. Best credit wins the slot.
+  minPerTradeLive:       600,  // Live trading minimum — $250 sandbox floor doesn't survive
+                                // commissions ($39+ on 60-leg SPY condor) and slippage in live.
+                                // $600 ensures meaningful profit after transaction costs.
 };
 
 // ── INDEX TICKERS — treated differently for IC strategy ──────
@@ -98,39 +111,40 @@ const TRADIER = {
   accountId: process.env.TRADIER_ACCOUNT_ID,
 };
 
-// ── PORTFOLIO — Updated July 12, 2026 ─────────────────────────
+// ── PORTFOLIO — Last reviewed Aug 2026 ────────────────────────
 // 17 high-IV, liquid options stocks. All meet: daily volume >10K,
 // ATM spread <$0.15, weekly expiries available, market cap >$200B
+// Earnings dates updated Aug 2026 to Q3/Q4 2026 estimates.
 const PORTFOLIO = [
   // ── AI / SEMICONDUCTORS — highest IV, most profitable ─────
-  { ticker:"NVDA", name:"Nvidia",                 shares:0,    avgCost:198.00, stopLoss:175.00, target:236.00,  sector:"AI/Semis",  ivProfile:"high",   optionable:true,  earningsDate:"2026-08-20" },
-  { ticker:"AMD",  name:"Advanced Micro Devices", shares:0,    avgCost:546.72, stopLoss:480.00, target:650.00,  sector:"Semis",     ivProfile:"high",   optionable:true,  earningsDate:"2026-07-28" },
-  { ticker:"AVGO", name:"Broadcom Inc",           shares:0,    avgCost:400.39, stopLoss:340.00, target:472.00,  sector:"AI/Semis",  ivProfile:"high",   optionable:true,  earningsDate:"2026-09-04" },
+  { ticker:"NVDA", name:"Nvidia",                 shares:0,    avgCost:198.00, stopLoss:175.00, target:236.00,  sector:"AI/Semis",  ivProfile:"high",   optionable:true,  earningsDate:"2026-11-19" }, // Q3 FY2027 est.
+  { ticker:"AMD",  name:"Advanced Micro Devices", shares:0,    avgCost:546.72, stopLoss:480.00, target:650.00,  sector:"Semis",     ivProfile:"high",   optionable:true,  earningsDate:"2026-10-27" }, // Q3 2026 est.
+  { ticker:"AVGO", name:"Broadcom Inc",           shares:0,    avgCost:400.39, stopLoss:340.00, target:472.00,  sector:"AI/Semis",  ivProfile:"high",   optionable:true,  earningsDate:"2026-09-04" }, // upcoming
 
   // ── MEGA-CAP TECH — deepest liquidity, weekly expiries ────
-  { ticker:"MSFT", name:"Microsoft",              shares:0,    avgCost:365.44, stopLoss:350.00, target:430.00,  sector:"Cloud/AI",  ivProfile:"high",   optionable:true,  earningsDate:"2026-07-28" },
-  { ticker:"AAPL", name:"Apple Inc",              shares:0,    avgCost:298.01, stopLoss:277.00, target:350.00,  sector:"Consumer",  ivProfile:"medium", optionable:true,  earningsDate:"2026-07-31" },
-  { ticker:"AMZN", name:"Amazon",                 shares:0,    avgCost:244.00, stopLoss:208.00, target:278.00,  sector:"Cloud/AI",  ivProfile:"high",   optionable:true,  earningsDate:"2026-07-31" },
-  { ticker:"GOOGL",name:"Alphabet",               shares:0,    avgCost:357.18, stopLoss:314.00, target:410.00,  sector:"AI/Ads",    ivProfile:"high",   optionable:true,  earningsDate:"2026-07-28" },
-  { ticker:"META", name:"Meta Platforms",         shares:0,    avgCost:620.00, stopLoss:588.00, target:780.00,  sector:"AI/Social", ivProfile:"high",   optionable:true,  earningsDate:"2026-07-29" },
+  { ticker:"MSFT", name:"Microsoft",              shares:0,    avgCost:365.44, stopLoss:460.00, target:560.00,  sector:"Cloud/AI",  ivProfile:"high",   optionable:true,  earningsDate:"2026-10-23" }, // Q1 FY2027 est. | stop/target updated Aug 2026
+  { ticker:"AAPL", name:"Apple Inc",              shares:0,    avgCost:298.01, stopLoss:277.00, target:350.00,  sector:"Consumer",  ivProfile:"medium", optionable:true,  earningsDate:"2026-11-01" }, // Q4 FY2026 est.
+  { ticker:"AMZN", name:"Amazon",                 shares:0,    avgCost:244.00, stopLoss:208.00, target:310.00,  sector:"Cloud/AI",  ivProfile:"high",   optionable:true,  earningsDate:"2026-10-30" }, // Q3 2026 est.
+  { ticker:"GOOGL",name:"Alphabet",               shares:0,    avgCost:357.18, stopLoss:314.00, target:410.00,  sector:"AI/Ads",    ivProfile:"high",   optionable:true,  earningsDate:"2026-10-27" }, // Q3 2026 est.
+  { ticker:"META", name:"Meta Platforms",         shares:0,    avgCost:620.00, stopLoss:540.00, target:680.00,  sector:"AI/Social", ivProfile:"high",   optionable:true,  earningsDate:"2026-10-28" }, // Q3 2026 est. | target updated Aug 2026
 
   // ── HIGH VOLATILITY ───────────────────────────────────────
-  { ticker:"TSLA", name:"Tesla",                  shares:0,    avgCost:375.53, stopLoss:320.00, target:440.00,  sector:"EV/Tech",   ivProfile:"high",   optionable:true,  earningsDate:"2026-07-22" },
+  { ticker:"TSLA", name:"Tesla",                  shares:0,    avgCost:375.53, stopLoss:320.00, target:440.00,  sector:"EV/Tech",   ivProfile:"high",   optionable:true,  earningsDate:"2026-10-21" }, // Q3 2026 est.
 
   // ── CYBERSECURITY ─────────────────────────────────────────
-  { ticker:"PANW", name:"Palo Alto Networks",     shares:0,    avgCost:325.91, stopLoss:286.00, target:370.00,  sector:"Cyber",     ivProfile:"high",   optionable:true,  earningsDate:"2026-08-18" },
-  { ticker:"CRWD", name:"CrowdStrike",            shares:0,    avgCost:187.23, stopLoss:165.00, target:235.00,  sector:"Cyber",     ivProfile:"high",   optionable:true,  earningsDate:"2026-09-02" },  // 4-for-1 split completed Jul 2026
+  { ticker:"PANW", name:"Palo Alto Networks",     shares:0,    avgCost:325.91, stopLoss:286.00, target:370.00,  sector:"Cyber",     ivProfile:"high",   optionable:true,  earningsDate:"2026-09-10" }, // FQ4 2026 est.
+  { ticker:"CRWD", name:"CrowdStrike",            shares:0,    avgCost:187.23, stopLoss:165.00, target:235.00,  sector:"Cyber",     ivProfile:"high",   optionable:true,  earningsDate:"2026-11-25" },  // Q2 FY2027 est. 4-for-1 split completed Jul 2026
 
   // ── INDEX ETFs — 0DTE capable, deepest liquidity ─────────
   { ticker:"SPY",  name:"S&P 500 ETF",            shares:0,    avgCost:754.95, stopLoss:680.00, target:820.00,  sector:"Index",     ivProfile:"medium", optionable:true,  earningsDate:null },
   { ticker:"QQQ",  name:"Nasdaq 100 ETF",         shares:0,    avgCost:725.51, stopLoss:653.00, target:790.00,  sector:"Index",     ivProfile:"medium", optionable:true,  earningsDate:null },
 
   // ── EXISTING HOLDINGS ─────────────────────────────────────
-  { ticker:"OKLO", name:"Oklo Inc",               shares:150,  avgCost:68.38,  stopLoss:42.00,  target:88.00,   sector:"Nuclear",   ivProfile:"high",   optionable:true,  earningsDate:"2026-08-12" },
-  { ticker:"LLY",  name:"Eli Lilly",              shares:4.02, avgCost:987.00, stopLoss:1045.00,target:1350.00, sector:"Pharma",    ivProfile:"medium", optionable:true,  earningsDate:"2026-08-06" },
-  { ticker:"PLTR", name:"Palantir",               shares:13,   avgCost:135.00, stopLoss:105.00, target:183.00,  sector:"AI/Gov",    ivProfile:"medium", optionable:true,  earningsDate:"2026-08-04" },
-  // NOTE: NOW did 5-for-1 split in 2025. Price $107.71. Down 42% YTD. Earnings Jul 22.
-  { ticker:"NOW",  name:"ServiceNow",             shares:0,    avgCost:107.71, stopLoss:88.00,  target:142.00,  sector:"SaaS",      ivProfile:"medium", optionable:true,  earningsDate:"2026-07-22" },
+  { ticker:"OKLO", name:"Oklo Inc",               shares:150,  avgCost:68.38,  stopLoss:42.00,  target:88.00,   sector:"Nuclear",   ivProfile:"high",   optionable:true,  earningsDate:"2026-11-12" }, // Q3 2026 est.
+  { ticker:"LLY",  name:"Eli Lilly",              shares:4.02, avgCost:987.00, stopLoss:1045.00,target:1350.00, sector:"Pharma",    ivProfile:"medium", optionable:true,  earningsDate:"2026-10-29" }, // Q3 2026 est.
+  { ticker:"PLTR", name:"Palantir",               shares:13,   avgCost:135.00, stopLoss:105.00, target:183.00,  sector:"AI/Gov",    ivProfile:"medium", optionable:true,  earningsDate:"2026-11-03" }, // Q3 2026 est.
+  // NOTE: NOW did 5-for-1 split in 2025. Price $107.71. Down 42% YTD.
+  { ticker:"NOW",  name:"ServiceNow",             shares:0,    avgCost:107.71, stopLoss:88.00,  target:142.00,  sector:"SaaS",      ivProfile:"medium", optionable:true,  earningsDate:"2026-10-22" }, // Q3 2026 est.
 ];
 
 // ── EARNINGS CALENDAR ─────────────────────────────────────────
@@ -147,9 +161,13 @@ const state = {
   alertsSent:         new Set(),
   priceCache:         {},
   dailyPnL:           0,
+  weeklyPnL:          0,    // resets every Sunday
+  monthlyPnL:         0,    // resets on first trading day of each month
   totalDeployedToday: 0,
   dynamicLevels:      {},   // auto-updated stops + targets
   weeklyHighs:        {},   // highest price seen this week
+  tradeStats:         {},   // per-strategy win/loss: { "Iron Condor": { wins, losses, totalPnL, ... } }
+  _lastResetMonth:    null, // "YYYY-M" string — used to detect first trading day of each month
   jobRunning:         null, // name of the currently executing scheduled job, or null
 };
 
@@ -175,9 +193,13 @@ function saveState() {
       dailyTrades:        state.dailyTrades,
       totalDeployedToday: state.totalDeployedToday,
       dailyPnL:           state.dailyPnL,
+      weeklyPnL:          state.weeklyPnL,
+      monthlyPnL:         state.monthlyPnL,
+      tradeStats:         state.tradeStats,
+      _lastResetMonth:    state._lastResetMonth,
       dynamicLevels:      state.dynamicLevels,
       weeklyHighs:        state.weeklyHighs,
-      alertsSent:         [...state.alertsSent], // Set → Array for JSON serialisation
+      alertsSent:         [...state.alertsSent],
       savedAt:            new Date().toISOString(),
     };
     // Write to temp file then atomically rename — prevents a partial
@@ -201,6 +223,10 @@ function loadState() {
     state.openPositions = persisted.openPositions || [];
     state.dynamicLevels = persisted.dynamicLevels || {};
     state.weeklyHighs   = persisted.weeklyHighs   || {};
+    state.tradeStats        = persisted.tradeStats    || {};
+    state._lastResetMonth   = persisted._lastResetMonth || null;
+    state.weeklyPnL         = persisted.weeklyPnL     || 0;
+    state.monthlyPnL        = persisted.monthlyPnL    || 0;
     // Restore dedup keys so a mid-day restart doesn't re-fire alerts
     // that already fired this hour. alertsSent was serialised as Array.
     if (Array.isArray(persisted.alertsSent)) {
@@ -535,7 +561,7 @@ async function buildOptionsLegs(tradeRec, stockPrice, regime = null) {
     const todayUTC = new Date(todayStr + "T00:00:00Z");
     const validExp    = expirations.find(exp => {
       const dte = Math.ceil((new Date(exp + "T00:00:00Z") - todayUTC) / (1000*60*60*24));
-      return dte >= 5 && dte <= MANDATE.maxDTE;
+      return dte >= 5 && dte <= MANDATE.cspMaxDTE;
     });
     if (!validExp) return null;
 
@@ -564,7 +590,8 @@ async function buildOptionsLegs(tradeRec, stockPrice, regime = null) {
         }
 
         const cost = (lc.ask - sc.bid) * 100;
-        if (cost < MANDATE.minPerTrade || cost > MANDATE.maxPerTrade) return null;
+        const effMin = TRADIER.sandbox ? MANDATE.minPerTrade : MANDATE.minPerTradeLive;
+        if (cost < effMin || cost > MANDATE.maxPerTrade) return null;
         const midpoint = parseFloat(((lc.ask - sc.bid) / 2 + (lc.bid - sc.ask) / 2).toFixed(2));
         return { expiration:validExp, legs:[{symbol:lc.symbol,side:"buy_to_open"},{symbol:sc.symbol,side:"sell_to_open"}], cost:Math.round(cost), maxProfit:Math.round((sc.strike-lc.strike-(lc.ask-sc.bid))*100), longSymbol:lc.symbol, shortSymbol:sc.symbol, limitPrice:midpoint, quantity:1 };
       }
@@ -587,27 +614,23 @@ async function buildOptionsLegs(tradeRec, stockPrice, regime = null) {
         }
 
         const cost = (lp.ask - sp.bid) * 100;
-        if (cost < MANDATE.minPerTrade || cost > MANDATE.maxPerTrade) return null;
+        const effMin = TRADIER.sandbox ? MANDATE.minPerTrade : MANDATE.minPerTradeLive;
+        if (cost < effMin || cost > MANDATE.maxPerTrade) return null;
         return { expiration:validExp, legs:[{symbol:lp.symbol,side:"buy_to_open"},{symbol:sp.symbol,side:"sell_to_open"}], cost:Math.round(cost), maxProfit:Math.round((lp.strike-sp.strike-(lp.ask-sp.bid))*100), quantity:1 };
       }
       case "Iron Condor": {
         // INDEX-ONLY guard — single-stock ICs repeatedly breached in live data
-        // (META $610C day 2, AMZN $285C nearly breached day 2). Indexes are
-        // enforced here as a hard stop so a misconfigured AI prompt can't
-        // override the rule; the AI prompt also instructs index-only (belt+suspenders).
         if (!INDEX_TICKERS.includes(ticker)) {
           console.log(`  ✗ ${ticker} Iron Condor REJECTED — index-only strategy (SPY/QQQ). Single-stock ICs data-confirmed unprofitable Aug 2026.`);
           return null;
         }
 
-        // SHORT-DTE ONLY: target 1-3 DTE for condors.
-        // Data: QQQ +58.5% and NVDA +25.5% came from 2 DTE entries.
-        // 7 DTE single-stock ICs both underwater within 2 days.
-        // Use condorMaxDTE instead of maxDTE for expiry selection.
-        const expirationsCond = await getExpirations(ticker);
-        const condorTodayStr  = new Date().toISOString().slice(0, 10);
-        const condorTodayUTC  = new Date(condorTodayStr + "T00:00:00Z");
-        const condorExp = expirationsCond.find(exp => {
+        // SHORT-DTE ONLY: reuse the expirations array already fetched above —
+        // previously called getExpirations(ticker) again here, an identical
+        // redundant Tradier API call. The outer `expirations` array is the same data.
+        const condorTodayStr = new Date().toISOString().slice(0, 10);
+        const condorTodayUTC = new Date(condorTodayStr + "T00:00:00Z");
+        const condorExp = expirations.find(exp => {
           const dte = Math.ceil((new Date(exp + "T00:00:00Z") - condorTodayUTC) / (1000*60*60*24));
           return dte >= MANDATE.minDTE && dte <= MANDATE.condorMaxDTE;
         });
@@ -776,8 +799,14 @@ async function sendSMS(body) {
 //  getMarketRegime for full history of why VIX was dropped)
 // ═══════════════════════════════════════════════════════════════
 
-// VIX_REGIME removed — regime thresholds now hardcoded directly
-// in getMarketRegime() based on SPY change alone (see that function).
+// VIX_REGIME history:
+// - Originally used Alpha Vantage GLOBAL_QUOTE for ^VIX — always failed
+//   (^VIX is not a valid symbol for that endpoint). VIX defaulted to 18
+//   every session so regime was always NORMAL. Retired Jul 29 2026.
+// - Re-added Aug 2026 via Tradier /markets/quotes?symbols=VIX — now
+//   optional (fails gracefully to null) and used to widen IC wings when
+//   IV is elevated and skip condors when premium is too thin (VIX < 15).
+//   See fetchVIX() and getMarketRegime() for full implementation.
 
 // ═══════════════════════════════════════════════════════════════
 // REGIME SIGNAL — retired Alpha Vantage VIX/SPY fetching entirely
@@ -796,8 +825,13 @@ async function sendSMS(body) {
 // present in portfolioData (fetched reliably via Tradier's batched
 // quote call every cycle) — no separate network call, no external
 // dependency, no possibility of a silent default masking a real
-// failure. VIX itself is dropped; SPY's move is a well-established,
-// highly-correlated proxy for broad market volatility.
+// failure. SPY's move is a well-established, highly-correlated
+// proxy for broad market volatility.
+//
+// VIX was re-added Aug 2026 via Tradier /markets/quotes?symbols=VIX
+// as a SECONDARY signal — it widens IC wings when IV is elevated
+// and halts all trading when VIX > 40 (crash-level fear). VIX is
+// optional and fails gracefully; the regime works without it.
 // ═══════════════════════════════════════════════════════════════
 
 function getSpyChangeFromPortfolio(portfolioData) {
@@ -809,44 +843,122 @@ function getSpyChangeFromPortfolio(portfolioData) {
   return spy.changePct;
 }
 
-function getMarketRegime(spyChangePct) {
-  // Regime classification driven purely by SPY's day change — see the
-  // block comment above getSpyChangeFromPortfolio for why VIX was
-  // dropped entirely rather than left as a (previously always-broken)
-  // secondary input. Same threshold values that were already tested
-  // and tuned this week (the -0.3% ELEVATED threshold specifically
-  // calibrated against the July 14 borderline-volatility session) —
-  // only the broken input source changed, not the trigger points.
+// ═══════════════════════════════════════════════════════════════
+// VIX FETCH — real-time fear/greed gauge for regime calibration
+// VIX > 20: elevated IV, wider wings, more credit per condor — good
+// VIX < 15: compressed premium, thin condor credit — be selective
+// VIX > 30: extreme fear, avoid condors entirely (gap risk too high)
+// ═══════════════════════════════════════════════════════════════
+async function fetchVIX() {
+  try {
+    const data = await tradierRequest("GET", "/markets/quotes", { symbols: "VIX", greeks: "false" });
+    const q    = data?.quotes?.quote;
+    const vix  = q?.last ?? q?.close;
+    if (vix && vix > 0) {
+      console.log(`  📊 VIX: ${parseFloat(vix).toFixed(2)}`);
+      return parseFloat(vix);
+    }
+  } catch(e) {
+    console.log(`  ⚠ VIX fetch failed (${e.message}) — regime will use SPY-only signals`);
+  }
+  return null; // graceful fallback — regime still works without VIX
+}
+
+function getVIXLabel(vix) {
+  if (!vix)    return { label:"UNKNOWN", note:"VIX unavailable" };
+  if (vix > 30) return { label:"EXTREME", note:`VIX ${vix.toFixed(1)} — extreme fear, gap risk high` };
+  if (vix > 20) return { label:"ELEVATED", note:`VIX ${vix.toFixed(1)} — elevated IV, wider wings collect more premium` };
+  if (vix > 15) return { label:"NORMAL",   note:`VIX ${vix.toFixed(1)} — normal conditions` };
+  return         { label:"LOW",      note:`VIX ${vix.toFixed(1)} — compressed premium, be selective on condors` };
+}
+
+function getMarketRegime(spyChangePct, vix = null) {
+  // Compute VIX label FIRST — needed by every regime path including
+  // early returns. Previously computed after the SPY<-3% check, meaning
+  // the SPY-triggered EXTREME FEAR returned without a vix field while
+  // the VIX-triggered EXTREME FEAR did have one — inconsistent shapes.
+  const vixInfo = getVIXLabel(vix);
+
+  if (spyChangePct < -5.0) {
+    return {
+      label:            "MARKET CRASH",
+      allowDirectional: false,
+      allowCondors:     false,
+      allowCSP:         false,
+      skipTrading:      true,   // SPY -5%+ intraday = genuine crash event. Gap risk is
+                                 // too extreme even for wide-OTM CSPs — a put strike 7%
+                                 // below an already-5%-down market can be breached same day.
+                                 // Bot halts completely. Resumes tomorrow.
+      wingMultiplier:   2.0,
+      otmPct:           7,
+      vix:              vixInfo,
+      note:             `SPY ${spyChangePct.toFixed(1)}% | ${vixInfo.note} — CRASH: all trading halted`,
+    };
+  }
+
   if (spyChangePct < -3.0) {
     return {
       label:            "EXTREME FEAR",
       allowDirectional: false,
       allowCondors:     false,
+      allowCSP:         true,   // CSP is valid in extreme fear — IV peaks, stocks oversold,
+                                 // put strikes below already-depressed prices. This is when
+                                 // premium selling is most advantageous. Use wider OTM (7%+).
+      skipTrading:      false,
+      wingMultiplier:   2.0,
+      otmPct:           7,
+      vix:              vixInfo,
+      note:             `SPY ${spyChangePct.toFixed(1)}% | ${vixInfo.note} — CSP only, 7% OTM, elevated premium.`,
+    };
+  }
+
+  // VIX override: VIX > 40 = extreme systemic fear (2020-style). Halt all trading.
+  // VIX > 30 = elevated fear, CSPs still valid. VIX > 40 means gap risk too high.
+  if (vix && vix > 40) {
+    return {
+      label:            "MARKET CRASH",
+      allowDirectional: false,
+      allowCondors:     false,
       allowCSP:         false,
       skipTrading:      true,
       wingMultiplier:   2.0,
-      otmPct:           5,    // widest wings if somehow a trade slips through
-      note:             `SPY ${spyChangePct.toFixed(1)}% — no new trades today. Extreme fear.`,
+      otmPct:           7,
+      vix:              vixInfo,
+      note:             `${vixInfo.note} | SPY ${spyChangePct.toFixed(1)}% — VIX extreme: all trading halted`,
     };
   }
-  // STRONG RALLY (SPY > +1%): Iron Condors are equally dangerous on the upside
-  // as the downside — the short CALL legs get breached just as readily as short
-  // PUT legs in a falling market. Confirmed Aug 4 2026: SPY rallied from $757 to
-  // $772 (+2%) and all three Iron Condors placed that morning had short calls
-  // breached within hours. Block condors symmetrically on large moves either direction.
-  // NOTE: Bull Call Spreads removed Aug 2026 — net negative across all live data.
-  // MSFT +40.2% was the only winner; AMZN -95.7% the same day erased it.
-  // CSP on uptrending names replaced — collects premium without needing direction.
-  if (spyChangePct > 1.0) {
+
+  // VIX 30-40: extreme fear, CSPs only
+  if (vix && vix > 30) {
     return {
-      label:            "STRONG RALLY",
-      allowDirectional: false, // Bull/Bear spreads dropped entirely Aug 2026
+      label:            "EXTREME FEAR",
+      allowDirectional: false,
       allowCondors:     false,
       allowCSP:         true,
       skipTrading:      false,
-      wingMultiplier:   1.0,
-      otmPct:           3,
-      note:             `SPY +${spyChangePct.toFixed(1)}% — condors blocked (short calls at risk), CSP only`,
+      wingMultiplier:   2.0,
+      otmPct:           7,
+      vix:              vixInfo,
+      note:             `${vixInfo.note} | SPY ${spyChangePct.toFixed(1)}% — CSP only, 7% OTM`,
+    };
+  }
+
+  // VIX modifier for wing width and OTM distance
+  const vixWingBonus  = (vix && vix > 20) ? 0.5  : 0;   // wider wings when IV elevated
+  const vixOtmBonus   = (vix && vix > 20) ? 1    : 0;   // extra 1% OTM cushion when fearful
+  const lowVIX        = (vix && vix < 15);               // thin premium — be selective
+
+  if (spyChangePct > 1.0) {
+    return {
+      label:            "STRONG RALLY",
+      allowDirectional: false,
+      allowCondors:     false,
+      allowCSP:         true,
+      skipTrading:      false,
+      wingMultiplier:   1.0 + vixWingBonus,
+      otmPct:           3 + vixOtmBonus,
+      vix:              vixInfo,
+      note:             `SPY +${spyChangePct.toFixed(1)}% | ${vixInfo.note} — CSP only`,
     };
   }
   if (spyChangePct < -1.0) {
@@ -854,34 +966,39 @@ function getMarketRegime(spyChangePct) {
       label:            "HIGH VOLATILITY",
       allowDirectional: false,
       allowCondors:     false,
-      allowCSP:         true,
+      allowCSP:         true,   // CSP is the right play in a down market — collect elevated premium,
+                                 // put strike lands below an already-falling stock. Better entry
+                                 // than on a calm day with the same strike.
       skipTrading:      false,
-      wingMultiplier:   1.5,
-      otmPct:           5,
-      note:             `SPY ${spyChangePct.toFixed(1)}% — condors blocked (short puts at risk), CSP only`,
+      wingMultiplier:   1.5 + vixWingBonus,
+      otmPct:           5 + vixOtmBonus,
+      vix:              vixInfo,
+      note:             `SPY ${spyChangePct.toFixed(1)}% | ${vixInfo.note} — CSP only, 5%+ OTM`,
     };
   }
-  if (spyChangePct < -0.3) {
+  if (spyChangePct < -0.7) {
     return {
       label:            "ELEVATED VOLATILITY",
       allowDirectional: false,
-      allowCondors:     true,
+      allowCondors:     !lowVIX, // skip condors if VIX too low to collect meaningful premium
       allowCSP:         true,
       skipTrading:      false,
-      wingMultiplier:   1.25,
-      otmPct:           4,
-      note:             `SPY ${spyChangePct.toFixed(1)}% — income only, wider 4% OTM wings`,
+      wingMultiplier:   1.25 + vixWingBonus,
+      otmPct:           4 + vixOtmBonus,
+      vix:              vixInfo,
+      note:             `SPY ${spyChangePct.toFixed(1)}% | ${vixInfo.note}${lowVIX ? " — condors skipped (thin premium)" : ""}`,
     };
   }
   return {
     label:            "NORMAL",
-    allowDirectional: false, // directional spreads dropped Aug 2026 — CSP preferred
-    allowCondors:     true,
+    allowDirectional: false,
+    allowCondors:     !lowVIX,
     allowCSP:         true,
     skipTrading:      false,
-    wingMultiplier:   1.0,
-    otmPct:           3,
-    note:             `SPY ${spyChangePct.toFixed(1)}% — all income strategies allowed, 3% OTM`,
+    wingMultiplier:   1.0 + vixWingBonus,
+    otmPct:           3 + vixOtmBonus,
+    vix:              vixInfo,
+    note:             `SPY ${spyChangePct.toFixed(1)}% | ${vixInfo.note}${lowVIX ? " — condors skipped (thin premium)" : " — all income strategies allowed"}`,
   };
 }
 
@@ -1000,7 +1117,8 @@ const INCOME_MIN_SCORE      = 6; // CSP, Iron Condor keep original threshold
 // Extracted from generateTrades so the prompt logic is independently
 // readable and testable without touching the AI call or filtering.
 function buildTradePrompt({ today, optionable, regime, spyChange, sectorHealth,
-                            weakSectors, earningsWarnings, allowedStrategies }) {
+                            weakSectors, earningsWarnings, allowedStrategies,
+                            effectiveMin = MANDATE.minPerTrade }) {
   const priceLines = optionable.map(p => {
     const health      = sectorHealth[p.ticker];
     const warn        = (!health?.healthy) ? " ⚠️ SECTOR WEAK" : "";
@@ -1015,7 +1133,7 @@ function buildTradePrompt({ today, optionable, regime, spyChange, sectorHealth,
   return `You are a professional options trader. Generate as many high-quality options trades as fit within today's remaining capital — there is no fixed trade count, only the dollar budget and mandate criteria below. Do not pad the count with marginal setups just to use the budget; only include trades that genuinely meet the return and quality bar.
 
 DATE: ${today}
-MANDATE: $${MANDATE.minPerTrade}–$${MANDATE.maxPerTrade}/trade | $${MANDATE.dailyCapMin}–$${MANDATE.dailyCapMax} daily | ${MANDATE.minReturnPct}%+ return | Exit at ${MANDATE.profitTargetPct}% profit | Max ${MANDATE.maxDTE} DTE
+MANDATE: $${effectiveMin}–$${MANDATE.maxPerTrade}/trade | $${MANDATE.dailyCapMin}–$${MANDATE.dailyCapMax} daily | ${MANDATE.minReturnPct}%+ return | Exit at ${MANDATE.profitTargetPct}% profit | Max ${MANDATE.condorMaxDTE} DTE (condors)
 
 MARKET REGIME: ${regime.label}
 SPY Day Change: ${spyChange.toFixed(2)}%
@@ -1064,13 +1182,13 @@ ALLOCATION RULES:
 Return ONLY a valid JSON array, no markdown, no extra text.
 Every object MUST include ALL of these exact field names:
 [{
-  "ticker": "NVDA",
-  "strategy": "Bull Call Spread",
-  "direction": "BULLISH",
-  "targetCost": 900,
+  "ticker": "SPY",
+  "strategy": "Iron Condor",
+  "direction": "NEUTRAL",
+  "targetCost": 400,
   "targetReturnPct": "10.0",
   "setupScore": 8,
-  "rationale": "NVDA up 3.1% today with high IV — bull spread captures momentum",
+  "rationale": "SPY rangebound this week — 3% OTM condor collects premium with high probability of expiry",
   "exitTarget": "Close at 50% of max profit"
 }]
 
@@ -1078,7 +1196,7 @@ REQUIRED FIELDS — do not rename or omit any:
 - ticker: stock symbol string
 - strategy: options strategy name string
 - direction: BULLISH, BEARISH, or NEUTRAL
-- targetCost: integer dollar amount between ${MANDATE.minPerTrade} and ${MANDATE.maxPerTrade}
+- targetCost: integer dollar amount between ${effectiveMin} and ${MANDATE.maxPerTrade}
 - targetReturnPct: string percentage e.g. "9.5" (must be >= ${MANDATE.minReturnPct})
 - setupScore: integer 1-10 (must be >= 6)
 - rationale: one sentence explanation
@@ -1088,7 +1206,7 @@ REQUIRED FIELDS — do not rename or omit any:
 // ── TRADE NORMALISER + FILTER ──────────────────────────────────
 // Extracted from generateTrades so normalisation/filter logic is
 // independently testable without needing an AI call.
-function normaliseAndFilterTrades(parsed) {
+function normaliseAndFilterTrades(parsed, effectiveMin = MANDATE.minPerTrade) {
   const isDirectional = s => ["Bull Call Spread", "Bear Put Spread"].includes(s);
 
   const normalised = parsed.map(t => ({
@@ -1103,7 +1221,11 @@ function normaliseAndFilterTrades(parsed) {
   }));
 
   const passed = normalised.filter(t => {
-    if (t.targetCost < MANDATE.minPerTrade || t.targetCost > MANDATE.maxPerTrade) return false;
+    // Use effectiveMin (live=$600, sandbox=$250) so the filter matches
+    // morningSession's gate — previously used MANDATE.minPerTrade ($250)
+    // in live mode, meaning trades between $250-$599 passed the filter
+    // but were silently blocked downstream, wasting AI effort.
+    if (t.targetCost < effectiveMin || t.targetCost > MANDATE.maxPerTrade) return false;
     if (parseFloat(t.targetReturnPct) < MANDATE.minReturnPct) return false;
 
     // Bull Call Spreads retired Aug 2026 — net negative across all live data.
@@ -1140,26 +1262,38 @@ function normaliseAndFilterTrades(parsed) {
 }
 
 async function generateTrades(portfolioData, preComputedRegime = null) {
-  const optionable = portfolioData.filter(p => p.optionable && p.price);
-  const today      = new Date().toLocaleDateString("en-US",{weekday:"long",month:"long",day:"numeric",year:"numeric"});
+  const optionable  = portfolioData.filter(p => p.optionable && p.price);
+  const today       = new Date().toLocaleDateString("en-US",{weekday:"long",month:"long",day:"numeric",year:"numeric"});
+  const effectiveMin = TRADIER.sandbox ? MANDATE.minPerTrade : MANDATE.minPerTradeLive;
 
   let spyChange, regime;
   if (preComputedRegime) {
     ({ spyChange, regime } = preComputedRegime);
     console.log(`  📊 Using pre-computed regime: ${regime.label} (passed from caller)`);
   } else {
+    // Fallback: compute regime independently — fetch VIX so the regime
+    // has the same quality as when called from morningSession.
     spyChange = getSpyChangeFromPortfolio(portfolioData);
-    regime    = getMarketRegime(spyChange);
+    const fallbackVix = await fetchVIX();
+    regime    = getMarketRegime(spyChange, fallbackVix);
     console.log(`  📊 Market regime: ${regime.label} — ${regime.note}`);
   }
 
   if (regime.skipTrading) {
-    await sendSMS(`⚠️ OPTIONS BOT\nNo trades today — ${regime.note}\nBot resumes tomorrow.`);
+    // Genuine halt: SPY -5%+ intraday or VIX > 40 (crash-level fear).
+    // CSPs are too risky in these conditions — gap risk can breach even
+    // wide strikes same day. Bot resumes normally tomorrow.
+    await sendSMS(`⚠️ OPTIONS BOT — ALL TRADING HALTED\n${regime.note}\nBot will resume normal operation tomorrow morning.`);
     return [];
   }
 
   const sectorHealth = {};
   for (const stock of optionable) {
+    // Index ETFs (SPY/QQQ) have no meaningful sector correlation — skip the check
+    if (INDEX_TICKERS.includes(stock.ticker)) {
+      sectorHealth[stock.ticker] = { healthy: true, reason: "Index ETF — no sector correlation check" };
+      continue;
+    }
     sectorHealth[stock.ticker] = checkSectorHealth(stock.ticker, optionable);
     if (!sectorHealth[stock.ticker].healthy) {
       console.log(`  ⚠ ${stock.ticker} sector weak: ${sectorHealth[stock.ticker].reason}`);
@@ -1182,7 +1316,7 @@ async function generateTrades(portfolioData, preComputedRegime = null) {
 
   const prompt = buildTradePrompt({
     today, optionable, regime, spyChange, sectorHealth,
-    weakSectors, earningsWarnings, allowedStrategies,
+    weakSectors, earningsWarnings, allowedStrategies, effectiveMin,
   });
 
   // max_tokens raised from 1000 -> 3000: with the trade-count cap removed,
@@ -1219,7 +1353,7 @@ async function generateTrades(portfolioData, preComputedRegime = null) {
     throw new Error(`JSON parse failed in generateTrades: ${e.message}`);
   }
 
-  return normaliseAndFilterTrades(parsed);
+  return normaliseAndFilterTrades(parsed, effectiveMin);
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -1625,9 +1759,49 @@ async function monitorOpenPositions(groups, priceMap = {}) {
         }
         const allClosed = closeResults.every(r => r.success);
         if (allClosed) {
-          state.dailyPnL += currentPnL;
+          state.dailyPnL   += currentPnL;
+          state.weeklyPnL  += currentPnL;
+          state.monthlyPnL += currentPnL;
           state.openPositions = state.openPositions.filter(t => t !== ourTrade);
-          await sendSMS(`◈ POSITION CLOSED\n${ourTrade.ticker} ${ourTrade.strategy} (${g.positions.length} legs closed)\n${closeReason}\n\nP&L: ${currentPnL>=0?"+":""}$${currentPnL.toFixed(0)} (${currentPct.toFixed(1)}%)\nToday's P&L: ${state.dailyPnL>=0?"+":""}$${state.dailyPnL.toFixed(0)}\n\nNot financial advice.`);
+
+          // Win/loss tracking per strategy — includes exit type breakdown
+          const sk = ourTrade.strategy;
+          if (!state.tradeStats[sk]) state.tradeStats[sk] = { wins:0, losses:0, totalPnL:0, totalWinPnL:0, totalLossPnL:0, earlyExits:0, heldToExpiry:0 };
+          const ts = state.tradeStats[sk];
+          ts.totalPnL += currentPnL;
+          if (currentPnL >= 0) { ts.wins++;   ts.totalWinPnL  += currentPnL; }
+          else                  { ts.losses++; ts.totalLossPnL += currentPnL; }
+          // Track whether the trade was closed early (profit target / stop)
+          // or held to near-expiry (DTE <= minDTE) — informs whether the
+          // 50% profit target is capturing value or leaving money on the table.
+          if (closeReason.includes("EXPIRY RISK") || closeReason.includes("STRIKE BREACHED")) {
+            ts.heldToExpiry = (ts.heldToExpiry || 0) + 1;
+          } else {
+            ts.earlyExits = (ts.earlyExits || 0) + 1;
+          }
+          const winRate  = ts.wins + ts.losses > 0 ? ((ts.wins / (ts.wins + ts.losses)) * 100).toFixed(0) : "N/A";
+          const avgWin   = ts.wins   > 0 ? (ts.totalWinPnL  / ts.wins).toFixed(0)   : "N/A";
+          const avgLoss  = ts.losses > 0 ? (ts.totalLossPnL / ts.losses).toFixed(0) : "N/A";
+          const exitNote = ts.earlyExits + ts.heldToExpiry > 0
+            ? `Early exits: ${ts.earlyExits} | Held to expiry: ${ts.heldToExpiry}`
+            : "";
+
+          await sendSMS(
+`◈ POSITION CLOSED
+${ourTrade.ticker} ${ourTrade.strategy} (${g.positions.length} legs)
+${closeReason}
+
+P&L: ${currentPnL>=0?"+":""}$${currentPnL.toFixed(0)} (${currentPct.toFixed(1)}%)
+
+TODAY:   ${state.dailyPnL>=0?"+":""}$${state.dailyPnL.toFixed(0)}
+WEEK:    ${state.weeklyPnL>=0?"+":""}$${state.weeklyPnL.toFixed(0)}
+MONTH:   ${state.monthlyPnL>=0?"+":""}$${state.monthlyPnL.toFixed(0)}
+
+${sk}: ${ts.wins}W/${ts.losses}L (${winRate}% win rate) | avg +$${avgWin} / -$${Math.abs(avgLoss)}
+${exitNote}
+
+Not financial advice.`
+          );
         } else {
           // CRITICAL: some legs failed to close — do NOT remove from tracking.
           // Keep monitoring so we retry closing the remaining legs next cycle.
@@ -1787,6 +1961,16 @@ async function morningSession() {
   console.log(`\n[${new Date().toLocaleTimeString()}] 🌅 Morning session...`);
   state.dailyTrades = []; state.totalDeployedToday = 0; state.dailyPnL = 0;
 
+  // Reset monthly P&L on the first trading day of each month
+  const today      = new Date();
+  const thisMonth  = `${today.getFullYear()}-${today.getMonth()}`;
+  const savedMonth = state._lastResetMonth;
+  if (savedMonth !== thisMonth) {
+    console.log(`  🔄 Monthly P&L reset (${state.monthlyPnL >= 0 ? "+" : ""}$${state.monthlyPnL.toFixed(0)} carried — new month starting)`);
+    state.monthlyPnL      = 0;
+    state._lastResetMonth = thisMonth;
+  }
+
   // Wrap all external calls in try/catch — any single failure
   // should not kill the entire morning session
   let balances = {};
@@ -1810,11 +1994,17 @@ async function morningSession() {
   const portfolioData = await fetchAllPrices();
   const modeFlag      = TRADIER.sandbox ? " [SANDBOX]" : "";
 
-  // Regime signal sourced from already-fetched portfolioData — no
-  // separate network call, no external dependency that can silently fail.
+  // Fetch VIX for regime calibration — affects wing width and condor eligibility.
+  // Fails gracefully to null if Tradier doesn't support the VIX symbol in sandbox.
+  const vix = await fetchVIX();
+
   const spyNow    = getSpyChangeFromPortfolio(portfolioData);
-  const regimeNow = getMarketRegime(spyNow);
+  const regimeNow = getMarketRegime(spyNow, vix);
   console.log(`  📊 Regime: ${regimeNow.label} | SPY: ${spyNow.toFixed(2)}%`);
+
+  // Effective minimum per trade: sandbox can experiment with lower floor ($250);
+  // live trading needs $600 to survive commissions and slippage.
+  const effectiveMin = TRADIER.sandbox ? MANDATE.minPerTrade : MANDATE.minPerTradeLive;
 
   // Generate trades — retry up to 3x on network/connection errors ONLY.
   // Previously: `while (trades.length === 0)` retried even when the AI
@@ -1847,6 +2037,37 @@ async function morningSession() {
     }
   }
 
+  // BEST-CREDIT CONDOR SELECTION: evaluate all IC candidates before the
+  // trade loop and keep only the highest-credit one. Previously the first
+  // IC through the filter won the slot regardless of credit — meaning SPY
+  // at $399 could beat QQQ at $459 simply by appearing earlier in the AI's
+  // ranked list. Now we evaluate both and take the better premium.
+  //
+  // IMPORTANT: cache the built legs here so the main trade loop can reuse
+  // them — previously buildOptionsLegs was called AGAIN in the loop for the
+  // winning condor, doubling the Tradier API calls (getExpirations + getOptionChain).
+  const cachedLegs = new Map(); // trade object → pre-built legs
+  const icCandidates = trades.filter(t => t.strategy === "Iron Condor");
+  if (icCandidates.length > 1) {
+    const icEvaluated = [];
+    for (const t of icCandidates) {
+      const sd = portfolioData.find(p => p.ticker === t.ticker);
+      if (!sd?.price) continue;
+      const legs = await buildOptionsLegs(t, sd.price, regimeNow);
+      if (legs) {
+        icEvaluated.push({ trade: t, credit: legs.cost });
+        cachedLegs.set(t, legs); // cache so main loop doesn't rebuild
+      }
+    }
+    if (icEvaluated.length > 1) {
+      icEvaluated.sort((a, b) => b.credit - a.credit);
+      const best = icEvaluated[0];
+      const rest = icEvaluated.slice(1);
+      console.log(`  🏆 Best-credit condor: ${best.trade.ticker} ($${best.credit}) beats ${rest.map(x=>`${x.trade.ticker} $${x.credit}`).join(", ")}`);
+      trades = [...trades.filter(t => t.strategy !== "Iron Condor"), best.trade];
+    }
+  }
+
   const executed = [];
   for (const trade of trades) {
     if (state.totalDeployedToday >= MANDATE.dailyCapMax) break;
@@ -1871,11 +2092,24 @@ async function morningSession() {
       }
     }
 
-    const legs = await buildOptionsLegs(trade, stockData.price, regimeNow);
+    // Use cached legs if available (pre-built during best-credit condor
+    // selection) — avoids a second getExpirations + getOptionChain round-trip.
+    const legs = cachedLegs.get(trade) || await buildOptionsLegs(trade, stockData.price, regimeNow);
     if (!legs) { console.log(`  ⏭  ${trade.ticker} ${trade.strategy} — buildOptionsLegs returned null, skipping (see rejection reason above)`); continue; }
-    if (legs.cost < MANDATE.minPerTrade || legs.cost > MANDATE.maxPerTrade) {
-      console.log(`  ⏭  ${trade.ticker} ${trade.strategy} — cost $${legs.cost} outside mandate range $${MANDATE.minPerTrade}-$${MANDATE.maxPerTrade}, skipping`);
+    if (legs.cost < effectiveMin || legs.cost > MANDATE.maxPerTrade) {
+      console.log(`  ⏭  ${trade.ticker} ${trade.strategy} — cost $${legs.cost} outside mandate range $${effectiveMin}-$${MANDATE.maxPerTrade}, skipping`);
       continue;
+    }
+
+    // Max one Iron Condor per day — SPY and QQQ move together so placing
+    // both doubles the same directional bet with extra transaction costs.
+    // First condor to pass all checks wins the slot.
+    if (trade.strategy === "Iron Condor") {
+      const condorsToday = state.dailyTrades.filter(t => t.strategy === "Iron Condor").length;
+      if (condorsToday >= MANDATE.maxCondorsPerDay) {
+        console.log(`  ⏭  ${trade.ticker} Iron Condor — daily condor limit reached (${condorsToday}/${MANDATE.maxCondorsPerDay}). Best-credit condor already placed.`);
+        continue;
+      }
     }
 
     // Buying power gate (live only — sandbox has no real capital constraint).
@@ -1934,9 +2168,10 @@ async function morningSession() {
 async function opportunisticScan() {
   console.log(`\n[${new Date().toLocaleTimeString()}] 🔍 Opportunistic scan...`);
 
+  const effectiveMin    = TRADIER.sandbox ? MANDATE.minPerTrade : MANDATE.minPerTradeLive;
   const budgetRemaining = MANDATE.dailyCapMax - state.totalDeployedToday;
-  if (budgetRemaining < MANDATE.minPerTrade) {
-    console.log(`  ⏭  Skipping — daily budget exhausted ($${state.totalDeployedToday} deployed, $${budgetRemaining} remaining)`);
+  if (budgetRemaining < effectiveMin) {
+    console.log(`  ⏭  Skipping — daily budget exhausted ($${state.totalDeployedToday} deployed, $${budgetRemaining} remaining, need ≥$${effectiveMin})`);
     return;
   }
 
@@ -1963,10 +2198,11 @@ async function opportunisticScan() {
 
   // Re-check regime and sector health — same rules as morning session
   const spyNow = getSpyChangeFromPortfolio(portfolioData);
-  const regime = getMarketRegime(spyNow);
+  const vix    = await fetchVIX();
+  const regime = getMarketRegime(spyNow, vix);
 
   if (regime.skipTrading) {
-    console.log(`  ⏭  Skipping — regime is ${regime.label}, no new trades`);
+    console.log(`  ⏭  Skipping — regime is ${regime.label} (${regime.note}), all trading halted`);
     return;
   }
 
@@ -2006,7 +2242,7 @@ async function opportunisticScan() {
 
   const stockData = portfolioData.find(p => p.ticker === candidate.ticker);
   const legs = await buildOptionsLegs(candidate, stockData.price, regime);
-  if (!legs || legs.cost < MANDATE.minPerTrade || legs.cost > MANDATE.maxPerTrade || legs.cost > budgetRemaining) {
+  if (!legs || legs.cost < effectiveMin || legs.cost > MANDATE.maxPerTrade || legs.cost > budgetRemaining) {
     console.log(`  ✗ ${candidate.ticker} setup did not pass final checks. Standing down.`);
     return;
   }
@@ -2078,9 +2314,41 @@ async function closingSession() {
   const losers   = portfolioData.filter(p=>(p.changePct||0)<0).sort((a,b)=>a.changePct-b.changePct);
   const modeFlag = TRADIER.sandbox ? " [SANDBOX]" : "";
 
-  await sendSMS(`🔔 CLOSING${modeFlag} ${new Date().toLocaleDateString()}\n\nOPTIONS:\nTrades: ${state.dailyTrades.length} | Open: ${state.openPositions.length}\nRealized P&L: ${state.dailyPnL>=0?"+":""}$${state.dailyPnL.toFixed(0)}\nDeployed: $${state.totalDeployedToday}\n\nSTOCKS:\n🟢 ${winners.slice(0,3).map(p=>`${p.ticker} +${(p.changePct||0).toFixed(1)}%`).join(", ")||"None"}\n🔴 ${losers.slice(0,3).map(p=>`${p.ticker} ${(p.changePct||0).toFixed(1)}%`).join(", ")||"None"}\n\nNot financial advice.`);
+  // Win rate summary across all strategies
+  const statsLines = Object.entries(state.tradeStats).map(([strategy, ts]) => {
+    const total   = ts.wins + ts.losses;
+    const winRate = total > 0 ? ((ts.wins / total) * 100).toFixed(0) : "N/A";
+    const avgWin  = ts.wins   > 0 ? `+$${(ts.totalWinPnL  / ts.wins).toFixed(0)}`  : "N/A";
+    const avgLoss = ts.losses > 0 ? `-$${Math.abs(ts.totalLossPnL / ts.losses).toFixed(0)}` : "N/A";
+    const exitBreakdown = (ts.earlyExits || 0) + (ts.heldToExpiry || 0) > 0
+      ? ` | early:${ts.earlyExits||0} held:${ts.heldToExpiry||0}`
+      : "";
+    return `${strategy}: ${ts.wins}W/${ts.losses}L (${winRate}%) | avg ${avgWin} / ${avgLoss}${exitBreakdown}`;
+  }).join("\n") || "No closed trades yet";
+
+  await sendSMS(
+`🔔 CLOSING${modeFlag} ${new Date().toLocaleDateString()}
+
+OPTIONS:
+Trades: ${state.dailyTrades.length} | Open: ${state.openPositions.length}
+
+P&L SUMMARY:
+Today:  ${state.dailyPnL>=0?"+":""}$${state.dailyPnL.toFixed(0)}
+Week:   ${state.weeklyPnL>=0?"+":""}$${state.weeklyPnL.toFixed(0)}
+Month:  ${state.monthlyPnL>=0?"+":""}$${state.monthlyPnL.toFixed(0)}
+Capital deployed: $${state.totalDeployedToday}
+
+WIN RATES:
+${statsLines}
+
+STOCKS:
+🟢 ${winners.slice(0,3).map(p=>`${p.ticker} +${(p.changePct||0).toFixed(1)}%`).join(", ")||"None"}
+🔴 ${losers.slice(0,3).map(p=>`${p.ticker} ${(p.changePct||0).toFixed(1)}%`).join(", ")||"None"}
+
+Not financial advice.`
+  );
   state.alertsSent.clear();
-  saveState(); // persist end-of-day state
+  saveState();
   console.log("  ✅ Closing summary sent.");
 }
 
@@ -2208,25 +2476,37 @@ async function sundaySummary() {
   console.log("\n📋 Sunday portfolio review...");
   const portfolioData = await fetchAllPrices();
 
-  // Reset weekly highs at the start of each new week. The momentum filter in
-  // buildOptionsLegs uses state.weeklyHighs to gate directional spreads —
-  // without a weekly reset, a peak from weeks ago would permanently block
-  // Bull Call Spreads on any ticker that has since pulled back.
+  // Reset weekly highs at the start of each new week.
   const prevHighCount = Object.keys(state.weeklyHighs).length;
   state.weeklyHighs = {};
   console.log(`  🔄 Weekly highs reset (${prevHighCount} ticker(s) cleared — momentum filter will rebuild from today's prices)`);
 
+  // Capture weekly P&L before resetting
+  const closingWeeklyPnL = state.weeklyPnL;
+  state.weeklyPnL = 0;
+  console.log(`  🔄 Weekly P&L reset (${closingWeeklyPnL >= 0 ? "+" : ""}$${closingWeeklyPnL.toFixed(0)} this week)`);
+
   // Check for splits FIRST — must happen before pricing update
   await detectAndFixSplits(portfolioData);
   await updateAllPricingLevels(portfolioData);
+
+  // Win rate summary per strategy
+  const statsLines = Object.entries(state.tradeStats).map(([strategy, ts]) => {
+    const total   = ts.wins + ts.losses;
+    const winRate = total > 0 ? ((ts.wins / total) * 100).toFixed(0) : "N/A";
+    const avgWin  = ts.wins   > 0 ? `+$${(ts.totalWinPnL  / ts.wins).toFixed(0)}`  : "N/A";
+    const avgLoss = ts.losses > 0 ? `-$${Math.abs(ts.totalLossPnL / ts.losses).toFixed(0)}` : "N/A";
+    const exitBreakdown = (ts.earlyExits || 0) + (ts.heldToExpiry || 0) > 0
+      ? ` | early:${ts.earlyExits||0} held:${ts.heldToExpiry||0}`
+      : "";
+    return `${strategy}: ${ts.wins}W/${ts.losses}L (${winRate}%) avg ${avgWin}/${avgLoss} | net $${ts.totalPnL.toFixed(0)}${exitBreakdown}`;
+  }).join("\n") || "No closed trades yet";
 
   const lines = portfolioData.map(p => {
     const price      = p.price || 0;
     const stop       = getStopLoss(p.ticker, p.stopLoss);
     const target     = getTarget(p.ticker, p.target);
     const dynamic    = state.dynamicLevels[p.ticker];
-    // Use split-adjusted avgCost from dynamicLevels if available —
-    // detectAndFixSplits updates it there; PORTFOLIO.avgCost is static.
     const costBasis  = dynamic?.avgCost || p.avgCost;
     const pnlPct     = costBasis ? (((price - costBasis) / costBasis) * 100).toFixed(1) : "N/A";
     const distToStop   = stop   ? (((price-stop)/price)*100).toFixed(1)    : "N/A";
@@ -2237,7 +2517,26 @@ async function sundaySummary() {
   const autoStops   = Object.values(state.dynamicLevels).filter(l=>l.stopLoss).length;
   const autoTargets = Object.values(state.dynamicLevels).filter(l=>l.target).length;
 
-  await sendSMS(`📋 SUNDAY REVIEW\n${new Date().toLocaleDateString("en-US",{month:"long",day:"numeric",year:"numeric"})}\n\nAUTO-UPDATES:\n📈 Trailing stops: ${autoStops}\n🔄 Analyst targets: ${autoTargets}\n\n${lines}\n\n📈=auto stop 🔄=updated target\nNot financial advice.`);
+  await sendSMS(
+`📋 SUNDAY REVIEW
+${new Date().toLocaleDateString("en-US",{month:"long",day:"numeric",year:"numeric"})}
+
+P&L SUMMARY:
+This week:  ${closingWeeklyPnL>=0?"+":""}$${closingWeeklyPnL.toFixed(0)}
+This month: ${state.monthlyPnL>=0?"+":""}$${state.monthlyPnL.toFixed(0)}
+
+WIN RATES (all-time):
+${statsLines}
+
+AUTO-UPDATES:
+📈 Trailing stops: ${autoStops} | 🔄 Analyst targets: ${autoTargets}
+
+PORTFOLIO:
+${lines}
+
+📈=auto stop 🔄=updated target
+Not financial advice.`
+  );
   saveState();
   console.log("  ✅ Sunday summary sent.");
 }
