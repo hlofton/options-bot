@@ -76,8 +76,13 @@ const MANDATE = {
                                      // Data: META/AMZN ICs both down 40%+ within 2 days of entry
                                      // with 6 DTE remaining. Keeping 200% stop on singles meant
                                      // riding losers far too long on high-IV individual names.
-  cspMaxDTE:             21,  // CSP expiry target: up to 21 DTE for income premium
-                               // (condors use condorMaxDTE=3 separately)
+  cspMaxDTE:             21,  // CSP expiry: up to 21 DTE for medium-IV names (AAPL, MSFT, SPY)
+  cspMaxDTEHighIV:       14,  // CSP expiry: max 14 DTE for high-IV names (NVDA, TSLA, META, AMZN etc.)
+                               // High-IV names can move 8-10% on a single day — 21 DTE is 3 weeks
+                               // of exposure. PANW CSP closed +47% in 8 DTE; no need to hold longer.
+  cspVIXSizeMultiplier:  1.5, // In elevated/extreme VIX regimes, premium is 2-4x higher — size up
+                               // CSPs to collect more credit while IV is elevated. Applied when
+                               // regime.vix.label is "ELEVATED" or "EXTREME". Capped at maxPerTrade.
   minDTE:                1,
   condorMaxDTE:           3,  // Iron Condors target 1-3 DTE only — data shows 7 DTE single-stock
                                // ICs consistently breached (META $610C breached day 2, AMZN $285C
@@ -87,9 +92,12 @@ const MANDATE = {
   maxSingleStockPositions: 2,  // No more than 2 individual-name positions open at once.
                                 // Reduces concentration risk — previously could have META, AMZN,
                                 // NVDA, CRWD all open simultaneously = 4 bets on single names.
-  maxCondorsPerDay:        1,  // One index condor per day max — SPY and QQQ move together 95%
-                                // of the time, placing both is doubling the same directional bet
-                                // with twice the transaction costs. Best credit wins the slot.
+  maxCondorsPerDay:        1,  // One index condor per day max
+  shortDTEThreshold:       4,  // DTE at or below which single-stock credit stops tighten.
+                                // Set to condorMaxDTE+1 so any condor placed at max DTE
+                                // immediately falls into the tighter stop zone — confirmed
+                                // Aug 13 2026: AMZN IC at 4 DTE kept deteriorating with no
+                                // recovery path. 50% stop at DTE<=4, 100% otherwise.
   minPerTradeLive:       600,  // Live trading minimum — $250 sandbox floor doesn't survive
                                 // commissions ($39+ on 60-leg SPY condor) and slippage in live.
                                 // $600 ensures meaningful profit after transaction costs.
@@ -118,12 +126,12 @@ const TRADIER = {
 const PORTFOLIO = [
   // ── AI / SEMICONDUCTORS — highest IV, most profitable ─────
   { ticker:"NVDA", name:"Nvidia",                 shares:0,    avgCost:198.00, stopLoss:175.00, target:236.00,  sector:"AI/Semis",  ivProfile:"high",   optionable:true,  earningsDate:"2026-11-19" }, // Q3 FY2027 est.
-  { ticker:"AMD",  name:"Advanced Micro Devices", shares:0,    avgCost:546.72, stopLoss:480.00, target:650.00,  sector:"Semis",     ivProfile:"high",   optionable:true,  earningsDate:"2026-10-27" }, // Q3 2026 est.
+  { ticker:"AMD",  name:"Advanced Micro Devices", shares:0,    avgCost:546.72, stopLoss:420.00, target:580.00,  sector:"Semis",     ivProfile:"high",   optionable:true,  earningsDate:"2026-10-27" }, // stop lowered Aug 2026 — sustained weakness below $480 original stop
   { ticker:"AVGO", name:"Broadcom Inc",           shares:0,    avgCost:400.39, stopLoss:340.00, target:472.00,  sector:"AI/Semis",  ivProfile:"high",   optionable:true,  earningsDate:"2026-09-04" }, // upcoming
 
   // ── MEGA-CAP TECH — deepest liquidity, weekly expiries ────
   { ticker:"MSFT", name:"Microsoft",              shares:0,    avgCost:365.44, stopLoss:460.00, target:560.00,  sector:"Cloud/AI",  ivProfile:"high",   optionable:true,  earningsDate:"2026-10-23" }, // Q1 FY2027 est. | stop/target updated Aug 2026
-  { ticker:"AAPL", name:"Apple Inc",              shares:0,    avgCost:298.01, stopLoss:277.00, target:350.00,  sector:"Consumer",  ivProfile:"medium", optionable:true,  earningsDate:"2026-11-01" }, // Q4 FY2026 est.
+  { ticker:"AAPL", name:"Apple Inc",              shares:0,    avgCost:298.01, stopLoss:255.00, target:350.00,  sector:"Consumer",  ivProfile:"medium", optionable:true,  earningsDate:"2026-11-01" }, // stop lowered Aug 2026 — weakness near $277 original stop
   { ticker:"AMZN", name:"Amazon",                 shares:0,    avgCost:244.00, stopLoss:208.00, target:310.00,  sector:"Cloud/AI",  ivProfile:"high",   optionable:true,  earningsDate:"2026-10-30" }, // Q3 2026 est.
   { ticker:"GOOGL",name:"Alphabet",               shares:0,    avgCost:357.18, stopLoss:314.00, target:410.00,  sector:"AI/Ads",    ivProfile:"high",   optionable:true,  earningsDate:"2026-10-27" }, // Q3 2026 est.
   { ticker:"META", name:"Meta Platforms",         shares:0,    avgCost:620.00, stopLoss:540.00, target:680.00,  sector:"AI/Social", ivProfile:"high",   optionable:true,  earningsDate:"2026-10-28" }, // Q3 2026 est. | target updated Aug 2026
@@ -166,9 +174,14 @@ const state = {
   totalDeployedToday: 0,
   dynamicLevels:      {},   // auto-updated stops + targets
   weeklyHighs:        {},   // highest price seen this week
-  tradeStats:         {},   // per-strategy win/loss: { "Iron Condor": { wins, losses, totalPnL, ... } }
-  _lastResetMonth:    null, // "YYYY-M" string — used to detect first trading day of each month
-  jobRunning:         null, // name of the currently executing scheduled job, or null
+  tradeStats:         {},   // per-strategy win/loss tracking
+  downtrendCount:     {},   // { ticker: { count: N, lastDate: "YYYY-MM-DD" } }
+                            // increments each day STOP_LOSS fires; resets on TARGET_HIT.
+                            // Tickers with count >= 3 are blocked as CSP candidates —
+                            // confirmed Aug 2026: AMD and AAPL hitting stop repeatedly
+                            // while in sustained downtrends, not appropriate for put selling.
+  _lastResetMonth:    null,
+  jobRunning:         null,
 };
 
 // ═══════════════════════════════════════════════════════════════
@@ -196,6 +209,7 @@ function saveState() {
       weeklyPnL:          state.weeklyPnL,
       monthlyPnL:         state.monthlyPnL,
       tradeStats:         state.tradeStats,
+      downtrendCount:     state.downtrendCount,
       _lastResetMonth:    state._lastResetMonth,
       dynamicLevels:      state.dynamicLevels,
       weeklyHighs:        state.weeklyHighs,
@@ -224,6 +238,7 @@ function loadState() {
     state.dynamicLevels = persisted.dynamicLevels || {};
     state.weeklyHighs   = persisted.weeklyHighs   || {};
     state.tradeStats        = persisted.tradeStats    || {};
+    state.downtrendCount    = persisted.downtrendCount || {};
     state._lastResetMonth   = persisted._lastResetMonth || null;
     state.weeklyPnL         = persisted.weeklyPnL     || 0;
     state.monthlyPnL        = persisted.monthlyPnL    || 0;
@@ -510,10 +525,31 @@ async function placeOptionsOrder(trade) {
 
 async function closeOptionsPosition(position) {
   const closeSide = position.side === "buy_to_open" ? "sell_to_close" : "buy_to_close";
+
+  // Live mode: use midpoint limit order to avoid bid-ask slippage.
+  // Market orders on options in live mode can give back $10-50+ per leg
+  // on the spread. placeOptionsOrder already uses limits for opens —
+  // closes should match. Falls back to market if quote fetch fails.
+  let orderType  = "market";
+  let limitPrice;
+  if (!TRADIER.sandbox) {
+    try {
+      const quotes = await getOptionQuote(position.symbol);
+      const q      = quotes[0];
+      if (q?.bid != null && q?.ask != null && q.bid > 0) {
+        limitPrice = ((q.bid + q.ask) / 2).toFixed(2);
+        orderType  = "limit";
+      }
+    } catch(e) {
+      console.log(`  ⚠ Quote fetch failed for ${position.symbol} — falling back to market close`);
+    }
+  }
+
   const orderParams = {
     class:"option", symbol:position.underlyingSymbol || position.ticker,
     option_symbol:position.symbol, side:closeSide,
-    quantity:Math.abs(position.quantity), type:"market", duration:"day",
+    quantity:Math.abs(position.quantity), type:orderType, duration:"day",
+    ...(limitPrice ? { price: limitPrice } : {}),
   };
 
   // Retry up to 3 times with backoff — Tradier sandbox occasionally rejects
@@ -646,9 +682,15 @@ async function buildOptionsLegs(tradeRec, stockPrice, regime = null) {
         const condorPuts  = condorChain.filter(o => o.option_type==="put").sort((a,b) => b.strike-a.strike);
 
         // Dynamic OTM distance based on regime — wider wings in volatile markets
-        const otmFactor   = (regime?.otmPct ?? 3) / 100;
+        // Belt-and-suspenders: enforce 5% OTM minimum for non-index ICs even though
+        // single-stock ICs are already banned by the INDEX_TICKERS guard above.
+        // Confirmed Aug 13 2026: AMZN IC placed at 3% OTM breached in 2 days.
+        const baseOtmPct  = INDEX_TICKERS.includes(ticker)
+          ? (regime?.otmPct ?? 3)
+          : Math.max(5, regime?.otmPct ?? 5); // single stocks: 5% minimum
+        const otmFactor   = baseOtmPct / 100;
         const widthFactor = otmFactor + (0.03 * (regime?.wingMultiplier ?? 1.0));
-        console.log(`  📐 Iron Condor wings: ${(otmFactor*100).toFixed(0)}% OTM / ${(widthFactor*100).toFixed(1)}% width (regime: ${regime?.label || "DEFAULT"}) | DTE: ${Math.ceil((new Date(condorExp + "T00:00:00Z") - condorTodayUTC) / (1000*60*60*24))}`);
+        console.log(`  📐 Iron Condor wings: ${(otmFactor*100).toFixed(0)}% OTM / ${(widthFactor*100).toFixed(1)}% width (regime: ${regime?.label || "DEFAULT"}${!INDEX_TICKERS.includes(ticker) ? ", 5% floor applied" : ""}) | DTE: ${Math.ceil((new Date(condorExp + "T00:00:00Z") - condorTodayUTC) / (1000*60*60*24))}`);
 
         const sc2 = condorCalls.find(c => c.strike >= stockPrice * (1 + otmFactor));
         const lc2 = condorCalls.find(c => c.strike >= stockPrice * (1 + widthFactor));
@@ -692,25 +734,49 @@ async function buildOptionsLegs(tradeRec, stockPrice, regime = null) {
         };
       }
       case "Cash Secured Put": {
-        const sp3 = puts.find(p => p.strike <= stockPrice*0.95);
+        // DTE selection: high-IV names use a shorter window (14 DTE max) —
+        // NVDA/TSLA/META can move 8-10% in a day, 21 DTE is too much exposure.
+        // Medium-IV names (AAPL, MSFT) use the full 21 DTE window.
+        const stock      = PORTFOLIO.find(s => s.ticker === ticker);
+        const maxDTEcsp  = stock?.ivProfile === "high" ? MANDATE.cspMaxDTEHighIV : MANDATE.cspMaxDTE;
+        const cspTodayStr = new Date().toISOString().slice(0, 10);
+        const cspTodayUTC = new Date(cspTodayStr + "T00:00:00Z");
+        const cspExp = expirations.find(exp => {
+          const dte = Math.ceil((new Date(exp + "T00:00:00Z") - cspTodayUTC) / (1000*60*60*24));
+          return dte >= 5 && dte <= maxDTEcsp;
+        });
+        if (!cspExp) return null;
+
+        // Fetch chain for CSP-specific expiry (may differ from validExp above)
+        const cspChain = cspExp === validExp ? chain : await getOptionChain(ticker, cspExp);
+        const cspPuts  = cspChain.filter(o => o.option_type==="put").sort((a,b) => b.strike-a.strike);
+
+        const sp3 = cspPuts.find(p => p.strike <= stockPrice * 0.95);
         if (!sp3) return null;
         const creditPerContract = sp3.bid * 100;
-        // Scale contract quantity so the CREDIT COLLECTED (not the
-        // collateral) lands inside the mandate's $400-$1200 range.
-        // "cost" now represents premium at risk, comparable to spreads.
-        // "collateral" tracks the real cash-secured requirement separately
-        // so account-balance checks stay accurate.
-        let qty = Math.max(1, Math.round(MANDATE.minPerTrade / Math.max(creditPerContract, 1)));
+
+        // VIX-aware sizing: in elevated/extreme IV environments, premium is
+        // 2-4x higher — collect more credit while conditions are favourable.
+        // Multiplier capped so we never exceed maxPerTrade.
+        const vixLabel   = regime?.vix?.label || "UNKNOWN";
+        const sizeMulti  = ["ELEVATED","EXTREME","CRASH"].includes(vixLabel)
+          ? MANDATE.cspVIXSizeMultiplier : 1.0;
+
+        let qty = Math.max(1, Math.round((MANDATE.minPerTrade * sizeMulti) / Math.max(creditPerContract, 1)));
         let totalCredit = creditPerContract * qty;
-        // Cap quantity so we never exceed maxPerTrade in credit collected
         while (totalCredit > MANDATE.maxPerTrade && qty > 1) { qty--; totalCredit = creditPerContract * qty; }
-        if (totalCredit < MANDATE.minPerTrade * 0.5) return null; // too little premium even at floor qty
+        if (totalCredit < MANDATE.minPerTrade * 0.5) return null;
+
+        if (sizeMulti > 1.0) {
+          console.log(`  📊 ${ticker} CSP: VIX ${vixLabel} — sizing up ${sizeMulti}x (${qty} contracts, $${Math.round(totalCredit)} credit)`);
+        }
+
         const collateral = sp3.strike * 100 * qty;
         return {
-          expiration:  validExp,
+          expiration:  cspExp,
           legs:        [{ symbol: sp3.symbol, side: "sell_to_open" }],
-          cost:        Math.round(totalCredit),   // premium collected — compared against mandate
-          collateral:  Math.round(collateral),    // actual cash-secured requirement — for balance checks only
+          cost:        Math.round(totalCredit),
+          collateral:  Math.round(collateral),
           maxProfit:   Math.round(totalCredit),
           quantity:    qty,
           isCredit:    true,
@@ -865,8 +931,9 @@ async function fetchVIX() {
 }
 
 function getVIXLabel(vix) {
-  if (!vix)    return { label:"UNKNOWN", note:"VIX unavailable" };
-  if (vix > 30) return { label:"EXTREME", note:`VIX ${vix.toFixed(1)} — extreme fear, gap risk high` };
+  if (!vix)     return { label:"UNKNOWN",  note:"VIX unavailable" };
+  if (vix > 40) return { label:"CRASH",    note:`VIX ${vix.toFixed(1)} — crash-level fear, all trading halted` };
+  if (vix > 30) return { label:"EXTREME",  note:`VIX ${vix.toFixed(1)} — extreme fear, gap risk high` };
   if (vix > 20) return { label:"ELEVATED", note:`VIX ${vix.toFixed(1)} — elevated IV, wider wings collect more premium` };
   if (vix > 15) return { label:"NORMAL",   note:`VIX ${vix.toFixed(1)} — normal conditions` };
   return         { label:"LOW",      note:`VIX ${vix.toFixed(1)} — compressed premium, be selective on condors` };
@@ -1120,14 +1187,16 @@ function buildTradePrompt({ today, optionable, regime, spyChange, sectorHealth,
                             weakSectors, earningsWarnings, allowedStrategies,
                             effectiveMin = MANDATE.minPerTrade }) {
   const priceLines = optionable.map(p => {
-    const health      = sectorHealth[p.ticker];
-    const warn        = (!health?.healthy) ? " ⚠️ SECTOR WEAK" : "";
-    const weekHigh    = state.weeklyHighs[p.ticker];
-    const pctFromHigh = weekHigh ? (((p.price - weekHigh) / weekHigh) * 100).toFixed(1) : null;
-    const momentumNote = pctFromHigh !== null
+    const health        = sectorHealth[p.ticker];
+    const warn          = (!health?.healthy) ? " ⚠️ SECTOR WEAK" : "";
+    const weekHigh      = state.weeklyHighs[p.ticker];
+    const pctFromHigh   = weekHigh ? (((p.price - weekHigh) / weekHigh) * 100).toFixed(1) : null;
+    const momentumNote  = pctFromHigh !== null
       ? (parseFloat(pctFromHigh) >= 0 ? ` | AT/NEAR WEEK HIGH (+${pctFromHigh}%)` : ` | ${pctFromHigh}% from week high`)
       : "";
-    return `${p.ticker}: $${p.price?.toFixed(2)} ${(p.changePct||0)>=0?"▲":"▼"}${Math.abs(p.changePct||0).toFixed(2)}% | IV:${p.ivProfile} | ${p.sector}${momentumNote}${warn}`;
+    const dtCount       = state.downtrendCount[p.ticker]?.count || 0;
+    const downtrendNote = dtCount >= 3 ? ` | 🔻 DOWNTREND ${dtCount}d — NO CSP` : "";
+    return `${p.ticker}: $${p.price?.toFixed(2)} ${(p.changePct||0)>=0?"▲":"▼"}${Math.abs(p.changePct||0).toFixed(2)}% | IV:${p.ivProfile} | ${p.sector}${momentumNote}${warn}${downtrendNote}`;
   }).join("\n");
 
   return `You are a professional options trader. Generate as many high-quality options trades as fit within today's remaining capital — there is no fixed trade count, only the dollar budget and mandate criteria below. Do not pad the count with marginal setups just to use the budget; only include trades that genuinely meet the return and quality bar.
@@ -1206,7 +1275,7 @@ REQUIRED FIELDS — do not rename or omit any:
 // ── TRADE NORMALISER + FILTER ──────────────────────────────────
 // Extracted from generateTrades so normalisation/filter logic is
 // independently testable without needing an AI call.
-function normaliseAndFilterTrades(parsed, effectiveMin = MANDATE.minPerTrade) {
+function normaliseAndFilterTrades(parsed, effectiveMin = MANDATE.minPerTrade, downtrendCount = {}) {
   const isDirectional = s => ["Bull Call Spread", "Bear Put Spread"].includes(s);
 
   const normalised = parsed.map(t => ({
@@ -1241,6 +1310,17 @@ function normaliseAndFilterTrades(parsed, effectiveMin = MANDATE.minPerTrade) {
     if (t.strategy === "Iron Condor" && !INDEX_TICKERS.includes(t.ticker)) {
       console.log(`  🚫 Blocked ${t.ticker} Iron Condor — index-only strategy (SPY/QQQ only)`);
       return false;
+    }
+
+    // Block CSPs on tickers in sustained downtrend (3+ consecutive STOP_LOSS days).
+    // Confirmed Aug 2026: AMD and AAPL hitting stop repeatedly while falling —
+    // selling puts into a downtrend means the put strike gets breached same session.
+    if (t.strategy === "Cash Secured Put") {
+      const dtCount = downtrendCount[t.ticker]?.count || 0;
+      if (dtCount >= 3) {
+        console.log(`  🚫 Blocked ${t.ticker} CSP — ${dtCount} consecutive stop-loss sessions (sustained downtrend, not appropriate for put selling)`);
+        return false;
+      }
     }
 
     if (isDirectional(t.strategy) && HIGH_BETA_TICKERS.includes(t.ticker)) {
@@ -1353,7 +1433,7 @@ async function generateTrades(portfolioData, preComputedRegime = null) {
     throw new Error(`JSON parse failed in generateTrades: ${e.message}`);
   }
 
-  return normaliseAndFilterTrades(parsed, effectiveMin);
+  return normaliseAndFilterTrades(parsed, effectiveMin, state.downtrendCount);
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -1704,40 +1784,60 @@ async function monitorOpenPositions(groups, priceMap = {}) {
 
       const debitStopLossPnL  = -(ourTrade.executedCost * (MANDATE.stopLossPct / 100));
       // Index ICs (SPY/QQQ): 200% stop — wider buffer, indexes are range-bound.
-      // Single-stock ICs: 100% stop — lose what you made and exit. Data: META/AMZN
-      // both down 40%+ within 2 days, kept going worse. Tighter stop on singles.
-      const isIndexTrade     = INDEX_TICKERS.includes(ourTrade.ticker);
-      const creditStopPct    = isIndexTrade ? MANDATE.creditStopLossPct : MANDATE.singleStockCreditStopLossPct;
+      // Single-stock ICs: 100% stop — lose what you made and exit.
+      // Single-stock ICs with DTE <= 4: tighten to 50% — confirmed Aug 13 2026:
+      // AMZN IC was at -18.8% with 4 DTE and kept deteriorating. With so little
+      // time remaining, losers almost never recover. Cut at 50% and redeploy.
+      const isIndexTrade  = INDEX_TICKERS.includes(ourTrade.ticker);
+      const isShortDTE    = dte <= MANDATE.shortDTEThreshold;
+      const creditStopPct = isIndexTrade
+        ? MANDATE.creditStopLossPct                   // index: 200%
+        : (isShortDTE ? 50 : MANDATE.singleStockCreditStopLossPct); // single: 50% DTE<=4, 100% otherwise
       const creditStopLossPnL = -(maxProfitShare * g.qty * 100 * (creditStopPct / 100));
 
-      // BREACHED STRIKE CHECK — Lesson from PANW (Jul): an Iron Condor can
-      // still be inside the dollar stop-loss threshold while the underlying
-      // has already traded beyond a short strike, at which point the trade
-      // is structurally compromised and rarely recovers.
-      // Uses the pre-fetched priceMap (passed from intradayCheck) rather than
-      // fetchStockPrice() — the cache TTL (18 min) is shorter than the cycle
-      // interval (20 min), meaning fetchStockPrice was frequently returning
-      // prices from the PREVIOUS cycle. priceMap is fetched fresh this cycle.
-      let strikeBreached = false;
+      // BREACHED STRIKE CHECK + PRE-BREACH WARNING
+      // Lesson from PANW (Jul) and AMZN (Aug 13 2026): confirmed breach
+      // detection fires too late — by the time the underlying crosses the
+      // short strike, the leg has already expanded 2-3x. AMZN sat within
+      // $1 of the $265 short put for 24 hours before confirmed breach.
+      // FIX: add a 2% pre-breach warning that closes proactively when the
+      // underlying is within 2% of either short strike — before actual breach.
+      let strikeBreached    = false;
+      let preBreachWarning  = false;
+      let breachNote        = "";
       if (ourTrade.strategy === "Iron Condor" && ourTrade.shortCallStrike && ourTrade.shortPutStrike) {
         const livePrice = priceMap?.[ourTrade.ticker]?.price;
         if (livePrice) {
+          const pctToCall = (ourTrade.shortCallStrike - livePrice) / livePrice;
+          const pctToPut  = (livePrice - ourTrade.shortPutStrike)  / livePrice;
+
           if (livePrice >= ourTrade.shortCallStrike) {
             strikeBreached = true;
-            console.log(`  🚨 ${ourTrade.ticker} price $${livePrice} breached short CALL strike $${ourTrade.shortCallStrike}`);
+            breachNote = `🚨 ${ourTrade.ticker} price $${livePrice} breached short CALL $${ourTrade.shortCallStrike}`;
+            console.log(`  ${breachNote}`);
           } else if (livePrice <= ourTrade.shortPutStrike) {
             strikeBreached = true;
-            console.log(`  🚨 ${ourTrade.ticker} price $${livePrice} breached short PUT strike $${ourTrade.shortPutStrike}`);
+            breachNote = `🚨 ${ourTrade.ticker} price $${livePrice} breached short PUT $${ourTrade.shortPutStrike}`;
+            console.log(`  ${breachNote}`);
+          } else if (pctToCall < 0.02) {
+            preBreachWarning = true;
+            breachNote = `⚠️ ${ourTrade.ticker} price $${livePrice} within ${(pctToCall*100).toFixed(1)}% of short CALL $${ourTrade.shortCallStrike} — closing proactively`;
+            console.log(`  ${breachNote}`);
+          } else if (pctToPut < 0.02) {
+            preBreachWarning = true;
+            breachNote = `⚠️ ${ourTrade.ticker} price $${livePrice} within ${(pctToPut*100).toFixed(1)}% of short PUT $${ourTrade.shortPutStrike} — closing proactively`;
+            console.log(`  ${breachNote}`);
           }
         }
       }
 
       let shouldClose = false, closeReason = "";
-      if (strikeBreached)                { shouldClose=true; closeReason=`🚨 STRIKE BREACHED — underlying moved past a short strike, closing before further loss`; }
-      else if (currentPnL >= profitTargetPnL) { shouldClose=true; closeReason=`🎯 PROFIT TARGET — ${currentPct.toFixed(1)}% gain = +$${currentPnL.toFixed(0)}`; }
-      else if (dte <= MANDATE.minDTE)    { shouldClose=true; closeReason=`📅 EXPIRY RISK — ${dte} DTE, closing to avoid assignment`; }
+      if (strikeBreached)                              { shouldClose=true; closeReason=`🚨 STRIKE BREACHED — ${breachNote}`; }
+      else if (preBreachWarning)                       { shouldClose=true; closeReason=`⚠️ PRE-BREACH CLOSE — ${breachNote}`; }
+      else if (currentPnL >= profitTargetPnL)          { shouldClose=true; closeReason=`🎯 PROFIT TARGET — ${currentPct.toFixed(1)}% gain = +$${currentPnL.toFixed(0)}`; }
+      else if (dte <= MANDATE.minDTE)                  { shouldClose=true; closeReason=`📅 EXPIRY RISK — ${dte} DTE, closing to avoid assignment`; }
       else if (!ourTrade.isCredit && currentPnL <= debitStopLossPnL)  { shouldClose=true; closeReason=`🛑 STOP LOSS — down ${MANDATE.stopLossPct}%+ of debit = -$${Math.abs(currentPnL).toFixed(0)}`; }
-      else if (ourTrade.isCredit  && currentPnL <= creditStopLossPnL) { shouldClose=true; closeReason=`🛑 CREDIT STOP LOSS — down ${creditStopPct}%+ of credit = -$${Math.abs(currentPnL).toFixed(0)} (${isIndexTrade?"index":"single-stock"} threshold)`; }
+      else if (ourTrade.isCredit  && currentPnL <= creditStopLossPnL) { shouldClose=true; closeReason=`🛑 CREDIT STOP LOSS — down ${creditStopPct}% of credit = -$${Math.abs(currentPnL).toFixed(0)} (${isIndexTrade?"index":isShortDTE?"single≤4DTE":"single-stock"})`; }
 
       if (shouldClose) {
         // Close EVERY leg of this trade together — never leave a partial spread open.
@@ -2293,10 +2393,46 @@ async function intradayCheck() {
     await sendLiveSnapshot(groups);
   }
 
+  const todayStr = new Date().toISOString().slice(0, 10);
   for (const stock of portfolioData) {
     if (!stock.price) continue;
-    const alerts = detectAlerts(stock);
-    const urgent = alerts.filter(a => ["STOP_LOSS","STOP_WARNING","BIG_MOVE","EARNINGS","TARGET_HIT"].includes(a.type));
+    const alerts  = detectAlerts(stock);
+    const urgent  = alerts.filter(a => ["STOP_LOSS","STOP_WARNING","BIG_MOVE","EARNINGS","TARGET_HIT"].includes(a.type));
+
+    // Track consecutive STOP_LOSS days for CSP eligibility.
+    // Only create state entry when first STOP_LOSS fires (sparse — don't
+    // pre-populate all 17 tickers with count=0 on every cycle).
+    // Decay: if no STOP_LOSS fires today, decrement count toward 0 —
+    // a stock that stabilises after 3 bad days should eventually re-qualify.
+    if (alerts.some(a => a.type === "TARGET_HIT")) {
+      if (state.downtrendCount[stock.ticker]?.count > 0) {
+        console.log(`  📈 ${stock.ticker} downtrend counter reset (TARGET_HIT after ${state.downtrendCount[stock.ticker].count} days)`);
+        delete state.downtrendCount[stock.ticker];
+      }
+    } else if (alerts.some(a => a.type === "STOP_LOSS")) {
+      if (!state.downtrendCount[stock.ticker]) {
+        state.downtrendCount[stock.ticker] = { count: 0, lastDate: null };
+      }
+      const dc = state.downtrendCount[stock.ticker];
+      if (dc.lastDate !== todayStr) {
+        dc.count++;
+        dc.lastDate = todayStr;
+        if (dc.count >= 3) {
+          console.log(`  ⚠ ${stock.ticker} downtrend: ${dc.count} consecutive STOP_LOSS days — CSP blocked`);
+        }
+      }
+    } else {
+      // No STOP_LOSS today — decay by 1 (once per day per ticker)
+      const dc = state.downtrendCount[stock.ticker];
+      if (dc && dc.count > 0 && dc.lastDate !== todayStr) {
+        dc.count = Math.max(0, dc.count - 1);
+        if (dc.count === 0) {
+          delete state.downtrendCount[stock.ticker];
+          console.log(`  📈 ${stock.ticker} downtrend counter decayed to 0 — CSP re-eligible`);
+        }
+      }
+    }
+
     if (!urgent.length) continue;
     const key = `${stock.ticker}_${urgent.map(a=>a.type).join("_")}_${new Date().getHours()}`;
     if (state.alertsSent.has(key)) continue;
@@ -2326,6 +2462,12 @@ async function closingSession() {
     return `${strategy}: ${ts.wins}W/${ts.losses}L (${winRate}%) | avg ${avgWin} / ${avgLoss}${exitBreakdown}`;
   }).join("\n") || "No closed trades yet";
 
+  // Show which tickers are currently downtrend-blocked for CSPs
+  const blockedTickers = Object.entries(state.downtrendCount)
+    .filter(([, dc]) => dc.count >= 3)
+    .map(([t, dc]) => `${t} (${dc.count}d)`)
+    .join(", ");
+
   await sendSMS(
 `🔔 CLOSING${modeFlag} ${new Date().toLocaleDateString()}
 
@@ -2340,7 +2482,7 @@ Capital deployed: $${state.totalDeployedToday}
 
 WIN RATES:
 ${statsLines}
-
+${blockedTickers ? `\n⚠️ CSP BLOCKED (downtrend): ${blockedTickers}` : ""}
 STOCKS:
 🟢 ${winners.slice(0,3).map(p=>`${p.ticker} +${(p.changePct||0).toFixed(1)}%`).join(", ")||"None"}
 🔴 ${losers.slice(0,3).map(p=>`${p.ticker} ${(p.changePct||0).toFixed(1)}%`).join(", ")||"None"}
@@ -2481,6 +2623,15 @@ async function sundaySummary() {
   state.weeklyHighs = {};
   console.log(`  🔄 Weekly highs reset (${prevHighCount} ticker(s) cleared — momentum filter will rebuild from today's prices)`);
 
+  // Reset downtrend counters weekly — a stock that was bearish last week
+  // should get a fresh look on Monday. Daily decay handles gradual recovery
+  // mid-week; the Sunday reset ensures clean slate week-over-week.
+  const prevDowntrends = Object.keys(state.downtrendCount).length;
+  if (prevDowntrends > 0) {
+    console.log(`  🔄 Downtrend counters reset (${prevDowntrends} ticker(s) had counts — all CSP-eligible on Monday)`);
+    state.downtrendCount = {};
+  }
+
   // Capture weekly P&L before resetting
   const closingWeeklyPnL = state.weeklyPnL;
   state.weeklyPnL = 0;
@@ -2546,19 +2697,6 @@ Not financial advice.`
 // ═══════════════════════════════════════════════════════════════
 
 const modeLabel = TRADIER.sandbox ? "SANDBOX" : "LIVE";
-
-// Validate critical env vars at startup
-const missingVars = [];
-if (!process.env.ANTHROPIC_API_KEY)    missingVars.push("ANTHROPIC_API_KEY");
-if (!process.env.PUSHOVER_USER_KEY)    missingVars.push("PUSHOVER_USER_KEY");
-if (!process.env.TRADIER_ACCESS_TOKEN) missingVars.push("TRADIER_ACCESS_TOKEN");
-if (missingVars.length > 0) {
-  console.error(`🚨 MISSING ENV VARS: ${missingVars.join(", ")}`);
-}
-const keyPreview = process.env.ANTHROPIC_API_KEY
-  ? `${process.env.ANTHROPIC_API_KEY.slice(0,12)}...${process.env.ANTHROPIC_API_KEY.slice(-4)}`
-  : "❌ NOT SET";
-console.log(`🔑 Anthropic key: ${keyPreview}`);
 
 console.log(`\n🚀 Options Trading Bot v2 (${modeLabel} MODE)`);
 console.log(`📋 Portfolio: ${PORTFOLIO.map(p=>p.ticker).join(", ")}`);

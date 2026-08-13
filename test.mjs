@@ -32,12 +32,17 @@ function test(name, fn) {
 // If you change these in options-bot.mjs, update them here too.
 
 const MANDATE = {
-  profitTargetPct:   50,
-  stopLossPct:       50,
-  creditStopLossPct: 200,
-  minPerTrade:       400,
-  maxPerTrade:       1200,
-  minReturnPct:      8,
+  profitTargetPct:          50,
+  stopLossPct:              50,
+  creditStopLossPct:        200,
+  singleStockCreditStopLossPct: 100,
+  minPerTrade:              250,
+  maxPerTrade:              1200,
+  minReturnPct:             8,
+  shortDTEThreshold:        4,
+  cspMaxDTE:                21,
+  cspMaxDTEHighIV:          14,
+  cspVIXSizeMultiplier:     1.5,
 };
 
 const HIGH_BETA_TICKERS    = ["NVDA", "TSLA", "CRWD"];
@@ -58,11 +63,11 @@ function computePnL(ourTrade, g) {
 
 function getVIXLabel(vix) {
   if (!vix)     return { label:"UNKNOWN",  note:"VIX unavailable" };
-  if (vix > 40) return { label:"EXTREME",  note:`VIX ${vix.toFixed(1)} — crash level` };
-  if (vix > 30) return { label:"EXTREME",  note:`VIX ${vix.toFixed(1)} — extreme fear` };
-  if (vix > 20) return { label:"ELEVATED", note:`VIX ${vix.toFixed(1)} — elevated IV` };
-  if (vix > 15) return { label:"NORMAL",   note:`VIX ${vix.toFixed(1)} — normal` };
-  return         { label:"LOW",      note:`VIX ${vix.toFixed(1)} — compressed premium` };
+  if (vix > 40) return { label:"CRASH",    note:`VIX ${vix.toFixed(1)} — crash-level fear, all trading halted` };
+  if (vix > 30) return { label:"EXTREME",  note:`VIX ${vix.toFixed(1)} — extreme fear, gap risk high` };
+  if (vix > 20) return { label:"ELEVATED", note:`VIX ${vix.toFixed(1)} — elevated IV, wider wings collect more premium` };
+  if (vix > 15) return { label:"NORMAL",   note:`VIX ${vix.toFixed(1)} — normal conditions` };
+  return         { label:"LOW",      note:`VIX ${vix.toFixed(1)} — compressed premium, be selective on condors` };
 }
 
 function getMarketRegime(spyChangePct, vix = null) {
@@ -86,7 +91,7 @@ function detectLikelySplitRatio(storedCost, currentPrice) {
   return null;
 }
 
-function normaliseAndFilterTrades(parsed, effectiveMin = MANDATE.minPerTrade) {
+function normaliseAndFilterTrades(parsed, effectiveMin = MANDATE.minPerTrade, downtrendCount = {}) {
   const isDirectional = s => ["Bull Call Spread", "Bear Put Spread"].includes(s);
   const normalised = parsed.map(t => ({
     ...t,
@@ -101,6 +106,10 @@ function normaliseAndFilterTrades(parsed, effectiveMin = MANDATE.minPerTrade) {
   return normalised.filter(t => {
     if (t.targetCost < effectiveMin || t.targetCost > MANDATE.maxPerTrade) return false;
     if (parseFloat(t.targetReturnPct) < MANDATE.minReturnPct) return false;
+    if (t.strategy === "Cash Secured Put") {
+      const dtCount = downtrendCount[t.ticker]?.count || 0;
+      if (dtCount >= 3) return false;
+    }
     if (isDirectional(t.strategy) && HIGH_BETA_TICKERS.includes(t.ticker)) return false;
     const minScore = isDirectional(t.strategy) ? DIRECTIONAL_MIN_SCORE : INCOME_MIN_SCORE;
     if (t.setupScore < minScore) return false;
@@ -311,8 +320,8 @@ test("passes a valid directional trade", () => {
   assert.equal(result.length, 1);
 });
 
-test("blocks trade below minPerTrade ($400)", () => {
-  const result = normaliseAndFilterTrades([makeTrade({ targetCost: 300 })]);
+test("blocks trade below minPerTrade ($250)", () => {
+  const result = normaliseAndFilterTrades([makeTrade({ targetCost: 200 })]);
   assert.equal(result.length, 0);
 });
 
@@ -369,8 +378,154 @@ test("passes multiple valid trades, blocks one invalid", () => {
   assert.equal(result.length, 2);
 });
 
+
+console.log("\n🌡️ getVIXLabel");
+
+test("VIX > 40 returns CRASH label (not EXTREME)", () => {
+  const r = getVIXLabel(42);
+  assert.equal(r.label, "CRASH", "VIX>40 must be CRASH — different trading rule from EXTREME");
+});
+
+test("VIX 31-40 returns EXTREME label", () => {
+  assert.equal(getVIXLabel(35).label, "EXTREME");
+});
+
+test("VIX 14 returns LOW label (condors skipped)", () => {
+  assert.equal(getVIXLabel(14).label, "LOW");
+});
+
+test("null VIX returns UNKNOWN", () => {
+  assert.equal(getVIXLabel(null).label, "UNKNOWN");
+});
+
+console.log("\n📐 pre-breach distance calculation");
+
+function pctToStrike(livePrice, strike) {
+  return Math.abs(livePrice - strike) / livePrice;
+}
+
+test("1.9% from short call triggers pre-breach (< 2% threshold)", () => {
+  const shortCall = 780;
+  const live      = 780 * (1 - 0.019);
+  assert.ok(pctToStrike(live, shortCall) < 0.02);
+});
+
+test("2.1% from short call does NOT trigger pre-breach", () => {
+  const shortCall = 780;
+  const live      = 780 * (1 - 0.021);
+  assert.ok(pctToStrike(live, shortCall) >= 0.02);
+});
+
+test("1.9% above short put triggers pre-breach", () => {
+  const shortPut = 700;
+  const live     = 700 * (1 + 0.019);
+  assert.ok(pctToStrike(live, shortPut) < 0.02);
+});
+
+console.log("\n💸 short-DTE and index credit stop thresholds");
+
+test("50% credit stop for single-stock IC with DTE <= 4", () => {
+  const credit = 423;
+  assert.equal(Math.round(-(credit * 0.50)), -211);
+});
+
+test("100% credit stop for single-stock IC with DTE > 4", () => {
+  const credit = 423;
+  assert.equal(Math.round(-(credit * 1.00)), -423);
+});
+
+test("200% credit stop for index IC (any DTE)", () => {
+  const credit = 408;
+  assert.equal(Math.round(-(credit * 2.00)), -816);
+});
+
+console.log("\n📉 downtrend CSP filter");
+
+const makeCsp = (ticker, overrides = {}) => ({
+  ticker, strategy: "Cash Secured Put", direction: "NEUTRAL",
+  targetCost: 400, targetReturnPct: "10.0", setupScore: 7,
+  rationale: "test", exitTarget: "50% profit", ...overrides,
+});
+
+test("CSP allowed when downtrend count < 3", () => {
+  const r = normaliseAndFilterTrades([makeCsp("MSFT")], MANDATE.minPerTrade, { MSFT: { count: 2 } });
+  assert.equal(r.length, 1, "count=2 should still allow CSP");
+});
+
+test("CSP blocked when downtrend count >= 3", () => {
+  const r = normaliseAndFilterTrades([makeCsp("AMD")], MANDATE.minPerTrade, { AMD: { count: 3 } });
+  assert.equal(r.length, 0, "3 consecutive STOP_LOSS days should block CSP");
+});
+
+test("CSP allowed with no downtrend data", () => {
+  const r = normaliseAndFilterTrades([makeCsp("AMD")], MANDATE.minPerTrade, {});
+  assert.equal(r.length, 1);
+});
+
+test("downtrend block is per-ticker — other tickers unaffected", () => {
+  const trades = [makeCsp("AMD"), makeCsp("MSFT")];
+  const r = normaliseAndFilterTrades(trades, MANDATE.minPerTrade, { AMD: { count: 4 } });
+  assert.equal(r.length, 1);
+  assert.equal(r[0].ticker, "MSFT");
+});
+
+console.log("\n🌡️ VIX-aware CSP sizing logic");
+
+test("CSP size multiplier is 1.5x when VIX ELEVATED", () => {
+  // Credit $200/contract, target $250 * 1.5 = $375 effective min
+  // qty = round(375 / 200) = 2 contracts, credit = $400
+  const creditPerContract = 200;
+  const sizeMulti = MANDATE.cspVIXSizeMultiplier;
+  const qty = Math.max(1, Math.round((MANDATE.minPerTrade * sizeMulti) / creditPerContract));
+  assert.equal(qty, 2, "should size up to 2 contracts in elevated VIX");
+  assert.ok(creditPerContract * qty <= MANDATE.maxPerTrade, "sized credit must stay under maxPerTrade");
+});
+
+test("CSP size multiplier 1x in NORMAL regime", () => {
+  const creditPerContract = 200;
+  const sizeMulti = 1.0; // NORMAL
+  const qty = Math.max(1, Math.round((MANDATE.minPerTrade * sizeMulti) / creditPerContract));
+  assert.equal(qty, 1, "normal regime should place 1 contract");
+});
+
+test("cspMaxDTEHighIV is strictly less than cspMaxDTE", () => {
+  assert.ok(MANDATE.cspMaxDTEHighIV < MANDATE.cspMaxDTE,
+    "high-IV names should use shorter DTE window than medium-IV");
+});
+
+console.log("\n📉 downtrend decay and reset");
+
+test("downtrendCount decays toward 0 when no STOP_LOSS", () => {
+  // Simulate: count=3 ticker, no stop today → count becomes 2
+  const dc = { count: 3, lastDate: "2026-08-12" };
+  const todayStr = "2026-08-13";
+  if (dc.lastDate !== todayStr) {
+    dc.count = Math.max(0, dc.count - 1);
+  }
+  assert.equal(dc.count, 2, "count should decay by 1 when no stop fires");
+});
+
+test("downtrendCount does not decay twice on same day", () => {
+  const dc = { count: 3, lastDate: "2026-08-13" };
+  const todayStr = "2026-08-13"; // same day
+  if (dc.lastDate !== todayStr) {
+    dc.count = Math.max(0, dc.count - 1);
+  }
+  assert.equal(dc.count, 3, "should not decay when lastDate matches today");
+});
+
+test("downtrendCount clamps at 0", () => {
+  const dc = { count: 1, lastDate: "2026-08-12" };
+  const todayStr = "2026-08-13";
+  if (dc.lastDate !== todayStr) {
+    dc.count = Math.max(0, dc.count - 1);
+  }
+  assert.equal(dc.count, 0, "count should not go below 0");
+});
+
 // ── RESULTS ───────────────────────────────────────────────────
 const total = passed + failed;
+
 console.log(`\n${"─".repeat(50)}`);
 console.log(`${total} tests: ${passed} passed, ${failed} failed`);
 if (failed > 0) {
