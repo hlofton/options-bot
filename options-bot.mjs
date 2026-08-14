@@ -101,6 +101,15 @@ const MANDATE = {
   minPerTradeLive:       600,  // Live trading minimum — $250 sandbox floor doesn't survive
                                 // commissions ($39+ on 60-leg SPY condor) and slippage in live.
                                 // $600 ensures meaningful profit after transaction costs.
+  dailyMaxLoss:         2000,  // Circuit breaker: halt ALL new trades when realized+unrealized
+                                // P&L hits -$2,000 in a single day. Resets each morning.
+                                // Separate from per-position stops — this is a portfolio-level
+                                // floor for days where multiple positions deteriorate together.
+  trailPctHighIV:         15,  // Trailing stop distance for high-IV names (NVDA, TSLA, COIN…).
+                                // 15% gives enough room for normal daily swings on names that
+                                // routinely move 3-5% intraday without being structural breaks.
+  trailPctMediumIV:       10,  // Trailing stop distance for medium-IV names (AAPL, MSFT, LLY…).
+                                // 10% is appropriate — these names rarely move >2% on a normal day.
 };
 
 // ── INDEX TICKERS — treated differently for IC strategy ──────
@@ -119,10 +128,11 @@ const TRADIER = {
   accountId: process.env.TRADIER_ACCOUNT_ID,
 };
 
-// ── PORTFOLIO — Last reviewed Aug 2026 ────────────────────────
-// 17 high-IV, liquid options stocks. All meet: daily volume >10K,
-// ATM spread <$0.15, weekly expiries available, market cap >$200B
-// Earnings dates updated Aug 2026 to Q3/Q4 2026 estimates.
+// ── PORTFOLIO — Last reviewed Aug 14 2026 ─────────────────────
+// 22 high-IV, liquid options stocks. All meet: daily volume >10K,
+// ATM spread <$0.15, weekly expiries available.
+// Added Aug 14 2026: COIN, HOOD, ARM, MRVL, VST.
+// Earnings dates confirmed or estimated to Q3/Q4 2026.
 const PORTFOLIO = [
   // ── AI / SEMICONDUCTORS — highest IV, most profitable ─────
   { ticker:"NVDA", name:"Nvidia",                 shares:0,    avgCost:198.00, stopLoss:175.00, target:236.00,  sector:"AI/Semis",  ivProfile:"high",   optionable:true,  earningsDate:"2026-11-19" }, // Q3 FY2027 est.
@@ -142,6 +152,42 @@ const PORTFOLIO = [
   // ── CYBERSECURITY ─────────────────────────────────────────
   { ticker:"PANW", name:"Palo Alto Networks",     shares:0,    avgCost:325.91, stopLoss:286.00, target:370.00,  sector:"Cyber",     ivProfile:"high",   optionable:true,  earningsDate:"2026-09-10" }, // FQ4 2026 est.
   { ticker:"CRWD", name:"CrowdStrike",            shares:0,    avgCost:187.23, stopLoss:165.00, target:235.00,  sector:"Cyber",     ivProfile:"high",   optionable:true,  earningsDate:"2026-11-25" },  // Q2 FY2027 est. 4-for-1 split completed Jul 2026
+
+  // ── CRYPTO ADJACENT / HIGH-IV FINTECH ────────────────────
+  // COIN: $148 Aug 14 2026. 52-wk $139–$402. Near the low — premium
+  //   is elevated precisely because of that range. Q2 missed badly
+  //   (EPS -$1.36 vs -$0.01 est); Q3 earnings Oct 29 2026 (confirmed).
+  //   Treat as income-only: IV too extreme for directional spread.
+  { ticker:"COIN", name:"Coinbase Global",        shares:0, avgCost:148.00, stopLoss:118.00, target:220.00,  sector:"Crypto/Fintech", ivProfile:"high",   optionable:true, earningsDate:"2026-10-29" }, // Q3 2026 confirmed
+  // HOOD: $95.75 Aug 14 2026. 52-wk $63–$153. Post-Q2 selloff (reported
+  //   Jul 29). Crypto/retail correlated — moves with COIN. Record Q2
+  //   revenue but stock repriced lower. High IV, very active options flow.
+  //   Analyst targets $115–$170; BofA raised to $140 post-Q2.
+  //   Q3 earnings est Oct 28 2026 (based on historical cadence).
+  { ticker:"HOOD", name:"Robinhood Markets",      shares:0, avgCost:95.75,  stopLoss:72.00,  target:135.00,  sector:"Crypto/Fintech", ivProfile:"high",   optionable:true, earningsDate:"2026-10-28" }, // Q3 2026 est.
+
+  // ── SEMICONDUCTOR IP / AI NETWORKING ─────────────────────
+  // ARM: ~$340 Aug 14 2026 (range $325–$358 per Coinbase data). Fell 34%
+  //   in July AI selloff, now recovering above $280. AGI CPU order book
+  //   >$2B; data-center royalties doubled Q1 FY2027 (ended Jun 2026).
+  //   P/E 178x — priced for AI dominance. Q2 FY2027 est Nov 5 2026
+  //   (ARM fiscal year ends March; Q2 FY2027 = Jul–Sep 2026).
+  //   High IV post-selloff bounce; income-only given beta and valuation.
+  { ticker:"ARM",  name:"Arm Holdings",           shares:0, avgCost:340.00, stopLoss:268.00, target:430.00,  sector:"AI/Semis",  ivProfile:"high",   optionable:true, earningsDate:"2026-11-05" }, // Q2 FY2027 est.
+  // MRVL: ~$187 Aug 14 2026 (bounced from $163 July low; spiked to $220s
+  //   on new AI memory platform). EARNINGS AUG 27 2026 (CONFIRMED) — that
+  //   is 13 days away. Earnings block will fire in 7 days for income trades.
+  //   Do not open new CSPs within 7 days of Aug 27. AI networking / custom
+  //   ASIC for hyperscalers. Goldman raising targets; strong AI narrative.
+  //   Beta 1.53; Q3 FY2027 est Dec 3 2026 after Aug 27 Q2 report.
+  { ticker:"MRVL", name:"Marvell Technology",     shares:0, avgCost:187.00, stopLoss:155.00, target:270.00,  sector:"AI/Semis",  ivProfile:"high",   optionable:true, earningsDate:"2026-08-27" }, // Q2 FY2027 CONFIRMED — 13 days out
+  // VST: $146 Aug 14 2026. 52-wk $132–$219. Q2 adj EBITDA +30% YoY to
+  //   $1.77B; data center power deals driving narrative. Analyst consensus
+  //   target ~$221 (20 analysts, Strong Buy). Wells Fargo $212, BofA $196,
+  //   MS $212. Lower IV than pure tech but elevated for a utility — same
+  //   AI-power thesis as OKLO but far more liquid and dividend-paying.
+  //   Medium IV; CSPs on pullbacks near support $132. Q3 est Nov 6 2026.
+  { ticker:"VST",  name:"Vistra Corp",            shares:0, avgCost:146.00, stopLoss:122.00, target:215.00,  sector:"Energy/AI", ivProfile:"medium", optionable:true, earningsDate:"2026-11-06" }, // Q3 2026 est.
 
   // ── INDEX ETFs — 0DTE capable, deepest liquidity ─────────
   { ticker:"SPY",  name:"S&P 500 ETF",            shares:0,    avgCost:754.95, stopLoss:680.00, target:820.00,  sector:"Index",     ivProfile:"medium", optionable:true,  earningsDate:null },
@@ -180,8 +226,18 @@ const state = {
                             // Tickers with count >= 3 are blocked as CSP candidates —
                             // confirmed Aug 2026: AMD and AAPL hitting stop repeatedly
                             // while in sustained downtrends, not appropriate for put selling.
-  _lastResetMonth:    null,
-  jobRunning:         null,
+  _lastResetMonth:      null,
+  jobRunning:           null,
+  totalCollateralToday: 0,  // Buying power COMMITTED today — collateral for CSPs
+                            // (strike × 100 × qty), credit for condors, debit for spreads.
+                            // Separate from totalDeployedToday (premium only) so the buying
+                            // power gate and AI prompt reflect real capital committed, not
+                            // just the small premium received. A 10-contract NVDA CSP at $180
+                            // commits $18,000 of buying power while adding only ~$300 premium.
+  dailyCircuitBreakerTripped: false, // Set true when realized+unrealized P&L hits -dailyMaxLoss.
+                            // Halts all new trades for the rest of the day. Resets each morning.
+  _saveStateAlertSent:  false, // One-time flag — prevent spamming Pushover on every saveState
+                            // call if the Volume is unmounted. Resets on successful write.
 };
 
 // ═══════════════════════════════════════════════════════════════
@@ -197,32 +253,68 @@ const state = {
 // every redeploy exactly like memory was.
 // ═══════════════════════════════════════════════════════════════
 
-const STATE_FILE = process.env.STATE_FILE_PATH || "/data/bot-state.json";
+const STATE_FILE    = process.env.STATE_FILE_PATH    || "/data/bot-state.json";
+
+// ── PERSISTENT TRADE HISTORY ──────────────────────────────────
+// Newline-delimited JSON (NDJSON) — each closed trade appended as one
+// JSON line. Survives restarts indefinitely. Enables analysis queries
+// like "win rate by ticker" or "avg hold time by strategy" that
+// state.tradeStats counters alone can't answer (they reset mid-session).
+// Requires the same Railway Volume mount as STATE_FILE.
+const TRADE_LOG_FILE = process.env.TRADE_LOG_FILE_PATH || "/data/trade-log.ndjson";
+
+function appendTradeLog(entry) {
+  try {
+    fs.appendFileSync(
+      TRADE_LOG_FILE,
+      JSON.stringify({ ...entry, loggedAt: new Date().toISOString() }) + "\n"
+    );
+  } catch(e) {
+    // Non-fatal — state.tradeStats still captures aggregates.
+    // Don't alert: the Volume failure alert in saveState covers this.
+    console.error(`  ✗ Trade log write failed: ${e.message}`);
+  }
+}
 
 function saveState() {
   try {
     const persistable = {
-      openPositions:      state.openPositions,
-      dailyTrades:        state.dailyTrades,
-      totalDeployedToday: state.totalDeployedToday,
-      dailyPnL:           state.dailyPnL,
-      weeklyPnL:          state.weeklyPnL,
-      monthlyPnL:         state.monthlyPnL,
-      tradeStats:         state.tradeStats,
-      downtrendCount:     state.downtrendCount,
-      _lastResetMonth:    state._lastResetMonth,
-      dynamicLevels:      state.dynamicLevels,
-      weeklyHighs:        state.weeklyHighs,
-      alertsSent:         [...state.alertsSent],
-      savedAt:            new Date().toISOString(),
+      openPositions:              state.openPositions,
+      dailyTrades:                state.dailyTrades,
+      totalDeployedToday:         state.totalDeployedToday,
+      totalCollateralToday:       state.totalCollateralToday,
+      dailyCircuitBreakerTripped: state.dailyCircuitBreakerTripped,
+      dailyPnL:                   state.dailyPnL,
+      weeklyPnL:                  state.weeklyPnL,
+      monthlyPnL:                 state.monthlyPnL,
+      tradeStats:                 state.tradeStats,
+      downtrendCount:             state.downtrendCount,
+      _lastResetMonth:            state._lastResetMonth,
+      dynamicLevels:              state.dynamicLevels,
+      weeklyHighs:                state.weeklyHighs,
+      alertsSent:                 [...state.alertsSent],
+      savedAt:                    new Date().toISOString(),
     };
     // Write to temp file then atomically rename — prevents a partial
     // write (crash mid-write, disk full) from corrupting the live state.
     const tmp = STATE_FILE + ".tmp";
     fs.writeFileSync(tmp, JSON.stringify(persistable, null, 2));
     fs.renameSync(tmp, STATE_FILE);
+    // Successful write — clear the alert flag so a subsequent failure still fires.
+    state._saveStateAlertSent = false;
   } catch(e) {
     console.error(`  ✗ Failed to save state to ${STATE_FILE}: ${e.message}`);
+    // Alert once per outage — avoids spamming Pushover on every 20-min cycle.
+    // The flag is only reset when a write succeeds (above), so repeated failures
+    // stay silent after the first alert until the Volume comes back.
+    if (!state._saveStateAlertSent) {
+      state._saveStateAlertSent = true;
+      sendSMS(
+        `🚨 STATE PERSISTENCE FAILURE\n${e.message}\n\n` +
+        `All open position tracking will be LOST on next restart.\n` +
+        `Check Railway Volume mount immediately — the bot is running without persistence.`
+      ).catch(() => {});
+    }
   }
 }
 
@@ -255,9 +347,11 @@ function loadState() {
     const savedDate = persisted.savedAt ? new Date(persisted.savedAt).toDateString() : null;
     const today      = new Date().toDateString();
     if (savedDate === today) {
-      state.dailyTrades        = persisted.dailyTrades || [];
-      state.totalDeployedToday = persisted.totalDeployedToday || 0;
-      state.dailyPnL           = persisted.dailyPnL || 0;
+      state.dailyTrades                = persisted.dailyTrades || [];
+      state.totalDeployedToday         = persisted.totalDeployedToday || 0;
+      state.totalCollateralToday       = persisted.totalCollateralToday || 0;
+      state.dailyPnL                   = persisted.dailyPnL || 0;
+      state.dailyCircuitBreakerTripped = persisted.dailyCircuitBreakerTripped || false;
     }
 
     console.log(`  ✓ Restored state from disk: ${state.openPositions.length} open position(s) — saved ${persisted.savedAt}`);
@@ -330,11 +424,17 @@ function getTarget(ticker, staticTarget) {
   return state.dynamicLevels[ticker]?.target ?? staticTarget;
 }
 
-function updateTrailingStop(ticker, currentPrice, staticStop, trailPct = 12) {
+function updateTrailingStop(ticker, currentPrice, staticStop) {
   if (!currentPrice) return { updated: false };
   const weekHigh = state.weeklyHighs[ticker] || currentPrice;
   if (currentPrice > weekHigh) state.weeklyHighs[ticker] = currentPrice;
 
+  // Trail distance is IV-profile-aware: high-IV names (NVDA, TSLA, COIN…)
+  // need a wider trail because their normal daily range is 3-5%. A 10% trail
+  // would stop them out on routine volatility. Medium-IV names (AAPL, MSFT,
+  // VST…) rarely move >2% per day, so 10% gives clean signal without noise.
+  const ivProfile      = PORTFOLIO.find(p => p.ticker === ticker)?.ivProfile || "high";
+  const trailPct       = ivProfile === "high" ? MANDATE.trailPctHighIV : MANDATE.trailPctMediumIV;
   const currentStop    = getStopLoss(ticker, staticStop);
   const newTrailingStop = parseFloat((currentPrice * (1 - trailPct / 100)).toFixed(2));
 
@@ -345,7 +445,7 @@ function updateTrailingStop(ticker, currentPrice, staticStop, trailPct = 12) {
       stopLoss:    newTrailingStop,
       lastUpdated: new Date().toISOString(),
     };
-    console.log(`  📈 ${ticker} trailing stop: $${oldStop} → $${newTrailingStop} (price $${currentPrice})`);
+    console.log(`  📈 ${ticker} trailing stop: $${oldStop} → $${newTrailingStop} (${trailPct}% trail, ${ivProfile}-IV, price $${currentPrice})`);
     return { updated: true, oldStop, newStop: newTrailingStop };
   }
   return { updated: false };
@@ -558,7 +658,34 @@ async function closeOptionsPosition(position) {
   // each rejected 3-4 times before eventually filling. Without retries the bot
   // was removing positions from tracking after the first rejection and then
   // inline-restoring them every 20-min cycle indefinitely.
+  //
+  // CRITICAL (Aug 14 2026): before each retry, check whether the previous order
+  // is still open/pending. If it is, do NOT submit a duplicate. AMZN IC generated
+  // 5 duplicate close orders because all retries submitted unconditionally —
+  // a pending order is not a rejection; duplicates all eventually fill.
+  let lastOrderId = null;
+
   for (let attempt = 1; attempt <= 3; attempt++) {
+    if (attempt > 1 && lastOrderId && !TRADIER.sandbox) {
+      try {
+        const statusData  = await tradierRequest("GET", `/accounts/${TRADIER.accountId}/orders/${lastOrderId}`);
+        const orderStatus = statusData?.order?.status;
+        console.log(`  🔍 Close order ${lastOrderId} status: ${orderStatus}`);
+        if (orderStatus === "filled") {
+          console.log(`  ✅ Close order ${lastOrderId} already filled — no retry needed`);
+          return { success:true, orderId:lastOrderId };
+        }
+        if (["open","partially_filled","pending"].includes(orderStatus)) {
+          console.log(`  ⏳ Close order ${lastOrderId} still ${orderStatus} — waiting, not submitting duplicate`);
+          await new Promise(r => setTimeout(r, attempt * 5000));
+          continue;
+        }
+        console.log(`  ↩ Close order ${lastOrderId} is ${orderStatus} — submitting new close order`);
+      } catch(statusErr) {
+        console.log(`  ⚠ Could not check status of order ${lastOrderId}: ${statusErr.message} — proceeding with retry`);
+      }
+    }
+
     try {
       const data    = await tradierRequest("POST", `/accounts/${TRADIER.accountId}/orders`, orderParams);
       const orderId = data?.order?.id;
@@ -568,8 +695,10 @@ async function closeOptionsPosition(position) {
         console.error(`  ✗ Close attempt ${attempt}: no order ID returned`);
       } else if (status && status !== "ok") {
         console.error(`  ✗ Close attempt ${attempt}: order ${orderId} rejected (status: ${status})`);
+        lastOrderId = orderId;
       } else {
-        // Success
+        lastOrderId = orderId;
+        console.log(`  ✅ Close order accepted: ${orderId}`);
         return { success:true, orderId };
       }
     } catch(e) {
@@ -840,13 +969,24 @@ async function fetchAllPrices() {
 
 async function sendSMS(body) {
   try {
+    // Pushover hard-caps messages at 1024 characters. Long messages (Sunday
+    // summary with 22 portfolio lines, morning session with 6+ trades) overflow
+    // silently. Append a visible marker so the reader knows data was cut.
+    const LIMIT    = 1024;
+    const ELLIPSIS = "\n…[truncated]";
+    const message  = body.length > LIMIT
+      ? body.slice(0, LIMIT - ELLIPSIS.length) + ELLIPSIS
+      : body;
+    if (body.length > LIMIT) {
+      console.warn(`  ⚠ Push notification truncated: ${body.length} → ${LIMIT} chars`);
+    }
     const res = await fetch("https://api.pushover.net/1/messages.json", {
       method:  "POST",
       headers: { "Content-Type":"application/x-www-form-urlencoded" },
       body:    new URLSearchParams({
         token:   PUSHOVER.token,
         user:    PUSHOVER.user,
-        message: body.slice(0, 1024),
+        message,
         title:   "Options Bot",
         sound:   "cashregister",
       }).toString(),
@@ -1076,13 +1216,20 @@ function getMarketRegime(spyChangePct, vix = null) {
 // ═══════════════════════════════════════════════════════════════
 
 const SECTOR_GROUPS = {
-  semis:   ["NVDA", "AMD", "AVGO"],          // Pure semiconductors only
-  cyber:   ["CRWD", "PANW"],                  // Cybersecurity — separate from semis
+  // ARM and MRVL are IP/networking semis — correlated with NVDA/AMD/AVGO
+  // on AI spend headlines even though their business models differ.
+  semis:   ["NVDA", "AMD", "AVGO", "ARM", "MRVL"],
+  cyber:   ["CRWD", "PANW"],
   megacap: ["MSFT", "AAPL", "AMZN", "GOOGL", "META"],
   ev:      ["TSLA"],
   pharma:  ["LLY"],
   ai:      ["PLTR", "NOW"],
-  nuclear: ["OKLO"],
+  // COIN and HOOD move together on crypto sentiment + retail trading volume.
+  // One weak peer is enough to block the other (2-member group, weakThreshold=1).
+  fintech: ["COIN", "HOOD"],
+  // VST and OKLO share the AI-datacenter-power narrative — correlated on
+  // grid capacity headlines even though OKLO is nuclear and VST is thermal.
+  energy:  ["OKLO", "VST"],
   index:   ["SPY", "QQQ"],
 };
 
@@ -1173,7 +1320,11 @@ async function retryAI(fn, maxAttempts = 3, delayMs = 2000) {
 // medium-IV, lower-beta names only.
 // ═══════════════════════════════════════════════════════════════
 
-const HIGH_BETA_TICKERS = ["NVDA", "TSLA", "CRWD"]; // 2-day loss data on NVDA directionals
+const HIGH_BETA_TICKERS = ["NVDA", "TSLA", "CRWD", "COIN", "HOOD", "ARM"];
+// COIN/HOOD: crypto-correlated, extreme IV — directional spreads have
+//   unfavourable skew when a single BTC headline moves 10%+ overnight.
+// ARM: P/E 178x, fell 34% in one month then snapped back — exactly the
+//   profile that makes directional spreads lose money. Income only.
 
 // Minimum setupScore required for directional trades (Bull/Bear spreads)
 // Raised from 6 to 8 — require higher conviction for directional risk
@@ -1225,7 +1376,8 @@ Minimum setupScore for income strategies (CSP, Iron Condor): ${INCOME_MIN_SCORE}
 
 ${earningsWarnings.length ? `⚠️ EARNINGS PROXIMITY (avoid directional trades within 14 days, income trades within 7 days):\n${earningsWarnings.join(", ")}` : "No earnings this week"}
 
-CAPITAL REMAINING TODAY: $${MANDATE.dailyCapMax - state.totalDeployedToday}
+PREMIUM BUDGET REMAINING: $${MANDATE.dailyCapMax - state.totalDeployedToday} of $${MANDATE.dailyCapMax} daily cap
+BUYING POWER COMMITTED TODAY: $${state.totalCollateralToday} (collateral for CSPs + credit/debit for other strategies)
 
 Strategy guide (only use ALLOWED STRATEGIES listed above):
 🚫 RETIRED STRATEGIES (do NOT suggest):
@@ -1780,7 +1932,8 @@ async function monitorOpenPositions(groups, priceMap = {}) {
       const todayUTC = new Date(todayStr + "T00:00:00Z");
       const dte      = Math.ceil((expDate - todayUTC) / (1000*60*60*24));
 
-      console.log(`  ${ourTrade.ticker} ${ourTrade.strategy} (${g.positions.length} legs): net value $${g.currentValue.toFixed(2)}/sh | P&L: ${currentPnL>=0?"+":""}$${currentPnL.toFixed(0)} (${currentPct.toFixed(1)}%) | DTE:${dte}`);
+      const basisNote = ourTrade.reconstructed ? " (basis: reconstructed — % approx)" : "";
+      console.log(`  ${ourTrade.ticker} ${ourTrade.strategy} (${g.positions.length} legs): net value $${g.currentValue.toFixed(2)}/sh | P&L: ${currentPnL>=0?"+":""}$${currentPnL.toFixed(0)} (${currentPct.toFixed(1)}%)${basisNote} | DTE:${dte}`);
 
       const debitStopLossPnL  = -(ourTrade.executedCost * (MANDATE.stopLossPct / 100));
       // Index ICs (SPY/QQQ): 200% stop — wider buffer, indexes are range-bound.
@@ -1840,24 +1993,94 @@ async function monitorOpenPositions(groups, priceMap = {}) {
       else if (ourTrade.isCredit  && currentPnL <= creditStopLossPnL) { shouldClose=true; closeReason=`🛑 CREDIT STOP LOSS — down ${creditStopPct}% of credit = -$${Math.abs(currentPnL).toFixed(0)} (${isIndexTrade?"index":isShortDTE?"single≤4DTE":"single-stock"})`; }
 
       if (shouldClose) {
-        // Close EVERY leg of this trade together — never leave a partial spread open.
-        // 500ms between legs (was 300ms) + logging the ACTUAL error text per leg —
-        // previously only a count of failures was logged, making a real diagnosis
-        // impossible. Root cause suspected but NOT yet confirmed: the close orders
-        // hit /accounts/{id}/orders (a trading endpoint), whose rate limit was never
-        // separately verified from the /markets data endpoint's documented 60/min —
-        // 4 positions all exiting in the same cycle could burst 14+ close orders in
-        // a few seconds. This logging will confirm or rule that out next occurrence.
-        const closeResults = [];
-        for (const pos of g.positions) {
-          const result = await closeOptionsPosition({ symbol:pos.symbol, underlyingSymbol:ourTrade.ticker, quantity:Math.abs(pos.quantity), side:pos.quantity>0?"buy_to_open":"sell_to_open" });
-          if (!result.success) {
-            console.error(`  ✗ Close failed for ${pos.symbol}: ${result.error}`);
+        // ── ATOMIC MULTILEG CLOSE ───────────────────────────────────
+        // Previously closed each leg as an individual single-leg order
+        // 500ms apart. Risk: leg 1-2 accept, leg 3-4 reject → naked short
+        // left open (the exact scenario PARTIAL CLOSE ALERT was designed to
+        // catch after the fact). Tradier supports multileg close orders with
+        // class:"multileg" and side[i]: "buy_to_close"/"sell_to_close".
+        // A single multileg order is atomic: either all legs fill or none do.
+        // Single-leg positions (CSPs) still use closeOptionsPosition (single).
+        let closeResult;
+        if (g.positions.length === 1) {
+          const pos = g.positions[0];
+          closeResult = await closeOptionsPosition({ symbol:pos.symbol, underlyingSymbol:ourTrade.ticker, quantity:Math.abs(pos.quantity), side:pos.quantity>0?"buy_to_open":"sell_to_open" });
+        } else {
+          // Multileg: build a single close order for all legs atomically.
+          // Fetch midpoint quote for limit price in live mode.
+          let orderType = "market";
+          let limitPrice;
+          if (!TRADIER.sandbox) {
+            try {
+              const allSymbols = g.positions.map(p => p.symbol);
+              const quotes = await getOptionQuote(allSymbols);
+              const quoteMap = Object.fromEntries(quotes.map(q => [q.symbol, q]));
+              // Net midpoint across all legs (same sign convention as the open)
+              let netMid = 0;
+              for (const pos of g.positions) {
+                const q = quoteMap[pos.symbol];
+                if (!q || q.bid == null || q.ask == null || q.bid <= 0) { netMid = null; break; }
+                const legSign = pos.quantity > 0 ? 1 : -1; // long leg adds cost, short leg adds credit
+                netMid += legSign * (q.bid + q.ask) / 2;
+              }
+              if (netMid != null) {
+                limitPrice = Math.abs(netMid).toFixed(2);
+                orderType  = "limit";
+              }
+            } catch(e) {
+              console.log(`  ⚠ Midpoint fetch failed for multileg close — using market order`);
+            }
           }
-          closeResults.push(result);
-          await new Promise(r => setTimeout(r, 500));
+          const params = {
+            class:    "multileg",
+            symbol:   ourTrade.ticker,
+            type:     orderType,
+            duration: "day",
+            ...(limitPrice ? { price: limitPrice } : {}),
+          };
+          g.positions.forEach((pos, i) => {
+            params[`option_symbol[${i}]`] = pos.symbol;
+            params[`side[${i}]`]          = pos.quantity > 0 ? "sell_to_close" : "buy_to_close";
+            params[`quantity[${i}]`]       = Math.abs(pos.quantity);
+          });
+
+          let lastOrderId = null;
+          let success     = false;
+          for (let attempt = 1; attempt <= 3; attempt++) {
+            if (attempt > 1 && lastOrderId && !TRADIER.sandbox) {
+              try {
+                const statusData  = await tradierRequest("GET", `/accounts/${TRADIER.accountId}/orders/${lastOrderId}`);
+                const orderStatus = statusData?.order?.status;
+                console.log(`  🔍 Multileg close ${lastOrderId} status: ${orderStatus}`);
+                if (orderStatus === "filled")   { success = true; break; }
+                if (["open","partially_filled","pending"].includes(orderStatus)) {
+                  await new Promise(r => setTimeout(r, attempt * 5000));
+                  continue;
+                }
+              } catch(se) {
+                console.log(`  ⚠ Status check failed for ${lastOrderId}: ${se.message}`);
+              }
+            }
+            try {
+              const data    = await tradierRequest("POST", `/accounts/${TRADIER.accountId}/orders`, params);
+              const orderId = data?.order?.id;
+              const status  = data?.order?.status;
+              if (orderId && (!status || status === "ok")) {
+                lastOrderId = orderId;
+                success     = true;
+                console.log(`  ✅ Multileg close accepted: ${orderId} (${g.positions.length} legs)`);
+                break;
+              }
+              if (orderId) lastOrderId = orderId;
+              console.error(`  ✗ Multileg close attempt ${attempt}: ${status || "no order ID"}`);
+            } catch(e) {
+              console.error(`  ✗ Multileg close attempt ${attempt}: ${e.message}`);
+            }
+            if (attempt < 3) await new Promise(r => setTimeout(r, attempt * 5000));
+          }
+          closeResult = { success };
         }
-        const allClosed = closeResults.every(r => r.success);
+        const allClosed = closeResult.success;
         if (allClosed) {
           state.dailyPnL   += currentPnL;
           state.weeklyPnL  += currentPnL;
@@ -1879,6 +2102,26 @@ async function monitorOpenPositions(groups, priceMap = {}) {
           } else {
             ts.earlyExits = (ts.earlyExits || 0) + 1;
           }
+          // Append to persistent trade log — survives restarts, enables
+          // per-ticker and per-strategy analysis that tradeStats counters alone
+          // can't provide (e.g. "win rate on MRVL CSPs", "avg hold time by DTE").
+          appendTradeLog({
+            type:         "close",
+            ticker:       ourTrade.ticker,
+            strategy:     ourTrade.strategy,
+            expiration:   ourTrade.expiration,
+            executedCost: ourTrade.executedCost,
+            collateral:   ourTrade.collateral ?? null,
+            pnl:          Math.round(currentPnL),
+            pnlPct:       parseFloat(currentPct.toFixed(1)),
+            closeReason:  closeReason.replace(/[^\w\s%$:—.+\-]/g, "").slice(0, 80),
+            dte:          dte,
+            reconstructed: ourTrade.reconstructed ?? false,
+            isCredit:     ourTrade.isCredit,
+            legs:         g.positions.length,
+            source:       ourTrade.source ?? "morning",
+          });
+
           const winRate  = ts.wins + ts.losses > 0 ? ((ts.wins / (ts.wins + ts.losses)) * 100).toFixed(0) : "N/A";
           const avgWin   = ts.wins   > 0 ? (ts.totalWinPnL  / ts.wins).toFixed(0)   : "N/A";
           const avgLoss  = ts.losses > 0 ? (ts.totalLossPnL / ts.losses).toFixed(0) : "N/A";
@@ -1903,12 +2146,11 @@ ${exitNote}
 Not financial advice.`
           );
         } else {
-          // CRITICAL: some legs failed to close — do NOT remove from tracking.
-          // Keep monitoring so we retry closing the remaining legs next cycle.
-          const failedCount   = closeResults.filter(r => !r.success).length;
-          const failureReasons = closeResults.filter(r => !r.success).map(r => r.error).join(" | ");
-          console.error(`  🚨 PARTIAL CLOSE FAILURE: ${failedCount}/${g.positions.length} legs failed to close on ${ourTrade.ticker}. Reasons: ${failureReasons}. Trade remains tracked for retry.`);
-          await sendSMS(`🚨 PARTIAL CLOSE ALERT\n${ourTrade.ticker} ${ourTrade.strategy}\n${failedCount} of ${g.positions.length} legs failed to close.\nReason: ${failureReasons.slice(0,200)}\nBot will retry next cycle.`);
+          // Close order rejected after retries — do NOT remove from tracking.
+          // The position remains monitored and the close will be retried next cycle.
+          const failureReason = closeResult.error || "close order rejected after retries";
+          console.error(`  🚨 CLOSE FAILURE: ${ourTrade.ticker} ${ourTrade.strategy} (${g.positions.length} legs) failed to close. Reason: ${failureReason}. Remaining tracked for retry.`);
+          await sendSMS(`🚨 CLOSE FAILURE\n${ourTrade.ticker} ${ourTrade.strategy} (${g.positions.length} legs)\nReason: ${failureReason.slice(0, 200)}\nBot will retry next cycle.`);
         }
         // Small pause between DIFFERENT positions closing in the same monitoring
         // cycle — same burst-risk precaution, applied at the position level too.
@@ -2023,7 +2265,17 @@ Include every ticker. Use null for analystTarget if no data found.`;
       const currentPrice = liveData?.price || r.currentPrice || stock.avgCost;
       const oldTarget    = getTarget(r.ticker, stock.target);
       const oldStop      = getStopLoss(r.ticker, stock.stopLoss);
-      const targetChanged = Math.abs(r.analystTarget - oldTarget) / oldTarget > 0.03;
+
+      // SANITY CHECK: reject analyst targets that swung >50% from the previous
+      // value in a single update. Confirmed: CRWD oscillated $193→$701→$195 —
+      // clearly bad API data. Skip this cycle; if the API returns the same
+      // value again next session it will pass (oldTarget updates to the new value).
+      if (oldTarget && Math.abs(r.analystTarget - oldTarget) / oldTarget > 0.50) {
+        console.warn(`  ⚠ ${r.ticker}: analyst target $${r.analystTarget} changed ${(((r.analystTarget - oldTarget) / oldTarget) * 100).toFixed(0)}% from $${oldTarget} — exceeds 50% sanity threshold, skipping (source: ${r.source || "unknown"})`);
+        continue;
+      }
+
+      const targetChanged  = Math.abs(r.analystTarget - oldTarget) / oldTarget > 0.03;
       const priceBasedStop = parseFloat((currentPrice * 0.85).toFixed(2));
       const newStop        = Math.max(priceBasedStop, oldStop || 0);
       const stopChanged    = newStop > oldStop;
@@ -2059,7 +2311,11 @@ async function updateAnalystTargets() {
 
 async function morningSession() {
   console.log(`\n[${new Date().toLocaleTimeString()}] 🌅 Morning session...`);
-  state.dailyTrades = []; state.totalDeployedToday = 0; state.dailyPnL = 0;
+  state.dailyTrades               = [];
+  state.totalDeployedToday        = 0;
+  state.totalCollateralToday      = 0;
+  state.dailyPnL                  = 0;
+  state.dailyCircuitBreakerTripped = false; // fresh start each day
 
   // Reset monthly P&L on the first trading day of each month
   const today      = new Date();
@@ -2088,6 +2344,13 @@ async function morningSession() {
     const msg = "⚠️ MORNING SESSION ABORTED\nCould not verify account balance — refusing to place trades blind in live mode.\nCheck Tradier API connectivity and redeploy if needed.";
     console.error(`  🛑 ${msg}`);
     await sendSMS(msg);
+    return;
+  }
+
+  // Circuit breaker is reset at the top of this function each morning,
+  // so this guard only fires on same-day restarts after the breaker tripped.
+  if (state.dailyCircuitBreakerTripped) {
+    console.log("  ⏭ Daily circuit breaker tripped — no new trades this morning.");
     return;
   }
 
@@ -2221,9 +2484,13 @@ async function morningSession() {
     // that legs.collateral is available — previously it ran before, which made
     // legs undefined and threw a ReferenceError on every live morning session.
     if (!TRADIER.sandbox && buyingPower > 0) {
-      const capitalRequired = legs.collateral ?? legs.cost;
-      if (capitalRequired > buyingPower - state.totalDeployedToday) {
-        console.log(`  ⏭  ${trade.ticker} ${trade.strategy} — insufficient buying power ($${(buyingPower - state.totalDeployedToday).toFixed(0)} remaining, need $${capitalRequired}${legs.collateral ? " collateral" : ""})`);
+      const capitalRequired   = legs.collateral ?? legs.cost;
+      // Subtract collateral already committed today (not premium) so the check
+      // reflects true buying power availability. Previously subtracted
+      // totalDeployedToday (premium only) — grossly understated commitment for CSPs.
+      const bpRemaining = buyingPower - state.totalCollateralToday;
+      if (capitalRequired > bpRemaining) {
+        console.log(`  ⏭  ${trade.ticker} ${trade.strategy} — insufficient buying power ($${bpRemaining.toFixed(0)} remaining after $${state.totalCollateralToday} committed, need $${capitalRequired}${legs.collateral ? " collateral" : ""})`);
         continue;
       }
     }
@@ -2237,8 +2504,17 @@ async function morningSession() {
       executed.push(ex);
       state.openPositions.push(ex);
       state.dailyTrades.push(ex);
-      state.totalDeployedToday += legs.cost;
-      console.log(`  ✅ ${trade.ticker} ${trade.strategy} — $${legs.cost}`);
+      state.totalDeployedToday   += legs.cost;
+      // Track actual buying power committed: collateral for CSPs, credit/debit for others.
+      // The buying power gate and AI prompt use this to reflect real capital at risk.
+      state.totalCollateralToday += (legs.collateral ?? legs.cost);
+      appendTradeLog({
+        type: "open", ticker: trade.ticker, strategy: trade.strategy,
+        expiration: legs.expiration, executedCost: legs.cost,
+        collateral: legs.collateral ?? null, executedPrice: stockData.price,
+        orderId: result.orderId || "SANDBOX", source: "morning",
+      });
+      console.log(`  ✅ ${trade.ticker} ${trade.strategy} — $${legs.cost} premium, $${legs.collateral ?? legs.cost} collateral`);
     } else {
       console.log(`  ✗ ${trade.ticker} ${trade.strategy} — order rejected: ${result.error}`);
     }
@@ -2267,6 +2543,11 @@ async function morningSession() {
 
 async function opportunisticScan() {
   console.log(`\n[${new Date().toLocaleTimeString()}] 🔍 Opportunistic scan...`);
+
+  if (state.dailyCircuitBreakerTripped) {
+    console.log("  ⏭  Skipping — daily circuit breaker tripped, no new trades today.");
+    return;
+  }
 
   const effectiveMin    = TRADIER.sandbox ? MANDATE.minPerTrade : MANDATE.minPerTradeLive;
   const budgetRemaining = MANDATE.dailyCapMax - state.totalDeployedToday;
@@ -2353,7 +2634,14 @@ async function opportunisticScan() {
     const ex = { ...candidate, ...legs, orderId:result.orderId, executedAt:new Date().toISOString(), executedCost:legs.cost, executedPrice:stockData.price, status:"OPEN", source:"opportunistic" };
     state.openPositions.push(ex);
     state.dailyTrades.push(ex);
-    state.totalDeployedToday += legs.cost;
+    state.totalDeployedToday   += legs.cost;
+    state.totalCollateralToday += (legs.collateral ?? legs.cost);
+    appendTradeLog({
+      type: "open", ticker: candidate.ticker, strategy: candidate.strategy,
+      expiration: legs.expiration, executedCost: legs.cost,
+      collateral: legs.collateral ?? null, executedPrice: stockData.price,
+      orderId: result.orderId, source: "opportunistic",
+    });
 
     await sendSMS(
 `🎯 OPPORTUNISTIC TRADE
@@ -2391,6 +2679,29 @@ async function intradayCheck() {
   if (state.openPositions.length > 0) {
     console.log(`  📊 Sending live snapshot for ${state.openPositions.length} open position(s)...`);
     await sendLiveSnapshot(groups);
+  }
+
+  // ── DAILY CIRCUIT BREAKER EVALUATION ─────────────────────────
+  // Check combined realized + unrealized P&L against the daily max-loss
+  // limit. Fires once — subsequent cycles stay quiet until reset at 9:10 AM.
+  if (!state.dailyCircuitBreakerTripped) {
+    const unrealizedPnL = groups
+      .filter(g => g.valid && state.openPositions.includes(g.ourTrade))
+      .reduce((sum, g) => sum + computePnL(g.ourTrade, g).currentPnL, 0);
+    const totalExposure = state.dailyPnL + unrealizedPnL;
+    if (totalExposure <= -MANDATE.dailyMaxLoss) {
+      state.dailyCircuitBreakerTripped = true;
+      console.error(`  🛑 CIRCUIT BREAKER: realized $${state.dailyPnL.toFixed(0)} + unrealized $${unrealizedPnL.toFixed(0)} = $${totalExposure.toFixed(0)} ≤ -$${MANDATE.dailyMaxLoss}`);
+      await sendSMS(
+        `🛑 DAILY CIRCUIT BREAKER TRIPPED\n` +
+        `Realized P&L:   $${state.dailyPnL.toFixed(0)}\n` +
+        `Unrealized P&L: $${unrealizedPnL.toFixed(0)}\n` +
+        `Total:          $${totalExposure.toFixed(0)} (limit -$${MANDATE.dailyMaxLoss})\n\n` +
+        `All new trading halted for today. Existing positions still monitored and auto-closed.\n` +
+        `Not financial advice.`
+      );
+      saveState();
+    }
   }
 
   const todayStr = new Date().toISOString().slice(0, 10);
@@ -2434,7 +2745,10 @@ async function intradayCheck() {
     }
 
     if (!urgent.length) continue;
-    const key = `${stock.ticker}_${urgent.map(a=>a.type).join("_")}_${new Date().getHours()}`;
+    // Include date in the dedup key — without it, an alert at 3:58 PM (hour 15)
+    // and again at 4:02 PM (hour 16) fire twice for the same event because the
+    // hour rolls over before alertsSent.clear() runs in closingSession at 4:05.
+    const key = `${todayStr}_${stock.ticker}_${urgent.map(a=>a.type).join("_")}_${new Date().getHours()}`;
     if (state.alertsSent.has(key)) continue;
     state.alertsSent.add(key);
     await sendSMS(`⚡ ${stock.ticker} ALERT\nPrice: $${stock.price.toFixed(2)} ${(stock.changePct||0)>=0?"▲":"▼"}${Math.abs(stock.changePct||0).toFixed(2)}%\n\n${urgent.map(a=>`${a.urgency}\n${a.msg}`).join("\n\n")}\n\nStop: $${getStopLoss(stock.ticker,stock.stopLoss)?.toFixed(2)||"N/A"} | Target: $${getTarget(stock.ticker,stock.target)?.toFixed(2)||"N/A"}\nNot financial advice.`);
@@ -2449,6 +2763,60 @@ async function closingSession() {
   const winners  = portfolioData.filter(p=>(p.changePct||0)>0).sort((a,b)=>b.changePct-a.changePct);
   const losers   = portfolioData.filter(p=>(p.changePct||0)<0).sort((a,b)=>a.changePct-b.changePct);
   const modeFlag = TRADIER.sandbox ? " [SANDBOX]" : "";
+
+  // ── FORCED CLOSE: DTE ≤ 1 POSITIONS ──────────────────────────
+  // The schedule header says "4PM close" but previously this function only
+  // sent a summary — it never actually closed anything. Positions left open
+  // at DTE≤1 (especially CSPs) risk same-day assignment if they're anywhere
+  // near the money at expiry. Close all such positions now, before the summary.
+  // monitorOpenPositions handles the P&L accounting and state cleanup.
+  const todayStrC = new Date().toISOString().slice(0, 10);
+  const todayUTCC = new Date(todayStrC + "T00:00:00Z");
+  const expiringGroups = [];
+  if (state.openPositions.length > 0) {
+    console.log("  🔍 Checking for DTE≤1 positions to force-close before expiry...");
+    const groups = await getGroupedLivePositions();
+    for (const g of groups) {
+      if (!g.valid) continue;
+      const expDate = new Date(g.ourTrade.expiration + "T00:00:00Z");
+      const dte     = Math.ceil((expDate - todayUTCC) / (1000*60*60*24));
+      if (dte <= 1) {
+        console.log(`  ⚠ ${g.ourTrade.ticker} ${g.ourTrade.strategy} expiring in ${dte} DTE — forcing close`);
+        expiringGroups.push(g);
+      }
+    }
+    if (expiringGroups.length > 0) {
+      // Re-use monitorOpenPositions to handle the close with full P&L accounting,
+      // state cleanup, and win/loss tracking. Pass a synthetic priceMap.
+      const priceMap = Object.fromEntries(portfolioData.map(p => [p.ticker, p]));
+      // Temporarily force shouldClose on expiry-risk trades by reducing their DTE
+      // to minDTE in the monitor. The cleanest way: call monitorOpenPositions and
+      // let EXPIRY RISK logic fire naturally since dte <= MANDATE.minDTE (1).
+      await monitorOpenPositions(expiringGroups, priceMap);
+      console.log(`  ✅ Expiry-risk close sweep complete (${expiringGroups.length} position(s) processed).`);
+    } else {
+      console.log("  ✓ No DTE≤1 positions — nothing to force-close.");
+    }
+  }
+
+  // ── UNREALIZED P&L snapshot for summary ──────────────────────
+  // state.dailyPnL only captures REALIZED (closed) P&L. The summary was
+  // showing $0 on days with profitable open positions not yet triggered.
+  // Fetch current live values and include unrealized in the day total.
+  let unrealizedPnL   = 0;
+  let unrealizedLines = "";
+  if (state.openPositions.length > 0) {
+    try {
+      const remainingGroups = await getGroupedLivePositions();
+      const snap = getLivePositionSnapshot(remainingGroups);
+      unrealizedPnL   = snap.totalPnL || 0;
+      unrealizedLines = snap.lines?.length
+        ? `\nOPEN POSITIONS (unrealized):\n${snap.lines.join("\n")}`
+        : "";
+    } catch(e) {
+      console.log(`  ⚠ Could not fetch unrealized P&L for summary: ${e.message}`);
+    }
+  }
 
   // Win rate summary across all strategies
   const statsLines = Object.entries(state.tradeStats).map(([strategy, ts]) => {
@@ -2468,6 +2836,8 @@ async function closingSession() {
     .map(([t, dc]) => `${t} (${dc.count}d)`)
     .join(", ");
 
+  const totalDayPnL  = state.dailyPnL + unrealizedPnL;
+  const cbFlag       = state.dailyCircuitBreakerTripped ? "\n🛑 CIRCUIT BREAKER was tripped today — new trades were halted." : "";
   await sendSMS(
 `🔔 CLOSING${modeFlag} ${new Date().toLocaleDateString()}
 
@@ -2475,14 +2845,16 @@ OPTIONS:
 Trades: ${state.dailyTrades.length} | Open: ${state.openPositions.length}
 
 P&L SUMMARY:
-Today:  ${state.dailyPnL>=0?"+":""}$${state.dailyPnL.toFixed(0)}
+Realized:    ${state.dailyPnL>=0?"+":""}$${state.dailyPnL.toFixed(0)}
+Unrealized:  ${unrealizedPnL>=0?"+":""}$${unrealizedPnL.toFixed(0)} (open positions)
+Today total: ${totalDayPnL>=0?"+":""}$${totalDayPnL.toFixed(0)}
 Week:   ${state.weeklyPnL>=0?"+":""}$${state.weeklyPnL.toFixed(0)}
 Month:  ${state.monthlyPnL>=0?"+":""}$${state.monthlyPnL.toFixed(0)}
-Capital deployed: $${state.totalDeployedToday}
-
+Premium: $${state.totalDeployedToday} | Collateral: $${state.totalCollateralToday}
+${cbFlag}
 WIN RATES:
 ${statsLines}
-${blockedTickers ? `\n⚠️ CSP BLOCKED (downtrend): ${blockedTickers}` : ""}
+${blockedTickers ? `\n⚠️ CSP BLOCKED (downtrend): ${blockedTickers}` : ""}${unrealizedLines}
 STOCKS:
 🟢 ${winners.slice(0,3).map(p=>`${p.ticker} +${(p.changePct||0).toFixed(1)}%`).join(", ")||"None"}
 🔴 ${losers.slice(0,3).map(p=>`${p.ticker} ${(p.changePct||0).toFixed(1)}%`).join(", ")||"None"}
@@ -2623,13 +2995,20 @@ async function sundaySummary() {
   state.weeklyHighs = {};
   console.log(`  🔄 Weekly highs reset (${prevHighCount} ticker(s) cleared — momentum filter will rebuild from today's prices)`);
 
-  // Reset downtrend counters weekly — a stock that was bearish last week
-  // should get a fresh look on Monday. Daily decay handles gradual recovery
-  // mid-week; the Sunday reset ensures clean slate week-over-week.
-  const prevDowntrends = Object.keys(state.downtrendCount).length;
+  // Partial downtrend reset: clear sub-threshold counts (1-2 bad days —
+  // probably a short-term dip, not a structural trend) but PRESERVE entries
+  // with count >= 3 (active CSP block). A ticker hitting stop 8 consecutive
+  // days doesn't deserve a clean slate just because the calendar flips to
+  // Sunday. The daily decay mechanism (decrement on no-stop-loss days) is
+  // the right path back to CSP eligibility for those names.
+  const prevDowntrends    = Object.keys(state.downtrendCount).length;
+  const activeBlocks      = Object.entries(state.downtrendCount).filter(([, dc]) => dc.count >= 3);
+  const subThresholdClear = Object.entries(state.downtrendCount).filter(([, dc]) => dc.count < 3);
+  for (const [ticker] of subThresholdClear) delete state.downtrendCount[ticker];
   if (prevDowntrends > 0) {
-    console.log(`  🔄 Downtrend counters reset (${prevDowntrends} ticker(s) had counts — all CSP-eligible on Monday)`);
-    state.downtrendCount = {};
+    const clearedList   = subThresholdClear.map(([t]) => t).join(", ") || "none";
+    const retainedList  = activeBlocks.map(([t, dc]) => `${t}(${dc.count}d)`).join(", ") || "none";
+    console.log(`  🔄 Downtrend reset: cleared sub-threshold (${clearedList}), retained active blocks (${retainedList})`);
   }
 
   // Capture weekly P&L before resetting
