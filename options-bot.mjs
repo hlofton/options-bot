@@ -1,8 +1,9 @@
 // ================================================================
 // OPTIONS TRADING BOT v2 — FULLY AUTOMATED WITH TRADIER + PUSHOVER
 // ================================================================
-// Portfolio : 17 stocks — NVDA AMD AVGO MSFT AAPL AMZN GOOGL META
-//             TSLA PANW CRWD SPY QQQ OKLO LLY PLTR NOW
+// Portfolio : 22 stocks — NVDA AMD AVGO ARM MRVL MSFT AAPL AMZN
+//             GOOGL META TSLA PANW CRWD COIN HOOD OKLO VST LLY
+//             PLTR NOW SPY QQQ
 // Strategies: Iron Condor (SPY/QQQ only, 1-3 DTE) | Cash Secured Put
 //             Bull/Bear Spreads RETIRED Aug 2026 (net negative P&L)
 //             Single-stock ICs BANNED Aug 2026 (breach risk too high)
@@ -11,6 +12,7 @@
 // Execution : Tradier API (sandbox or live)
 // Alerts    : Pushover push notifications
 // Schedule  : 9:10AM execute | 20min monitor | 4PM close | Sun review
+// Last updated: Aug 2026 — added COIN, HOOD, ARM, MRVL, VST
 // ================================================================
 //
 // INSTALL:  npm install
@@ -352,6 +354,11 @@ function loadState() {
       state.totalCollateralToday       = persisted.totalCollateralToday || 0;
       state.dailyPnL                   = persisted.dailyPnL || 0;
       state.dailyCircuitBreakerTripped = persisted.dailyCircuitBreakerTripped || false;
+    } else {
+      // New day — daily counters stay at their initialised-zero defaults.
+      // Explicitly false here prevents a stale persisted true from bleeding
+      // into the next day if the state file's savedAt is somehow mid-day.
+      state.dailyCircuitBreakerTripped = false;
     }
 
     console.log(`  ✓ Restored state from disk: ${state.openPositions.length} open position(s) — saved ${persisted.savedAt}`);
@@ -394,7 +401,19 @@ async function runExclusive(jobName, fn) {
   try {
     await fn();
   } catch(e) {
-    console.error(`  ✗ ${jobName} crashed: ${e.message}`);
+    // Log the full stack — console is the primary diagnostic surface.
+    console.error(`  ✗ ${jobName} crashed: ${e.message}\n${e.stack || "(no stack)"}`);
+    // Alert for session-level jobs: a silent crash in morningSession or
+    // closingSession means trades were not placed / positions not closed
+    // with no indication to the operator. Even non-critical jobs that crash
+    // unexpectedly are worth knowing about immediately.
+    await sendSMS(
+      `🚨 ${jobName} CRASHED\n${e.message.slice(0, 300)}\n\n` +
+      `Crons are still running. Check Railway logs for full stack.\n` +
+      (CRITICAL_ONCE_DAILY_JOBS.has(jobName)
+        ? `⚠️ This job does NOT retry — manual check needed.`
+        : `Next scheduled run will retry automatically.`)
+    ).catch(() => {}); // never let the alert itself crash the finally block
   } finally {
     state.jobRunning = null;
   }
@@ -411,6 +430,40 @@ const PUSHOVER = {
 if (!PUSHOVER.user || !PUSHOVER.token) {
   console.error("⚠️  WARNING: PUSHOVER_USER_KEY or PUSHOVER_API_TOKEN not set — push notifications will fail.");
 }
+
+// ── SHARED UTILITY HELPERS ────────────────────────────────────
+
+// Strategy name → compact abbreviation used in all Pushover messages.
+// Single source of truth — previously copy-pasted identically in three
+// places (morningSession, closingSession, sundaySummary). One place to
+// update when a new strategy is added.
+function abbrevStrategy(s) {
+  return s
+    .replace("Cash Secured Put", "CSP")
+    .replace("Iron Condor",      "IC")
+    .replace("Bull Call Spread", "BCS")
+    .replace("Bear Put Spread",  "BPS");
+}
+
+// Classifies an error as a transient network failure safe to retry.
+// Used by retryAI (AI SDK errors) and the morningSession scan loop
+// (generateTrades errors). Previously duplicated verbatim in both places —
+// any update to one had to be manually mirrored to the other.
+function isRetryableError(e) {
+  return e.message.includes("Connection error") ||
+         e.message.includes("ECONNREFUSED")     ||
+         e.message.includes("ENOTFOUND")        ||
+         e.message.includes("fetch failed")     ||
+         e.message.includes("network")          ||
+         e.message.includes("timeout")          ||
+         e.status === 529                        ||
+         e.status === 503;
+}
+
+// Maximum age of a cached price before it is considered too stale to use
+// as a fallback. 30 minutes covers a transient Tradier blip without letting
+// the bot make stop-loss or profit-target decisions on hours-old data.
+const MAX_CACHE_AGE_MS = 30 * 60 * 1000;
 
 // ═══════════════════════════════════════════════════════════════
 // DYNAMIC LEVEL HELPERS — auto trailing stops + analyst targets
@@ -959,7 +1012,24 @@ async function fetchAllPrices() {
     return results;
   } catch(e) {
     console.error(`  ✗ Batched price fetch failed: ${e.message} — falling back to cache`);
-    return PORTFOLIO.map(s => ({ ...s, ...(state.priceCache[s.ticker]?.data || {}) })).filter(s => s.price);
+    // Only use cached entries that are fresher than MAX_CACHE_AGE_MS (30 min).
+    // A 3-hour-old NVDA price during an active market move is worse than no price —
+    // it would trigger false stop-loss or profit-target checks silently.
+    // Entries that are too stale are dropped; those positions skip this cycle.
+    const now = Date.now();
+    const fresh = PORTFOLIO
+      .map(s => {
+        const cached = state.priceCache[s.ticker];
+        if (!cached) return null;
+        if (now - cached.ts > MAX_CACHE_AGE_MS) {
+          console.warn(`  ⚠ ${s.ticker} cache entry is ${Math.round((now - cached.ts)/60000)}min old — too stale, dropping`);
+          return null;
+        }
+        return { ...s, ...cached.data };
+      })
+      .filter(Boolean);
+    console.log(`  ⚠ Using ${fresh.length} fresh cache entries (${PORTFOLIO.length - fresh.length} dropped as stale)`);
+    return fresh;
   }
 }
 
@@ -995,6 +1065,17 @@ async function sendSMS(body) {
     if (data.status === 1) console.log(`  ✅ Push notification sent`);
     else console.error(`  ✗ Pushover failed:`, data.errors);
   } catch(e) { console.error(`  ✗ Push failed: ${e.message}`); }
+}
+
+// Sends an array of messages sequentially with a short delay between each.
+// Use instead of multiple bare sendSMS calls whenever a session needs to
+// split a long summary into parts — keeps the call-site readable and
+// ensures Pushover doesn't receive concurrent requests from the same process.
+async function sendParts(parts, delayMs = 2000) {
+  for (let i = 0; i < parts.length; i++) {
+    if (parts[i]) await sendSMS(parts[i]);
+    if (i < parts.length - 1) await new Promise(r => setTimeout(r, delayMs));
+  }
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -1240,9 +1321,13 @@ function checkSectorHealth(ticker, portfolioData) {
 
   const [sectorName, peers] = sectorEntry;
 
-  // Skip correlation check for single-stock sectors and indexes
-  if (["ev", "pharma", "nuclear", "ai", "index"].includes(sectorName)) {
-    return { healthy: true, reason: "Single-stock or index sector" };
+  // Skip correlation check for single-stock sectors and indexes.
+  // "energy" is intentionally NOT in this list — OKLO and VST are both
+  // in the energy group and should block each other on correlated weakness.
+  // "nuclear" was the old name for a single-member OKLO group; it no longer
+  // exists after VST was added and the group was renamed.
+  if (["ev", "pharma", "ai", "index"].includes(sectorName)) {
+    return { healthy: true, reason: "Single-stock or index sector — no peer correlation check" };
   }
 
   // Count how many OTHER members of this sector are down 2%+ today.
@@ -1287,15 +1372,7 @@ async function retryAI(fn, maxAttempts = 3, delayMs = 2000) {
 
       // 401 (auth) and 400 (bad request) are NOT retried —
       // they are permanent failures; retrying only adds latency.
-      const isRetryable = e.message.includes("Connection error") ||
-                          e.message.includes("ECONNREFUSED") ||
-                          e.message.includes("ENOTFOUND") ||
-                          e.message.includes("fetch failed") ||
-                          e.message.includes("network") ||
-                          e.message.includes("timeout") ||
-                          e.status === 529 ||
-                          e.status === 503;
-      if (!isRetryable || attempt === maxAttempts) {
+      if (!isRetryableError(e) || attempt === maxAttempts) {
         console.error(`  ✗ AI call failed after ${attempt} attempt(s): ${errDetail}`);
         throw e;
       }
@@ -1575,7 +1652,12 @@ async function generateTrades(portfolioData, preComputedRegime = null) {
     .replace(/```\s*$/i, "")
     .trim();
 
-  const match = cleaned.match(/\[[\s\S]*\]/);
+  // Match ALL JSON arrays and take the LAST one. The model may emit
+  // explanation text containing [...] before the actual data array —
+  // the first-match regex would parse the wrong array. The last array
+  // in the response is always the structured data payload.
+  const allMatches = cleaned.match(/\[[\s\S]*?\]/g);
+  const match = allMatches ? allMatches[allMatches.length - 1] : null;
   if (!match) throw new Error(`No JSON array found in generateTrades. Raw: ${cleaned.slice(0, 200)}`);
 
   let parsed;
@@ -1910,7 +1992,7 @@ Not financial advice.`
   return snap;
 }
 
-async function monitorOpenPositions(groups, priceMap = {}) {
+async function monitorOpenPositions(groups, underlyingPriceMap = {}) {
   if (!groups || !groups.length) return;
   console.log(`  Monitoring ${groups.length} open trade(s) (grouped by all legs)...`);
 
@@ -1959,7 +2041,7 @@ async function monitorOpenPositions(groups, priceMap = {}) {
       let preBreachWarning  = false;
       let breachNote        = "";
       if (ourTrade.strategy === "Iron Condor" && ourTrade.shortCallStrike && ourTrade.shortPutStrike) {
-        const livePrice = priceMap?.[ourTrade.ticker]?.price;
+        const livePrice = underlyingPriceMap?.[ourTrade.ticker]?.price;
         if (livePrice) {
           const pctToCall = (ourTrade.shortCallStrike - livePrice) / livePrice;
           const pctToPut  = (livePrice - ourTrade.shortPutStrike)  / livePrice;
@@ -2175,7 +2257,9 @@ const STOCK_TICKERS = PORTFOLIO
 
 async function updateAllPricingLevels(portfolioData) {
   console.log("\n📊 Auto-updating ALL pricing levels...");
-  let totalUpdated = 0;
+  let totalUpdated   = 0;
+  const targetChanges = []; // { ticker, oldTarget, newTarget, nAnalysts } — for Sunday summary
+  const skipped       = []; // { ticker, newVal, oldVal, pct }             — sanity check failures
 
   // ── STEP 1: ETF price-based update ─────────────────────────
   // ETFs have no analyst targets — derive stop (10% below) and target (10% above)
@@ -2240,14 +2324,16 @@ Include every ticker. Use null for analystTarget if no data found.`;
 
     if (!allText) {
       console.log("  ⚠ No text block in response — model may have returned tool_use only. Skipping update.");
-      return totalUpdated;
+      return { totalUpdated, targetChanges, skipped };
     }
 
-    // Extract JSON array from anywhere in the text response
-    const match = allText.match(/\[[\s\S]*?\]/);
+    // Extract JSON array — take the LAST match in case the model emitted
+    // explanation text with embedded [...] before the actual data array.
+    const allMatches2 = allText.match(/\[[\s\S]*?\]/g);
+    const match = allMatches2 ? allMatches2[allMatches2.length - 1] : null;
     if (!match) {
       console.log("  ⚠ No JSON array found in response. Raw text:", allText.slice(0, 200));
-      return totalUpdated;
+      return { totalUpdated, targetChanges, skipped };
     }
 
     let results;
@@ -2255,7 +2341,7 @@ Include every ticker. Use null for analystTarget if no data found.`;
       results = JSON.parse(match[0]);
     } catch(parseErr) {
       console.error("  ✗ JSON parse failed:", parseErr.message);
-      return totalUpdated;
+      return { totalUpdated, targetChanges, skipped };
     }
     for (const r of results) {
       if (!r.ticker || !r.analystTarget) continue;
@@ -2271,7 +2357,9 @@ Include every ticker. Use null for analystTarget if no data found.`;
       // clearly bad API data. Skip this cycle; if the API returns the same
       // value again next session it will pass (oldTarget updates to the new value).
       if (oldTarget && Math.abs(r.analystTarget - oldTarget) / oldTarget > 0.50) {
-        console.warn(`  ⚠ ${r.ticker}: analyst target $${r.analystTarget} changed ${(((r.analystTarget - oldTarget) / oldTarget) * 100).toFixed(0)}% from $${oldTarget} — exceeds 50% sanity threshold, skipping (source: ${r.source || "unknown"})`);
+        const pct = (((r.analystTarget - oldTarget) / oldTarget) * 100).toFixed(0);
+        console.warn(`  ⚠ ${r.ticker}: analyst target $${r.analystTarget} changed ${pct}% from $${oldTarget} — exceeds 50% sanity threshold, skipping (source: ${r.source || "unknown"})`);
+        skipped.push({ ticker: r.ticker, newVal: r.analystTarget, oldVal: oldTarget, pct });
         continue;
       }
 
@@ -2287,23 +2375,26 @@ Include every ticker. Use null for analystTarget if no data found.`;
           lastUpdated: new Date().toISOString(),
         };
         const changes = [];
-        if (targetChanged) changes.push(`target $${oldTarget}→$${r.analystTarget} (${r.numAnalysts} analysts)`);
-        if (stopChanged)   changes.push(`stop $${oldStop}→$${newStop}`);
+        if (targetChanged) {
+          changes.push(`target $${oldTarget}→$${r.analystTarget} (${r.numAnalysts} analysts)`);
+          targetChanges.push({ ticker: r.ticker, oldTarget, newTarget: r.analystTarget, nAnalysts: r.numAnalysts });
+        }
+        if (stopChanged) changes.push(`stop $${oldStop}→$${newStop}`);
         console.log(`  ✓ ${r.ticker}: ${changes.join(" | ")}`);
         totalUpdated++;
       }
     }
   } catch(e) { console.error(`  ✗ Analyst fetch failed: ${e.message}`); }
 
-  saveState(); // persist updated stops/targets
+  saveState();
   console.log(`  ✅ Auto-update complete: ${totalUpdated} positions updated`);
-  return totalUpdated;
+  return { totalUpdated, targetChanges, skipped };
 }
 
-// Alias — keeps daily 9:15 AM cron working
+// Alias — keeps daily 9:25 AM cron working. Discards the targetChanges/skipped
+// arrays since the daily refresh doesn't send a summary notification.
 async function updateAnalystTargets() {
   const portfolioData = await fetchAllPrices();
-  // Check for splits FIRST — must happen before pricing update
   await detectAndFixSplits(portfolioData);
   await updateAllPricingLevels(portfolioData);
 }
@@ -2381,16 +2472,7 @@ async function morningSession() {
       trades = await generateTrades(portfolioData, { spyChange: spyNow, regime: regimeNow });
       break; // success — empty result is valid, don't retry
     } catch(e) {
-      // Match retryAI conditions exactly — previously missing ENOTFOUND, timeout, 503, 529
-      const isRetryable = e.message.includes("Connection error") ||
-                          e.message.includes("ECONNREFUSED") ||
-                          e.message.includes("ENOTFOUND") ||
-                          e.message.includes("fetch failed") ||
-                          e.message.includes("network") ||
-                          e.message.includes("timeout") ||
-                          e.status === 529 ||
-                          e.status === 503;
-      if (!isRetryable || scanAttempt === 3) {
+      if (!isRetryableError(e) || scanAttempt === 3) {
         await sendSMS(`⚠️ Morning scan failed after ${scanAttempt} attempt(s): ${e.message}`);
         return;
       }
@@ -2522,11 +2604,34 @@ async function morningSession() {
   }
 
   const regimeFlag = regimeNow.label !== "NORMAL" ? `\nRegime: ${regimeNow.label} (SPY ${spyNow.toFixed(1)}%)` : "";
-  const msg = executed.length > 0
-    ? `◈ MORNING${modeFlag}${regimeFlag} ${new Date().toLocaleDateString()}\n\n${executed.length} TRADES EXECUTED:\n${executed.map((t,i)=>`${i+1}. ${t.ticker} ${t.strategy}\n   Cost: $${t.executedCost} | Target: ${t.targetReturnPct}%\n   Expiry: ${t.expiration} | Order: ${t.orderId}`).join("\n\n")}\n\nDeployed: $${state.totalDeployedToday}\nMonitoring every 20 min. Auto-close at ${MANDATE.profitTargetPct}% profit.\n\nNot financial advice.`
-    : `◈ MORNING${modeFlag} ${new Date().toLocaleDateString()}\n\nNo trades executed — no setups met the 8% mandate.\nMonitoring continues.\n\nNot financial advice.`;
-  await sendSMS(msg);
-  saveState(); // persist any new trades before this cycle ends
+  const cbFlag     = state.dailyCircuitBreakerTripped ? "\n🛑 Circuit breaker tripped — no new trades." : "";
+
+  if (executed.length > 0) {
+    // Part 1: compact header — always under 250 chars
+    const header =
+      `◈ MORNING${modeFlag} ${new Date().toLocaleDateString()} ✅ ${executed.length} trade${executed.length>1?"s":""}${regimeFlag}${cbFlag}\n` +
+      `Premium: $${state.totalDeployedToday} | Collateral: $${state.totalCollateralToday}\n` +
+      `Monitoring every 20 min | Exit at ${MANDATE.profitTargetPct}% profit\nNot financial advice.`;
+
+    // Part 2: trade detail — one compact line per trade, always fits even with 6 trades
+    // Format: "1. NVDA CSP  $420 9.5%  exp 08-22  #12345"
+    const tradeLines = executed.map((t, i) => {
+      const strat    = abbrevStrategy(t.strategy);
+      const expShort = t.expiration ? t.expiration.slice(5) : "?";   // MM-DD
+      const ordShort = String(t.orderId || "?").slice(-6);            // last 6 chars
+      return `${i+1}. ${t.ticker} ${strat}  $${t.executedCost} ${t.targetReturnPct}%  exp ${expShort}  #${ordShort}`;
+    }).join("\n");
+    const detail = `TRADES (${executed.length}):\n${tradeLines}`;
+
+    await sendParts([header, detail]);
+  } else {
+    await sendSMS(
+      `◈ MORNING${modeFlag} ${new Date().toLocaleDateString()}\n` +
+      `No trades — no setups met the ${MANDATE.minReturnPct}% mandate.${regimeFlag}${cbFlag}\n` +
+      `Not financial advice.`
+    );
+  }
+  saveState();
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -2669,11 +2774,11 @@ async function intradayCheck() {
   // meaning breach checks called fetchStockPrice() which returned prices
   // from the 18-min cache — potentially a full cycle (20 min) stale.
   const portfolioData = await fetchAllPrices();
-  const priceMap = Object.fromEntries(portfolioData.map(p => [p.ticker, p]));
+  const underlyingPriceMap = Object.fromEntries(portfolioData.map(p => [p.ticker, p]));
 
   // Fetch positions once and pass to both monitor and snapshot.
   const groups = await getGroupedLivePositions();
-  await monitorOpenPositions(groups, priceMap);
+  await monitorOpenPositions(groups, underlyingPriceMap);
   saveState();
 
   if (state.openPositions.length > 0) {
@@ -2765,18 +2870,15 @@ async function closingSession() {
   const modeFlag = TRADIER.sandbox ? " [SANDBOX]" : "";
 
   // ── FORCED CLOSE: DTE ≤ 1 POSITIONS ──────────────────────────
-  // The schedule header says "4PM close" but previously this function only
-  // sent a summary — it never actually closed anything. Positions left open
-  // at DTE≤1 (especially CSPs) risk same-day assignment if they're anywhere
-  // near the money at expiry. Close all such positions now, before the summary.
-  // monitorOpenPositions handles the P&L accounting and state cleanup.
   const todayStrC = new Date().toISOString().slice(0, 10);
   const todayUTCC = new Date(todayStrC + "T00:00:00Z");
-  const expiringGroups = [];
+  const expiringGroups  = [];
+  let   firstFetchGroups = null; // reuse below if no closes happened
+
   if (state.openPositions.length > 0) {
     console.log("  🔍 Checking for DTE≤1 positions to force-close before expiry...");
-    const groups = await getGroupedLivePositions();
-    for (const g of groups) {
+    firstFetchGroups = await getGroupedLivePositions();
+    for (const g of firstFetchGroups) {
       if (!g.valid) continue;
       const expDate = new Date(g.ourTrade.expiration + "T00:00:00Z");
       const dte     = Math.ceil((expDate - todayUTCC) / (1000*60*60*24));
@@ -2786,28 +2888,24 @@ async function closingSession() {
       }
     }
     if (expiringGroups.length > 0) {
-      // Re-use monitorOpenPositions to handle the close with full P&L accounting,
-      // state cleanup, and win/loss tracking. Pass a synthetic priceMap.
-      const priceMap = Object.fromEntries(portfolioData.map(p => [p.ticker, p]));
-      // Temporarily force shouldClose on expiry-risk trades by reducing their DTE
-      // to minDTE in the monitor. The cleanest way: call monitorOpenPositions and
-      // let EXPIRY RISK logic fire naturally since dte <= MANDATE.minDTE (1).
-      await monitorOpenPositions(expiringGroups, priceMap);
+      const underlyingPriceMap = Object.fromEntries(portfolioData.map(p => [p.ticker, p]));
+      await monitorOpenPositions(expiringGroups, underlyingPriceMap);
       console.log(`  ✅ Expiry-risk close sweep complete (${expiringGroups.length} position(s) processed).`);
+      firstFetchGroups = null; // positions changed — must re-fetch for unrealized snapshot
     } else {
       console.log("  ✓ No DTE≤1 positions — nothing to force-close.");
     }
   }
 
   // ── UNREALIZED P&L snapshot for summary ──────────────────────
-  // state.dailyPnL only captures REALIZED (closed) P&L. The summary was
-  // showing $0 on days with profitable open positions not yet triggered.
-  // Fetch current live values and include unrealized in the day total.
+  // Reuse firstFetchGroups when no closes happened — avoids a redundant
+  // Tradier round-trip on the vast majority of days where nothing expires.
+  // After closes, firstFetchGroups is nulled so we re-fetch fresh state.
   let unrealizedPnL   = 0;
   let unrealizedLines = "";
   if (state.openPositions.length > 0) {
     try {
-      const remainingGroups = await getGroupedLivePositions();
+      const remainingGroups = firstFetchGroups ?? await getGroupedLivePositions();
       const snap = getLivePositionSnapshot(remainingGroups);
       unrealizedPnL   = snap.totalPnL || 0;
       unrealizedLines = snap.lines?.length
@@ -2818,49 +2916,54 @@ async function closingSession() {
     }
   }
 
-  // Win rate summary across all strategies
-  const statsLines = Object.entries(state.tradeStats).map(([strategy, ts]) => {
-    const total   = ts.wins + ts.losses;
-    const winRate = total > 0 ? ((ts.wins / total) * 100).toFixed(0) : "N/A";
-    const avgWin  = ts.wins   > 0 ? `+$${(ts.totalWinPnL  / ts.wins).toFixed(0)}`  : "N/A";
-    const avgLoss = ts.losses > 0 ? `-$${Math.abs(ts.totalLossPnL / ts.losses).toFixed(0)}` : "N/A";
-    const exitBreakdown = (ts.earlyExits || 0) + (ts.heldToExpiry || 0) > 0
-      ? ` | early:${ts.earlyExits||0} held:${ts.heldToExpiry||0}`
-      : "";
-    return `${strategy}: ${ts.wins}W/${ts.losses}L (${winRate}%) | avg ${avgWin} / ${avgLoss}${exitBreakdown}`;
-  }).join("\n") || "No closed trades yet";
+  // Win rate and blocked ticker data now computed inside the split-message block below.
 
-  // Show which tickers are currently downtrend-blocked for CSPs
+  const totalDayPnL = state.dailyPnL + unrealizedPnL;
+  const cbFlag      = state.dailyCircuitBreakerTripped ? "\n🛑 Circuit breaker tripped — new trades halted." : "";
+
+  // Part 1: P&L numbers — always fits, always sent (~250 chars max)
+  const part1 =
+    `🔔 CLOSING${modeFlag} ${new Date().toLocaleDateString()}` +
+    `\nTrades: ${state.dailyTrades.length} | Open: ${state.openPositions.length}` +
+    `\n\nTODAY:` +
+    `\nRealized:   ${state.dailyPnL  >=0?"+":""}$${state.dailyPnL.toFixed(0)}` +
+    `\nUnrealized: ${unrealizedPnL   >=0?"+":""}$${unrealizedPnL.toFixed(0)}${state.openPositions.length>0?" (open positions)":""}` +
+    `\nTotal:      ${totalDayPnL     >=0?"+":""}$${totalDayPnL.toFixed(0)}` +
+    `\nWeek: ${state.weeklyPnL>=0?"+":""}$${state.weeklyPnL.toFixed(0)} | Month: ${state.monthlyPnL>=0?"+":""}$${state.monthlyPnL.toFixed(0)}` +
+    `\nPremium: $${state.totalDeployedToday} | Collateral: $${state.totalCollateralToday}` +
+    `${cbFlag}\nNot financial advice.`;
+
+  // Part 2: win rates + blocked tickers + top 3 movers each side (~300 chars max)
   const blockedTickers = Object.entries(state.downtrendCount)
     .filter(([, dc]) => dc.count >= 3)
-    .map(([t, dc]) => `${t} (${dc.count}d)`)
+    .map(([t, dc]) => `${t}(${dc.count}d)`)
     .join(", ");
 
-  const totalDayPnL  = state.dailyPnL + unrealizedPnL;
-  const cbFlag       = state.dailyCircuitBreakerTripped ? "\n🛑 CIRCUIT BREAKER was tripped today — new trades were halted." : "";
-  await sendSMS(
-`🔔 CLOSING${modeFlag} ${new Date().toLocaleDateString()}
+  const statsLines = Object.entries(state.tradeStats).map(([strategy, ts]) => {
+    const total   = ts.wins + ts.losses;
+    if (total === 0) return null;
+    const winRate = ((ts.wins / total) * 100).toFixed(0);
+    const strat   = abbrevStrategy(strategy);
+    const avgWin  = ts.wins   > 0 ? `+$${(ts.totalWinPnL  / ts.wins  ).toFixed(0)}` : "N/A";
+    const avgLoss = ts.losses > 0 ? `-$${Math.abs(ts.totalLossPnL / ts.losses).toFixed(0)}` : "N/A";
+    return `${strat}: ${ts.wins}W/${ts.losses}L (${winRate}%) avg ${avgWin}/${avgLoss}`;
+  }).filter(Boolean).join("\n") || "No closed trades yet";
 
-OPTIONS:
-Trades: ${state.dailyTrades.length} | Open: ${state.openPositions.length}
+  const top3w = winners.slice(0,3).map(p=>`${p.ticker} +${(p.changePct||0).toFixed(1)}%`).join("  ");
+  const top3l = losers .slice(0,3).map(p=>`${p.ticker} ${(p.changePct||0).toFixed(1)}%`).join("  ");
 
-P&L SUMMARY:
-Realized:    ${state.dailyPnL>=0?"+":""}$${state.dailyPnL.toFixed(0)}
-Unrealized:  ${unrealizedPnL>=0?"+":""}$${unrealizedPnL.toFixed(0)} (open positions)
-Today total: ${totalDayPnL>=0?"+":""}$${totalDayPnL.toFixed(0)}
-Week:   ${state.weeklyPnL>=0?"+":""}$${state.weeklyPnL.toFixed(0)}
-Month:  ${state.monthlyPnL>=0?"+":""}$${state.monthlyPnL.toFixed(0)}
-Premium: $${state.totalDeployedToday} | Collateral: $${state.totalCollateralToday}
-${cbFlag}
-WIN RATES:
-${statsLines}
-${blockedTickers ? `\n⚠️ CSP BLOCKED (downtrend): ${blockedTickers}` : ""}${unrealizedLines}
-STOCKS:
-🟢 ${winners.slice(0,3).map(p=>`${p.ticker} +${(p.changePct||0).toFixed(1)}%`).join(", ")||"None"}
-🔴 ${losers.slice(0,3).map(p=>`${p.ticker} ${(p.changePct||0).toFixed(1)}%`).join(", ")||"None"}
+  const part2 =
+    `WIN RATES:\n${statsLines}` +
+    (blockedTickers ? `\n\n⚠️ CSP BLOCKED: ${blockedTickers}` : "") +
+    `\n\n🟢 ${top3w || "None"}` +
+    `\n🔴 ${top3l || "None"}`;
 
-Not financial advice.`
-  );
+  // Part 3: open positions detail — only sent if positions remain after the
+  // DTE≤1 close sweep above. unrealizedLines = "\nOPEN POSITIONS...\nline..."
+  // trimStart() strips the leading \n; no regex needed.
+  const part3 = unrealizedLines ? unrealizedLines.trimStart() : null;
+
+  await sendParts([part1, part2, part3].filter(Boolean));
   state.alertsSent.clear();
   saveState();
   console.log("  ✅ Closing summary sent.");
@@ -3018,55 +3121,88 @@ async function sundaySummary() {
 
   // Check for splits FIRST — must happen before pricing update
   await detectAndFixSplits(portfolioData);
-  await updateAllPricingLevels(portfolioData);
+  const { totalUpdated, targetChanges, skipped } = await updateAllPricingLevels(portfolioData);
 
-  // Win rate summary per strategy
+  // ── PART 1: P&L + win rates + target changes (~400 chars max) ────
   const statsLines = Object.entries(state.tradeStats).map(([strategy, ts]) => {
     const total   = ts.wins + ts.losses;
-    const winRate = total > 0 ? ((ts.wins / total) * 100).toFixed(0) : "N/A";
-    const avgWin  = ts.wins   > 0 ? `+$${(ts.totalWinPnL  / ts.wins).toFixed(0)}`  : "N/A";
-    const avgLoss = ts.losses > 0 ? `-$${Math.abs(ts.totalLossPnL / ts.losses).toFixed(0)}` : "N/A";
-    const exitBreakdown = (ts.earlyExits || 0) + (ts.heldToExpiry || 0) > 0
-      ? ` | early:${ts.earlyExits||0} held:${ts.heldToExpiry||0}`
-      : "";
-    return `${strategy}: ${ts.wins}W/${ts.losses}L (${winRate}%) avg ${avgWin}/${avgLoss} | net $${ts.totalPnL.toFixed(0)}${exitBreakdown}`;
-  }).join("\n") || "No closed trades yet";
+    if (total === 0) return null;
+    const winRate = ((ts.wins / total) * 100).toFixed(0);
+    const strat   = abbrevStrategy(strategy);
+  }).filter(Boolean).join("\n") || "No closed trades yet";
 
-  const lines = portfolioData.map(p => {
-    const price      = p.price || 0;
-    const stop       = getStopLoss(p.ticker, p.stopLoss);
-    const target     = getTarget(p.ticker, p.target);
-    const dynamic    = state.dynamicLevels[p.ticker];
-    const costBasis  = dynamic?.avgCost || p.avgCost;
-    const pnlPct     = costBasis ? (((price - costBasis) / costBasis) * 100).toFixed(1) : "N/A";
-    const distToStop   = stop   ? (((price-stop)/price)*100).toFixed(1)    : "N/A";
-    const distToTarget = target ? (((target-price)/price)*100).toFixed(1)  : "N/A";
-    return `${p.ticker}: $${price.toFixed(2)} (${parseFloat(pnlPct)>=0?"+":""}${pnlPct}%)\n  Stop: $${stop?.toFixed(2)||"N/A"} (${distToStop}% away)${dynamic?.stopLoss?" 📈auto":""}\n  Target: $${target?.toFixed(2)||"N/A"} (${distToTarget}% up)${dynamic?.target?" 🔄updated":""}`;
-  }).join("\n\n");
+  const autoStops   = Object.values(state.dynamicLevels).filter(l => l.stopLoss).length;
+  const autoTargets = Object.values(state.dynamicLevels).filter(l => l.target).length;
 
-  const autoStops   = Object.values(state.dynamicLevels).filter(l=>l.stopLoss).length;
-  const autoTargets = Object.values(state.dynamicLevels).filter(l=>l.target).length;
+  // Target change lines: "✓ ARM  $430→$296 ▼▼" — compact, 2 per row when possible
+  const changeLines = targetChanges.map(c => {
+    const dir = c.newTarget > c.oldTarget ? "▲" : (c.newTarget < c.oldTarget * 0.9 ? "▼▼" : "▼");
+    return `✓ ${c.ticker.padEnd(5)} $${c.oldTarget}→$${c.newTarget} ${dir}`;
+  });
+  const skipLines  = skipped.map(s => `⚠ ${s.ticker} skipped (bad data $${s.newVal} vs $${s.oldVal})`);
+  const targetSection = [...changeLines, ...skipLines].join("\n") || "No target changes";
 
-  await sendSMS(
-`📋 SUNDAY REVIEW
-${new Date().toLocaleDateString("en-US",{month:"long",day:"numeric",year:"numeric"})}
+  const modeFlag = TRADIER.sandbox ? " [SANDBOX]" : "";
+  const part1 =
+    `📋 SUNDAY${modeFlag} ${new Date().toLocaleDateString("en-US",{month:"short",day:"numeric",year:"numeric"})}` +
+    `\nWEEK: ${closingWeeklyPnL>=0?"+":""}$${closingWeeklyPnL.toFixed(0)} | MONTH: ${state.monthlyPnL>=0?"+":""}$${state.monthlyPnL.toFixed(0)}` +
+    `\n\nWIN RATES:\n${statsLines}` +
+    `\n\nAUTO-LEVELS: 🛑 stops:${autoStops} | 🎯 targets:${autoTargets}` +
+    `\n\nTARGETS (${totalUpdated} updated):\n${targetSection}` +
+    `\nNot financial advice.`;
 
-P&L SUMMARY:
-This week:  ${closingWeeklyPnL>=0?"+":""}$${closingWeeklyPnL.toFixed(0)}
-This month: ${state.monthlyPnL>=0?"+":""}$${state.monthlyPnL.toFixed(0)}
+  // ── PART 2: watchlist — near-stop warnings + near-target alerts + movers ──
+  // Focus on names needing attention, not a full 22-ticker dump.
+  // "Near stop" = within 10% of stop. "Near target" = within 10% of target.
+  const nearStop = portfolioData
+    .filter(p => {
+      const stop = getStopLoss(p.ticker, p.stopLoss);
+      return p.price && stop && ((p.price - stop) / p.price) < 0.10;
+    })
+    .sort((a, b) => {
+      const distA = (a.price - getStopLoss(a.ticker, a.stopLoss)) / a.price;
+      const distB = (b.price - getStopLoss(b.ticker, b.stopLoss)) / b.price;
+      return distA - distB;
+    })
+    .map(p => {
+      const stop = getStopLoss(p.ticker, p.stopLoss);
+      const dist = (((p.price - stop) / p.price) * 100).toFixed(1);
+      return `⚠ ${p.ticker} $${p.price.toFixed(0)} → stop $${stop.toFixed(0)} (${dist}% away)`;
+    });
 
-WIN RATES (all-time):
-${statsLines}
+  const nearTarget = portfolioData
+    .filter(p => {
+      const tgt = getTarget(p.ticker, p.target);
+      // Only include stocks trading BELOW their target and within 10% of it.
+      // Without `p.price < tgt`, any stock above its target has a negative
+      // distance which also passes the < 0.10 test — producing alerts on
+      // names that have already exceeded their target, not approaching it.
+      return p.price && tgt && p.price > 0 && p.price < tgt && ((tgt - p.price) / tgt) < 0.10;
+    })
+    .map(p => {
+      const tgt  = getTarget(p.ticker, p.target);
+      const dist = (((tgt - p.price) / tgt) * 100).toFixed(1);
+      return `🎯 ${p.ticker} $${p.price.toFixed(0)} → target $${tgt.toFixed(0)} (${dist}% to go)`;
+    });
 
-AUTO-UPDATES:
-📈 Trailing stops: ${autoStops} | 🔄 Analyst targets: ${autoTargets}
+  const winners = portfolioData.filter(p=>(p.changePct||0)>0).sort((a,b)=>b.changePct-a.changePct);
+  const losers  = portfolioData.filter(p=>(p.changePct||0)<0).sort((a,b)=>a.changePct-b.changePct);
 
-PORTFOLIO:
-${lines}
+  const blockedForPart2 = Object.entries(state.downtrendCount)
+    .filter(([, dc]) => dc.count >= 3)
+    .map(([t, dc]) => `${t}(${dc.count}d)`).join(", ");
 
-📈=auto stop 🔄=updated target
-Not financial advice.`
-  );
+  const part2 =
+    (nearStop.length   ? `NEAR STOP:\n${nearStop.join("\n")}\n\n` : "") +
+    (nearTarget.length ? `NEAR TARGET:\n${nearTarget.join("\n")}\n\n` : "") +
+    (blockedForPart2   ? `🚫 CSP BLOCKED: ${blockedForPart2}\n\n` : "") +
+    // changePct is the daily move from Friday's close — markets are closed
+    // Sunday morning, so this reflects Friday's last session, not the week.
+    `📈 FRIDAY SESSION:\n` +
+    `🟢 ${winners.slice(0,4).map(p=>`${p.ticker} +${(p.changePct||0).toFixed(1)}%`).join("  ")||"None"}\n` +
+    `🔴 ${losers .slice(0,4).map(p=>`${p.ticker} ${(p.changePct||0).toFixed(1)}%`).join("  ")||"None"}`;
+
+  await sendParts([part1, part2]);
   saveState();
   console.log("  ✅ Sunday summary sent.");
 }
@@ -3201,16 +3337,30 @@ cron.schedule("0 8 * * 0",         () => runExclusive("sundaySummary",        su
     await runExclusive("startupDiagnostics", intradayCheck);
     console.log("  🚀 Diagnostics clear. Background crons running.");
 
-    // Send the startup notification AFTER diagnostics — user should only
-    // see "BOT ACTIVE" once the system has verified its state.
-    await sendSMS(`◈ OPTIONS BOT v2 ACTIVE (${modeLabel})
-Portfolio: ${PORTFOLIO.filter(p=>p.optionable).map(p=>p.ticker).join(", ")}
-${PORTFOLIO.length} stocks | ${PORTFOLIO.filter(p=>p.ivProfile==="high").length} high-IV names
-Mandate: $${MANDATE.dailyCapMin}–$${MANDATE.dailyCapMax}/day | $${MANDATE.minPerTrade}–$${MANDATE.maxPerTrade}/trade | ${MANDATE.minReturnPct}%+ return
-Auto-execute: ENABLED | Broker: Tradier ${modeLabel}
-Trailing stops: ENABLED | Analyst targets: AUTO-UPDATE
+    // In live mode, send a separate loud alert first so there is no ambiguity
+    // about which mode is active. A copy-pasted Railway service misconfigured
+    // for live would otherwise start trading without any obvious friction.
+    if (!TRADIER.sandbox) {
+      await sendSMS(
+        `⚠️ LIVE TRADING ACTIVE — REAL MONEY\n` +
+        `Orders will execute on your real Tradier account.\n` +
+        `Verify TRADIER_SANDBOX is intentionally set to false before continuing.\n` +
+        `If this was unintentional, set TRADIER_SANDBOX=true and redeploy immediately.`
+      );
+    }
 
-Schedule: 9:10AM execute | 9:25 targets | 20min monitor | 4PM close | Sun 8AM review`);
+    // Compact startup summary — 22 tickers at full list would approach 1024 chars.
+    // Show counts instead; full portfolio is in the Railway console log above.
+    const highIVCount  = PORTFOLIO.filter(p => p.ivProfile === "high").length;
+    const optionCount  = PORTFOLIO.filter(p => p.optionable).length;
+    await sendSMS(
+      `◈ OPTIONS BOT v2 ACTIVE (${modeLabel})\n` +
+      `${optionCount} stocks (${highIVCount} high-IV) | ${MANDATE.dailyCapMin}–${MANDATE.dailyCapMax}/day\n` +
+      `$${MANDATE.minPerTrade}–${MANDATE.maxPerTrade}/trade | ${MANDATE.minReturnPct}%+ return\n` +
+      `Trailing stops: ON | Analyst targets: AUTO\n` +
+      `9:10 execute | 20min monitor | 4PM close | Sun 8AM review\n` +
+      `Open positions: ${state.openPositions.length}`
+    );
 
   } catch (bootError) {
     console.error("  🛑 BOOT ERROR:", bootError.message);
