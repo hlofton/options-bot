@@ -1628,15 +1628,23 @@ async function generateTrades(portfolioData, preComputedRegime = null) {
     weakSectors, earningsWarnings, allowedStrategies, effectiveMin,
   });
 
-  // max_tokens raised from 1000 -> 3000: with the trade-count cap removed,
-  // a rich-premium day can legitimately produce 8-12+ trades at the new
-  // $400 floor. Each trade object is ~80-100 tokens; 1000 tokens was only
-  // safe for ~8-10 before silent JSON truncation.
+  // max_tokens raised from 1000 → 3000 → 8192.
+  // 3000 was hit Aug 16 2026 after portfolio grew from 17 → 22 tickers:
+  // longer prompt in + more candidates out = response truncated mid-JSON,
+  // producing "Unexpected end of JSON input" on parse. 8192 is the hard
+  // ceiling for this model — safe to set unconditionally.
   const msg = await retryAI(() => ai.messages.create({
     model:      "claude-sonnet-4-6",
-    max_tokens: 3000,
+    max_tokens: 8192,
     messages:   [{ role: "user", content: prompt }],
   }));
+
+  // Detect truncation before attempting JSON parse. A truncated response
+  // always produces "Unexpected end of JSON input" — catching stop_reason
+  // here gives a clear message rather than a cryptic parse failure.
+  if (msg.stop_reason === "max_tokens") {
+    throw new Error("generateTrades response truncated (max_tokens hit) — model hit the 8192 ceiling, reduce prompt size or split the call");
+  }
 
   const allText = msg.content
     .filter(b => b.type === "text")
@@ -1662,7 +1670,7 @@ async function generateTrades(portfolioData, preComputedRegime = null) {
 
   let parsed;
   try {
-    parsed = JSON.parse(match[0]);
+    parsed = JSON.parse(match);
   } catch(e) {
     throw new Error(`JSON parse failed in generateTrades: ${e.message}`);
   }
@@ -2338,7 +2346,7 @@ Include every ticker. Use null for analystTarget if no data found.`;
 
     let results;
     try {
-      results = JSON.parse(match[0]);
+      results = JSON.parse(match);
     } catch(parseErr) {
       console.error("  ✗ JSON parse failed:", parseErr.message);
       return { totalUpdated, targetChanges, skipped };
