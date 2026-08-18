@@ -465,6 +465,13 @@ function isRetryableError(e) {
 // the bot make stop-loss or profit-target decisions on hours-old data.
 const MAX_CACHE_AGE_MS = 30 * 60 * 1000;
 
+// How long after placement before a tracked trade is considered stale if
+// Tradier has no matching position. Tradier has a fill-to-position lag —
+// confirmed Aug 18 2026: trades filled at 9:10 were not visible in the
+// positions endpoint at 9:20. Both stale-cleanup paths must use this same
+// constant so the grace window is consistent across the whole codebase.
+const STALE_GRACE_MS = 60 * 60 * 1000;
+
 // ═══════════════════════════════════════════════════════════════
 // DYNAMIC LEVEL HELPERS — auto trailing stops + analyst targets
 // ═══════════════════════════════════════════════════════════════
@@ -1810,10 +1817,42 @@ async function getGroupedLivePositions() {
   }
 
   if (!positions.length) {
-    // Confirmed by Tradier: the account genuinely has zero positions.
-    // Safe to clean up any tracked trades, since this is verified data,
-    // not a fetch failure masquerading as an empty result.
+    // Tradier confirmed the account is genuinely flat (not a fetch failure —
+    // that case returns null above). Before wiping tracked positions, apply
+    // the same 60-minute grace period used by the stale-leg cleanup below.
+    //
+    // ROOT CAUSE OF AUG 18 2026 BUG: trades filled at 9:10 were wiped at
+    // 9:20 because this branch had NO grace period. Tradier's positions
+    // endpoint lags the orders endpoint by up to 15 minutes after a fill —
+    // a confirmed [] response 10 minutes after placement is NOT proof the
+    // trade doesn't exist. The grace period prevents this race condition by
+    // refusing to purge positions placed within the last 60 minutes.
     if (state.openPositions.length > 0) {
+      const nowMs       = Date.now();
+      const recentTrades = state.openPositions.filter(t => {
+        const ageMs = t.executedAt ? nowMs - new Date(t.executedAt).getTime() : Infinity;
+        return ageMs < STALE_GRACE_MS;
+      });
+
+      if (recentTrades.length > 0) {
+        // Some positions are too recent to trust a flat response — keep them.
+        // Only purge trades that are clearly old enough to be genuinely gone.
+        console.log(`  ⏳ Tradier shows flat but ${recentTrades.length} position(s) placed within ${STALE_GRACE_MS/60000}min — skipping cleanup (fill-to-position lag)`);
+        const oldTrades = state.openPositions.filter(t => {
+          const ageMs = t.executedAt ? nowMs - new Date(t.executedAt).getTime() : Infinity;
+          return ageMs >= STALE_GRACE_MS;
+        });
+        if (oldTrades.length > 0) {
+          const oldList = oldTrades.map(t => `${t.ticker} ${t.strategy}`).join(", ");
+          console.error(`  🧹 STALE: ${oldList} — flat for 60min+, removing`);
+          state.openPositions = state.openPositions.filter(t => !oldTrades.includes(t));
+          await sendSMS(`🧹 STALE CLEANUP\n${oldList}\n\nTradier flat 60min+ since placement — assumed closed.\nVerify P&L manually.\nNot financial advice.`);
+          saveState();
+        }
+        return [];
+      }
+
+      // No recent trades — safe to treat the flat response as authoritative.
       const staleList = state.openPositions.map(t => `${t.ticker} ${t.strategy}`).join(", ");
       console.error(`  🧹 STALE TRACKED POSITIONS: Tradier confirms account is flat but ${state.openPositions.length} trade(s) still tracked — removing: ${staleList}`);
       state.openPositions = [];
@@ -1911,10 +1950,12 @@ Not financial advice.`
   // GRACE PERIOD (Aug 4 2026): Tradier has a fill-to-position lag for
   // multileg condors — legs placed at 9:10 AM weren't visible in the
   // positions endpoint at 9:20 AM, causing all 3 ICs to be wiped.
-  // Trades placed within 60 min are never marked stale.
-  const STALE_GRACE_MS = 60 * 60 * 1000;
-  const nowMs          = Date.now();
-  const trulyGrouped   = new Set(grouped.keys());
+  // Trades placed within STALE_GRACE_MS (module constant) are never
+  // marked stale. Path 1 (account-flat in getGroupedLivePositions) now
+  // uses the same constant — previously it had no grace period at all,
+  // which caused the Aug 18 2026 wipe of 3 freshly-filled positions.
+  const nowMs        = Date.now();
+  const trulyGrouped = new Set(grouped.keys());
 
   const staleTrades = state.openPositions.filter(t => {
     if (trulyGrouped.has(t)) return false;
@@ -3137,6 +3178,9 @@ async function sundaySummary() {
     if (total === 0) return null;
     const winRate = ((ts.wins / total) * 100).toFixed(0);
     const strat   = abbrevStrategy(strategy);
+    const avgWin  = ts.wins   > 0 ? `+$${(ts.totalWinPnL   / ts.wins  ).toFixed(0)}` : "N/A";
+    const avgLoss = ts.losses > 0 ? `-$${Math.abs(ts.totalLossPnL / ts.losses).toFixed(0)}` : "N/A";
+    return `${strat}: ${ts.wins}W/${ts.losses}L (${winRate}%) avg ${avgWin}/${avgLoss} | net $${(ts.totalPnL||0).toFixed(0)}`;
   }).filter(Boolean).join("\n") || "No closed trades yet";
 
   const autoStops   = Object.values(state.dynamicLevels).filter(l => l.stopLoss).length;
