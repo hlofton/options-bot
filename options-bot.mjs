@@ -894,9 +894,33 @@ async function buildOptionsLegs(tradeRec, stockPrice, regime = null) {
           console.log(`  ✗ ${ticker} Iron Condor REJECTED — non-positive credit: $${creditPerContract.toFixed(2)}/contract (call spread ${(sc2.bid-lc2.ask).toFixed(2)}, put spread ${(sp2.bid-lp2.ask).toFixed(2)})`);
           return null;
         }
+
+        // Minimum credit per contract — a condor generating less than $50/contract
+        // requires too many contracts to hit the mandate floor, producing unreasonable
+        // notional exposure. Confirmed Aug 18 2026: QQQ 1-DTE at 3% OTM generated
+        // $6/contract → qty formula produced 42 contracts → $84,000 max loss for
+        // $252 premium. Tradier rejected the execution even though the order was
+        // structurally accepted. Reject thin condors at the source.
+        const MIN_IC_CREDIT_PER_CONTRACT = 50; // $0.50/share minimum
+        if (creditPerContract < MIN_IC_CREDIT_PER_CONTRACT) {
+          console.log(`  ✗ ${ticker} Iron Condor REJECTED — credit $${creditPerContract.toFixed(0)}/contract below $${MIN_IC_CREDIT_PER_CONTRACT} minimum (condor too thin for current DTE/IV)`);
+          return null;
+        }
+
         let qty = Math.max(1, Math.round(MANDATE.minPerTrade / creditPerContract));
         let totalCredit = creditPerContract * qty;
         while (totalCredit > MANDATE.maxPerTrade && qty > 1) { qty--; totalCredit = creditPerContract * qty; }
+
+        // Hard cap on contract count — prevents the sizing formula from
+        // producing an unreasonable quantity on unexpectedly low credit.
+        // 10 contracts is a practical ceiling for a sandbox/live account
+        // running this mandate size ($250–$1200/day).
+        const MAX_IC_CONTRACTS = 10;
+        if (qty > MAX_IC_CONTRACTS) {
+          qty = MAX_IC_CONTRACTS;
+          totalCredit = creditPerContract * qty;
+          console.log(`  ⚠ ${ticker} Iron Condor: qty capped at ${MAX_IC_CONTRACTS} contracts (formula produced ${Math.round(MANDATE.minPerTrade / creditPerContract)}, credit $${creditPerContract.toFixed(0)}/contract)`);
+        }
         if (totalCredit < MANDATE.minPerTrade * 0.5) {
           console.log(`  ✗ ${ticker} Iron Condor REJECTED — credit too low even at floor qty: $${creditPerContract.toFixed(2)}/contract × ${qty} = $${totalCredit.toFixed(0)} (need ≥ $${(MANDATE.minPerTrade*0.5).toFixed(0)})`);
           return null;
