@@ -8,7 +8,7 @@
 //             AI selects direction based on momentum and technicals
 //             No premium selling — no collateral required
 // Mandate   : $300–$500/trade · $1,000–$3,000/day
-//             10–15% OTM · 14–21 DTE · 100% profit target
+//             10–15% OTM · 14–21 DTE · trail from +20%
 //             50% stop loss · 2 DTE time stop
 // Execution : Tradier API (sandbox or live)
 // Alerts    : Pushover push notifications
@@ -94,7 +94,10 @@ const MANDATE = {
   timeDTE:               2,  // time stop — close all positions at 2 DTE regardless
 
   // ── Quality filters ───────────────────────────────────────
-  minReturnPct:      100,  // AI must project 100%+ upside for the trade to be proposed
+  minReturnPct:       20,  // AI must project 20%+ upside — matches trail activation threshold.
+                           // Once a position hits +20% the trail takes over and lets it run
+                           // as far as momentum carries it (tightening at +50% and +100%).
+                           // Previously 100% — too aggressive, filtered out most valid setups.
   minSetupScore:       7,  // minimum AI conviction score out of 10
 
   // ── Risk management ───────────────────────────────────────
@@ -1369,6 +1372,8 @@ BUDGET: $${effectiveMin}–$${MANDATE.maxPerTrade} per trade | $${MANDATE.dailyC
 OPTION SPECS: ${MANDATE.targetMinDTE}–${MANDATE.targetMaxDTE} DTE | ${MANDATE.otmPctMin}–${MANDATE.otmPctMax}% OTM
 EXIT RULES: Trail activates at +${MANDATE.trailActivationPct}% gain (${MANDATE.trailWidthTier1}% trail, tightens to ${MANDATE.trailWidthTier2}% at +50%, ${MANDATE.trailWidthTier3}% at +100%) | Stop: -${MANDATE.stopLossGracePct}% first ${MANDATE.gracePeriodHours}h, then -${MANDATE.stopLossPct}%, tightens to -${MANDATE.stopLossLatePct}% at ≤${MANDATE.lateStopDTE} DTE | Close at ${MANDATE.timeDTE} DTE
 
+RETURN TARGET: Minimum ${MANDATE.minReturnPct}%+ projected gain. Trail handles the upside — a setup that can reach +20% and has momentum is worth taking. You do not need to project 100% to propose a trade.
+
 MARKET REGIME: ${regime.label}
 SPY Today: ${spyChange.toFixed(2)}%
 VIX: ${regime.vix?.note || "unknown"}
@@ -1396,18 +1401,18 @@ Return ONLY a valid JSON array. Include 2-4 genuine setups or [] if nothing comp
     "ticker": "NVDA",
     "strategy": "Long Call",
     "targetCost": 380,
-    "targetReturnPct": "100",
+    "targetReturnPct": "20",
     "setupScore": 8,
     "direction": "bullish",
     "reasoning": "NVDA breaking above resistance. AI capex tailwind. Strong semis sector.",
     "catalyst": "AI spending cycle",
-    "exitTarget": "Close at 100% gain or 50% loss or 2 DTE"
+    "exitTarget": "Trail activates at +20%, tightens at +50% and +100% — bot manages exit automatically"
   }
 ]
 
 strategy must be exactly "Long Call" or "Long Put".
 targetCost is total dollars to spend ($${effectiveMin}–$${MANDATE.maxPerTrade}).
-targetReturnPct should be "100".
+targetReturnPct is your projected minimum gain — must be "${MANDATE.minReturnPct}" or higher.
 Do NOT suggest: Cash Secured Put, Iron Condor, Bull Call Spread, Bear Put Spread.
 Do NOT suggest tickers with earnings within 5 days.
 Max ${MANDATE.maxOpenPositions - state.openPositions.length} more trades (open slot limit).`;
@@ -2622,8 +2627,8 @@ async function opportunisticScan() {
 ${candidate.ticker} ${(stockData.changePct>=0?"▲":"▼")}${Math.abs(stockData.changePct).toFixed(1)}% move triggered scan
 
 ${candidate.strategy}
-Cost: $${legs.cost} | Target: ${candidate.targetReturnPct}%
-Rationale: ${candidate.rationale}
+Cost: $${legs.cost} | Min return: ${candidate.targetReturnPct}%
+Rationale: ${candidate.reasoning}
 
 Deployed today: $${state.totalDeployedToday} / $${MANDATE.dailyCapMax}
 Not financial advice.`
@@ -2762,7 +2767,7 @@ async function closingSession() {
       console.log(`  ✅ Expiry-risk close sweep complete (${expiringGroups.length} position(s) processed).`);
       firstFetchGroups = null; // positions changed — must re-fetch for unrealized snapshot
     } else {
-      console.log("  ✓ No DTE≤1 positions — nothing to force-close.");
+      console.log(`  ✓ No DTE≤${MANDATE.timeDTE} positions — nothing to force-close.`);
     }
   }
 
@@ -2799,7 +2804,7 @@ async function closingSession() {
     `\nUnrealized: ${unrealizedPnL   >=0?"+":""}$${unrealizedPnL.toFixed(0)}${state.openPositions.length>0?" (open positions)":""}` +
     `\nTotal:      ${totalDayPnL     >=0?"+":""}$${totalDayPnL.toFixed(0)}` +
     `\nWeek: ${state.weeklyPnL>=0?"+":""}$${state.weeklyPnL.toFixed(0)} | Month: ${state.monthlyPnL>=0?"+":""}$${state.monthlyPnL.toFixed(0)}` +
-    `\nPremium: $${state.totalDeployedToday} | Collateral: $${state.totalCollateralToday}` +
+    `\nSpent today: $${state.totalDeployedToday}` +
     `${cbFlag}\nNot financial advice.`;
 
   // Part 2: win rates + blocked tickers + top 3 movers each side (~300 chars max)
@@ -2823,7 +2828,7 @@ async function closingSession() {
 
   const part2 =
     `WIN RATES:\n${statsLines}` +
-    (blockedTickers ? `\n\n⚠️ CSP BLOCKED: ${blockedTickers}` : "") +
+    (blockedTickers ? `\n\n📉 DOWNTREND (informational): ${blockedTickers}` : "") +
     `\n\n🟢 ${top3w || "None"}` +
     `\n🔴 ${top3l || "None"}`;
 
