@@ -829,7 +829,38 @@ async function buildOptionsLegs(tradeRec, stockPrice, regime = null) {
         // Math.floor means if 1 contract costs more than targetCost, we still
         // buy 1 (Math.max(1,0)=1) and spend more than the AI intended.
         // The mandate range check below catches anything outside $300-$1000.
-        const costPerContract = lcStrike.ask * 100;
+
+        // ── REAL-TIME QUOTE REFRESH ──────────────────────────────────
+        // The option chain was fetched seconds-to-minutes ago. For near-money
+        // options (2-7% OTM) a $0.10 move in the ask changes cost by $10-20
+        // per contract. Fetch a fresh single-symbol quote right now — before
+        // the order is placed — to get the actual current market price.
+        // In live mode this also gives us the bid for midpoint limit pricing.
+        let freshAsk  = lcStrike.ask;
+        let freshBid  = lcStrike.bid ?? 0;
+        let limitPrice = null;
+        try {
+          const freshQuotes = await getOptionQuote(lcStrike.symbol);
+          const fq = freshQuotes[0];
+          if (fq?.ask > 0) {
+            if (fq.ask !== lcStrike.ask) {
+              console.log(`  🔄 ${ticker} Long Call: ask refreshed $${lcStrike.ask} → $${fq.ask} (live quote)`);
+            }
+            freshAsk = fq.ask;
+            freshBid = fq.bid ?? 0;
+          }
+        } catch(e) {
+          console.log(`  ⚠ ${ticker} Long Call: live quote failed (${e.message}) — using chain price $${lcStrike.ask}`);
+        }
+        // Limit price for live orders: midpoint of fresh bid/ask, rounded to $0.05
+        // Midpoint avoids paying the full spread; $0.05 rounding matches most options markets.
+        if (!TRADIER.sandbox && freshBid > 0 && freshAsk > freshBid) {
+          const mid = (freshBid + freshAsk) / 2;
+          limitPrice = parseFloat((Math.round(mid / 0.05) * 0.05).toFixed(2));
+          console.log(`  💲 ${ticker} Long Call: limit price $${limitPrice} (mid of bid $${freshBid} / ask $${freshAsk})`);
+        }
+
+        const costPerContract = freshAsk * 100;
         if (costPerContract <= 0) return null;
         const qty       = Math.max(1, Math.floor(tradeRec.targetCost / costPerContract));
         const totalCost = costPerContract * qty;
@@ -842,13 +873,14 @@ async function buildOptionsLegs(tradeRec, stockPrice, regime = null) {
         }
 
         const dte = Math.ceil((new Date(lcExp + "T00:00:00Z") - todayUTC) / (1000*60*60*24));
-        console.log(`  📐 Long Call: ${ticker} $${lcStrike.strike}C exp ${lcExp} (${dte} DTE, ${((lcStrike.strike/stockPrice-1)*100).toFixed(1)}% OTM) × ${qty} @ $${lcStrike.ask} = $${totalCost.toFixed(0)}`);
+        console.log(`  📐 Long Call: ${ticker} $${lcStrike.strike}C exp ${lcExp} (${dte} DTE, ${((lcStrike.strike/stockPrice-1)*100).toFixed(1)}% OTM) × ${qty} @ $${freshAsk} = $${totalCost.toFixed(0)}`);
 
         return {
           expiration: lcExp,
           legs:       [{ symbol: lcStrike.symbol, side: "buy_to_open" }],
           cost:       Math.round(totalCost),
-          maxProfit:  null,  // theoretical — depends on how far stock moves
+          limitPrice,           // fresh midpoint for live limit orders; null in sandbox
+          maxProfit:  null,
           quantity:   qty,
           isCredit:   false,
           strike:     lcStrike.strike,
@@ -878,7 +910,30 @@ async function buildOptionsLegs(tradeRec, stockPrice, regime = null) {
           return null;
         }
 
-        const costPerContractP = lpStrike.ask * 100;
+        // ── REAL-TIME QUOTE REFRESH ──────────────────────────────────
+        let freshAskP  = lpStrike.ask;
+        let freshBidP  = lpStrike.bid ?? 0;
+        let limitPriceP = null;
+        try {
+          const freshQuotesP = await getOptionQuote(lpStrike.symbol);
+          const fqp = freshQuotesP[0];
+          if (fqp?.ask > 0) {
+            if (fqp.ask !== lpStrike.ask) {
+              console.log(`  🔄 ${ticker} Long Put: ask refreshed $${lpStrike.ask} → $${fqp.ask} (live quote)`);
+            }
+            freshAskP = fqp.ask;
+            freshBidP = fqp.bid ?? 0;
+          }
+        } catch(e) {
+          console.log(`  ⚠ ${ticker} Long Put: live quote failed (${e.message}) — using chain price $${lpStrike.ask}`);
+        }
+        if (!TRADIER.sandbox && freshBidP > 0 && freshAskP > freshBidP) {
+          const midP = (freshBidP + freshAskP) / 2;
+          limitPriceP = parseFloat((Math.round(midP / 0.05) * 0.05).toFixed(2));
+          console.log(`  💲 ${ticker} Long Put: limit price $${limitPriceP} (mid of bid $${freshBidP} / ask $${freshAskP})`);
+        }
+
+        const costPerContractP = freshAskP * 100;
         if (costPerContractP <= 0) return null;
         const qtyP       = Math.max(1, Math.floor(tradeRec.targetCost / costPerContractP));
         const totalCostP = costPerContractP * qtyP;
@@ -891,13 +946,14 @@ async function buildOptionsLegs(tradeRec, stockPrice, regime = null) {
         }
 
         const dteP = Math.ceil((new Date(lpExp + "T00:00:00Z") - todayUTC) / (1000*60*60*24));
-        console.log(`  📐 Long Put: ${ticker} $${lpStrike.strike}P exp ${lpExp} (${dteP} DTE, ${((1-lpStrike.strike/stockPrice)*100).toFixed(1)}% OTM) × ${qtyP} @ $${lpStrike.ask} = $${totalCostP.toFixed(0)}`);
+        console.log(`  📐 Long Put: ${ticker} $${lpStrike.strike}P exp ${lpExp} (${dteP} DTE, ${((1-lpStrike.strike/stockPrice)*100).toFixed(1)}% OTM) × ${qtyP} @ $${freshAskP} = $${totalCostP.toFixed(0)}`);
 
         return {
           expiration: lpExp,
           legs:       [{ symbol: lpStrike.symbol, side: "buy_to_open" }],
           cost:       Math.round(totalCostP),
-          maxProfit:  Math.round(lpStrike.strike * 100 * qtyP), // max profit if stock goes to zero
+          limitPrice: limitPriceP,  // fresh midpoint for live limit orders; null in sandbox
+          maxProfit:  Math.round(lpStrike.strike * 100 * qtyP),
           quantity:   qtyP,
           isCredit:   false,
           strike:     lpStrike.strike,
