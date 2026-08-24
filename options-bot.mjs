@@ -7,8 +7,8 @@
 // Strategies: Long Call (bullish) | Long Put (bearish)
 //             AI selects direction based on momentum and technicals
 //             No premium selling — no collateral required
-// Mandate   : $300–$500/trade · $1,000–$3,000/day
-//             10–15% OTM · 14–21 DTE · trail from +20%
+// Mandate   : $300–$1,000/trade · $1,000–$3,000/day
+//             2–7% OTM · 14–21 DTE · trail from +20%
 //             50% stop loss · 2 DTE time stop
 // Execution : Tradier API (sandbox or live)
 // Alerts    : Pushover push notifications
@@ -67,14 +67,17 @@ const MANDATE = {
   dailyCapMin:      1000,  // minimum to deploy per day ($)
   dailyCapMax:      3000,  // maximum to deploy per day ($)
   minPerTrade:       300,  // minimum cost per option purchase ($)
-  maxPerTrade:       500,  // maximum cost per option purchase ($)
-  minPerTradeLive:   300,  // same floor in live — no collateral, so $300 is real exposure
+  maxPerTrade:      1000,  // maximum cost per option purchase ($) — raised from $500
+  minPerTradeLive:   300,  // same floor in live
 
   // ── Option selection ─────────────────────────────────────
   targetMinDTE:       14,  // buy options with at least 14 DTE — enough time for move
   targetMaxDTE:       21,  // cap at 21 DTE — beyond this theta is too slow to decay
-  otmPctMin:          10,  // minimum 10% OTM — cheap enough to buy multiples
-  otmPctMax:          15,  // maximum 15% OTM — beyond this delta too low to move
+  otmPctMin:           2,  // minimum 2% OTM — close to the money, high delta (0.40–0.48)
+  otmPctMax:           7,  // maximum 7% OTM — still meaningful delta, moves with the stock
+                           // Previously 10–15% OTM — delta too low (0.15–0.25), needed huge
+                           // moves to reach the +20% trail activation. At 2–7% OTM a 5–8%
+                           // move in the underlying produces a 20–40% gain on the option.
 
   // ── Exit rules ───────────────────────────────────────────
   // Upside: trailing stop activates at +20% gain.
@@ -102,9 +105,12 @@ const MANDATE = {
 
   // ── Risk management ───────────────────────────────────────
   maxOpenPositions:    6,  // max concurrent option positions across all tickers
-  dailyMaxLoss:     1500,  // circuit breaker: halt new trades if day P&L hits -$1,500
-                           // lower than v2 ($2,000) because losses here are fast —
-                           // a bought option can go to zero in a single bad session
+  dailyMaxLoss:     2000,  // circuit breaker: halt new trades if day P&L hits -$2,000.
+                           // Raised from $1,500 when maxPerTrade raised to $1,000 —
+                           // at $1,500 with 3 × $1,000 positions hitting the -50% stop,
+                           // the breaker fired at a normal bad day, not an exceptional one.
+                           // $2,000 is meaningfully below the $3,000 daily cap and gives
+                           // the bot room to work without triggering on routine volatility.
 
   // ── Trailing stops (underlying stock monitoring) ──────────
   trailPctHighIV:     15,
@@ -153,10 +159,10 @@ const PORTFOLIO = [
   { ticker:"CRWD", name:"CrowdStrike",            shares:0,    avgCost:187.23, stopLoss:165.00, target:235.00,  sector:"Cyber",     ivProfile:"high",   optionable:true,  earningsDate:"2026-11-25" },  // Q2 FY2027 est. 4-for-1 split completed Jul 2026
 
   // ── CRYPTO ADJACENT / HIGH-IV FINTECH ────────────────────
-  // COIN: $148 Aug 14 2026. 52-wk $139–$402. Near the low — premium
-  //   is elevated precisely because of that range. Q2 missed badly
-  //   (EPS -$1.36 vs -$0.01 est); Q3 earnings Oct 29 2026 (confirmed).
-  //   Treat as income-only: IV too extreme for directional spread.
+  // COIN: $148 Aug 14 2026. 52-wk $139–$402. High-IV crypto-adjacent name.
+  //   Q2 missed badly (EPS -$1.36 vs -$0.01 est); Q3 earnings Oct 29 2026
+  //   (confirmed). Strong directional mover — COIN Long Call placed Aug 2026
+  //   closed at +123% gain. Treat with respect: moves 5-10%+ on BTC headlines.
   { ticker:"COIN", name:"Coinbase Global",        shares:0, avgCost:148.00, stopLoss:118.00, target:220.00,  sector:"Crypto/Fintech", ivProfile:"high",   optionable:true, earningsDate:"2026-10-29" }, // Q3 2026 confirmed
   // HOOD: $95.75 Aug 14 2026. 52-wk $63–$153. Post-Q2 selloff (reported
   //   Jul 29). Crypto/retail correlated — moves with COIN. Record Q2
@@ -171,7 +177,7 @@ const PORTFOLIO = [
   //   >$2B; data-center royalties doubled Q1 FY2027 (ended Jun 2026).
   //   P/E 178x — priced for AI dominance. Q2 FY2027 est Nov 5 2026
   //   (ARM fiscal year ends March; Q2 FY2027 = Jul–Sep 2026).
-  //   High IV post-selloff bounce; income-only given beta and valuation.
+  //   High IV post-selloff bounce; valid for directional long options in v3.
   { ticker:"ARM",  name:"Arm Holdings",           shares:0, avgCost:340.00, stopLoss:268.00, target:430.00,  sector:"AI/Semis",  ivProfile:"high",   optionable:true, earningsDate:"2026-11-05" }, // Q2 FY2027 est.
   // MRVL: ~$187 Aug 14 2026 (bounced from $163 July low; spiked to $220s
   //   on new AI memory platform). EARNINGS AUG 27 2026 (CONFIRMED) — that
@@ -819,11 +825,17 @@ async function buildOptionsLegs(tradeRec, stockPrice, regime = null) {
           return null;
         }
 
-        // Quantity: how many contracts fit within the budget
+        // Quantity: how many contracts fit within the budget.
+        // Math.floor means if 1 contract costs more than targetCost, we still
+        // buy 1 (Math.max(1,0)=1) and spend more than the AI intended.
+        // The mandate range check below catches anything outside $300-$1000.
         const costPerContract = lcStrike.ask * 100;
         if (costPerContract <= 0) return null;
         const qty       = Math.max(1, Math.floor(tradeRec.targetCost / costPerContract));
         const totalCost = costPerContract * qty;
+        if (qty === 1 && totalCost > tradeRec.targetCost * 1.2) {
+          console.log(`  ⚠ ${ticker} Long Call: AI targetCost $${tradeRec.targetCost} but cheapest option is $${totalCost} — proceeding if within mandate range`);
+        }
         if (totalCost < MANDATE.minPerTrade || totalCost > MANDATE.maxPerTrade) {
           console.log(`  ✗ ${ticker} Long Call REJECTED — ${qty} contract(s) × $${costPerContract.toFixed(0)} = $${totalCost.toFixed(0)} outside $${MANDATE.minPerTrade}–$${MANDATE.maxPerTrade} range`);
           return null;
@@ -857,7 +869,7 @@ async function buildOptionsLegs(tradeRec, stockPrice, regime = null) {
         const lpChain = lpExp === validExp ? chain : await getOptionChain(ticker, lpExp);
         const lpPuts  = lpChain.filter(o => o.option_type === "put").sort((a,b) => b.strike - a.strike);
 
-        // Target strike: 10–15% OTM (below current price for puts)
+        // Target strike: 2–7% OTM (below current price for puts)
         const maxStrikeP = stockPrice * (1 - MANDATE.otmPctMin / 100);
         const minStrikeP = stockPrice * (1 - MANDATE.otmPctMax / 100);
         const lpStrike   = lpPuts.find(p => p.strike <= maxStrikeP && p.strike >= minStrikeP && p.ask > 0);
@@ -870,6 +882,9 @@ async function buildOptionsLegs(tradeRec, stockPrice, regime = null) {
         if (costPerContractP <= 0) return null;
         const qtyP       = Math.max(1, Math.floor(tradeRec.targetCost / costPerContractP));
         const totalCostP = costPerContractP * qtyP;
+        if (qtyP === 1 && totalCostP > tradeRec.targetCost * 1.2) {
+          console.log(`  ⚠ ${ticker} Long Put: AI targetCost $${tradeRec.targetCost} but cheapest option is $${totalCostP} — proceeding if within mandate range`);
+        }
         if (totalCostP < MANDATE.minPerTrade || totalCostP > MANDATE.maxPerTrade) {
           console.log(`  ✗ ${ticker} Long Put REJECTED — ${qtyP} contract(s) × $${costPerContractP.toFixed(0)} = $${totalCostP.toFixed(0)} outside $${MANDATE.minPerTrade}–$${MANDATE.maxPerTrade} range`);
           return null;
@@ -1116,9 +1131,10 @@ function getMarketRegime(spyChangePct, vix = null) {
       label:            "EXTREME FEAR",
       allowDirectional: false,
       allowCondors:     false,
-      allowCSP:         true,   // CSP is valid in extreme fear — IV peaks, stocks oversold,
-                                 // put strikes below already-depressed prices. This is when
-                                 // premium selling is most advantageous. Use wider OTM (7%+).
+      allowCSP:         false, // v2 field — unused in v3
+                                // In v3: EXTREME FEAR = buy puts. Options are expensive
+                                // (high IV) but the directional move justifies the cost.
+                                // AI prompt tells the model to favour puts in this regime.
       skipTrading:      false,
       wingMultiplier:   2.0,
       otmPct:           7,
@@ -1158,10 +1174,13 @@ function getMarketRegime(spyChangePct, vix = null) {
     };
   }
 
-  // VIX modifier for wing width and OTM distance
-  const vixWingBonus  = (vix && vix > 20) ? 0.5  : 0;   // wider wings when IV elevated
-  const vixOtmBonus   = (vix && vix > 20) ? 1    : 0;   // extra 1% OTM cushion when fearful
-  const lowVIX        = (vix && vix < 15);               // thin premium — be selective
+  // v2 condor fields — computed for regime object shape consistency but
+  // not read by v3's generateTrades (which only uses regime.label,
+  // regime.skipTrading, and regime.vix). Retained to avoid breaking
+  // the regime object shape if v2 strategies are restored in future.
+  const vixWingBonus  = (vix && vix > 20) ? 0.5  : 0;
+  const vixOtmBonus   = (vix && vix > 20) ? 1    : 0;
+  const lowVIX        = (vix && vix < 15);
 
   if (spyChangePct > 1.0) {
     return {
@@ -3072,7 +3091,7 @@ async function sundaySummary() {
   const part2 =
     (nearStop.length   ? `NEAR STOP:\n${nearStop.join("\n")}\n\n` : "") +
     (nearTarget.length ? `NEAR TARGET:\n${nearTarget.join("\n")}\n\n` : "") +
-    (blockedForPart2   ? `🚫 CSP BLOCKED: ${blockedForPart2}\n\n` : "") +
+    (blockedForPart2   ? `📉 DOWNTREND (informational): ${blockedForPart2}\n\n` : "") +
     // changePct is the daily move from Friday's close — markets are closed
     // Sunday morning, so this reflects Friday's last session, not the week.
     `📈 FRIDAY SESSION:\n` +
@@ -3093,7 +3112,7 @@ const modeLabel = TRADIER.sandbox ? "SANDBOX" : "LIVE";
 console.log(`\n🚀 Options Trading Bot v3 (${modeLabel} MODE)`);
 console.log(`📋 Portfolio: ${PORTFOLIO.map(p=>p.ticker).join(", ")}`);
 console.log(`📊 ${PORTFOLIO.length} stocks | ${PORTFOLIO.filter(p=>p.optionable).length} optionable`);
-console.log(`◎  Mandate: $${MANDATE.dailyCapMin}–$${MANDATE.dailyCapMax}/day | $${MANDATE.minPerTrade}–$${MANDATE.maxPerTrade}/trade | 14-21 DTE | 10-15% OTM | Trail from +${MANDATE.trailActivationPct}% | Stop -${MANDATE.stopLossPct}% | ${MANDATE.timeDTE} DTE exit`);
+console.log(`◎  Mandate: $${MANDATE.dailyCapMin}–$${MANDATE.dailyCapMax}/day | $${MANDATE.minPerTrade}–$${MANDATE.maxPerTrade}/trade | 14-21 DTE | ${MANDATE.otmPctMin}–${MANDATE.otmPctMax}% OTM | Trail from +${MANDATE.trailActivationPct}% | Stop -${MANDATE.stopLossPct}% | ${MANDATE.timeDTE} DTE exit`);
 console.log(`🔗 Tradier: ${TRADIER.baseUrl}`);
 console.log("⏰ Schedule:");
 console.log("   Mon–Fri 9:10 AM — Morning scan + execute");
