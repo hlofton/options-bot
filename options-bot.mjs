@@ -3357,10 +3357,10 @@ cron.schedule("0 8 * * 0",         () => runExclusive("sundaySummary",        su
     const highIVCount  = PORTFOLIO.filter(p => p.ivProfile === "high").length;
     const optionCount  = PORTFOLIO.filter(p => p.optionable).length;
     await sendSMS(
-      `◈ OPTIONS BOT v2 ACTIVE (${modeLabel})\n` +
-      `${optionCount} stocks (${highIVCount} high-IV) | ${MANDATE.dailyCapMin}–${MANDATE.dailyCapMax}/day\n` +
-      `$${MANDATE.minPerTrade}–${MANDATE.maxPerTrade}/trade | ${MANDATE.minReturnPct}%+ return\n` +
-      `Trailing stops: ON | Analyst targets: AUTO\n` +
+      `◈ OPTIONS BOT v3 ACTIVE (${modeLabel})\n` +
+      `${optionCount} stocks (${highIVCount} high-IV) | $${MANDATE.dailyCapMin}–$${MANDATE.dailyCapMax}/day\n` +
+      `$${MANDATE.minPerTrade}–$${MANDATE.maxPerTrade}/trade | ${MANDATE.minReturnPct}%+ return | ${MANDATE.otmPctMin}–${MANDATE.otmPctMax}% OTM\n` +
+      `Strategy: Long Calls & Puts | Trail from +${MANDATE.trailActivationPct}% | Stop -${MANDATE.stopLossPct}%\n` +
       `9:10 execute | 20min monitor | 4PM close | Sun 8AM review\n` +
       `Open positions: ${state.openPositions.length}`
     );
