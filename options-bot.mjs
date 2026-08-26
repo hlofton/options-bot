@@ -66,9 +66,11 @@ const MANDATE = {
   // ── Capital ──────────────────────────────────────────────
   dailyCapMin:      1000,  // minimum to deploy per day ($)
   dailyCapMax:      3000,  // maximum to deploy per day ($)
-  minPerTrade:       300,  // minimum cost per option purchase ($)
-  maxPerTrade:      1000,  // maximum cost per option purchase ($) — raised from $500
-  minPerTradeLive:   300,  // same floor in live
+  minPerTrade:       250,  // minimum cost per option purchase ($) — lowered from $300
+                           // $300 was rejecting valid $290-$299 setups on a $6 difference.
+                           // Quality is controlled by setupScore, not an arbitrary floor.
+  maxPerTrade:      1000,  // maximum cost per option purchase ($)
+  minPerTradeLive:   250,  // same floor in live
 
   // ── Option selection ─────────────────────────────────────
   targetMinDTE:       14,  // buy options with at least 14 DTE — enough time for move
@@ -98,19 +100,20 @@ const MANDATE = {
 
   // ── Quality filters ───────────────────────────────────────
   minReturnPct:       20,  // AI must project 20%+ upside — matches trail activation threshold.
-                           // Once a position hits +20% the trail takes over and lets it run
-                           // as far as momentum carries it (tightening at +50% and +100%).
-                           // Previously 100% — too aggressive, filtered out most valid setups.
-  minSetupScore:       7,  // minimum AI conviction score out of 10
+  minSetupScore:       8,  // minimum AI conviction score out of 10 — raised from 7.
+                           // Live data: losing trades had scores of 7. Winning trades (COIN
+                           // +123%, PLTR +22%) had scores of 8-9. Score 7 was too permissive
+                           // in a weak market — quality gate needs to be tighter.
 
   // ── Risk management ───────────────────────────────────────
-  maxOpenPositions:    6,  // max concurrent option positions across all tickers
+  maxOpenPositions:    4,  // max concurrent option positions — reduced from 6.
+                           // With 6 positions open in a weak market all 6 lose simultaneously.
+                           // 4 positions keeps exposure manageable and forces selectivity.
+  broadWeaknessThreshold: 4, // if this many tickers have consecutive stop losses, the AI
+                           // prompt is flagged with bearish bias — favour puts over calls.
+                           // Based on live data: when 4+ names hit STOP_LOSS on the same day,
+                           // the broad market is in a sustained downtrend, not isolated weakness.
   dailyMaxLoss:     2000,  // circuit breaker: halt new trades if day P&L hits -$2,000.
-                           // Raised from $1,500 when maxPerTrade raised to $1,000 —
-                           // at $1,500 with 3 × $1,000 positions hitting the -50% stop,
-                           // the breaker fired at a normal bad day, not an exceptional one.
-                           // $2,000 is meaningfully below the $3,000 daily cap and gives
-                           // the bot room to work without triggering on routine volatility.
 
   // ── Trailing stops (underlying stock monitoring) ──────────
   trailPctHighIV:     15,
@@ -234,12 +237,10 @@ const state = {
                             // Kept in v3 for future strategy use and historical continuity.
   _lastResetMonth:      null,
   jobRunning:           null,
-  totalCollateralToday: 0,  // Buying power COMMITTED today — collateral for CSPs
-                            // (strike × 100 × qty), credit for condors, debit for spreads.
-                            // Separate from totalDeployedToday (premium only) so the buying
-                            // power gate and AI prompt reflect real capital committed, not
-                            // just the small premium received. A 10-contract NVDA CSP at $180
-                            // commits $18,000 of buying power while adding only ~$300 premium.
+  totalCollateralToday: 0,  // Total capital committed today across all trades.
+                            // For long options: the full cost paid (no collateral concept).
+                            // Tracked alongside totalDeployedToday for the buying power gate
+                            // and AI prompt accuracy.
   dailyCircuitBreakerTripped: false, // Set true when realized+unrealized P&L hits -dailyMaxLoss.
                             // Halts all new trades for the rest of the day. Resets each morning.
   _saveStateAlertSent:  false, // One-time flag — prevent spamming Pushover on every saveState
@@ -1400,19 +1401,20 @@ async function retryAI(fn, maxAttempts = 3, delayMs = 2000) {
 // ═══════════════════════════════════════════════════════════════
 
 const HIGH_BETA_TICKERS = ["NVDA", "TSLA", "CRWD", "COIN", "HOOD", "ARM"];
-// In v3 (long calls/puts), high-beta names are actually ATTRACTIVE for
-// directional trades — bigger moves = bigger option gains. However they
-// require higher conviction (score ≥ 8) because the same volatility that
-// makes them rewarding also makes wrong-way bets lose 50% fast.
+// In v3 (long calls/puts), high-beta names are attractive for directional
+// trades but require higher conviction given their speed of loss.
 
 // Minimum AI conviction score required to place a trade.
-// Higher bar for high-beta names given their speed of loss.
-const LONG_OPTIONS_MIN_SCORE    = 7;  // standard tickers
-const HIGH_BETA_MIN_SCORE       = 8;  // high-beta tickers — require extra conviction
+// Raised from 7→8 (standard) and 8→9 (high-beta) based on live data:
+// losing trades had scores of 7, winning trades (COIN +123%, PLTR +22%)
+// had scores of 8-9. Higher bar means fewer trades, better trades.
+const LONG_OPTIONS_MIN_SCORE = 8;  // standard tickers
+const HIGH_BETA_MIN_SCORE    = 9;  // high-beta: NVDA, TSLA, CRWD, COIN, HOOD, ARM
 
 // ── PROMPT BUILDER ────────────────────────────────────────────
 function buildTradePrompt({ today, optionable, regime, spyChange, sectorHealth,
-                            weakSectors, earningsWarnings, effectiveMin }) {
+                            weakSectors, earningsWarnings, effectiveMin,
+                            broadWeakness = false, weakTickers = [] }) {
   const priceLines = optionable.map(p => {
     const health       = sectorHealth[p.ticker];
     const sectorNote   = !health?.healthy ? " ⚠️ SECTOR WEAK" : "";
@@ -1462,10 +1464,26 @@ ${priceLines}
 
 ${weakSectors.length > 0 ? "⚠️ WEAK SECTORS:\n" + weakSectors.join("\n") + "\n" : ""}${earningsWarnings.length ? "⚠️ EARNINGS WITHIN 5 DAYS (skip — IV inflated for buying):\n" + earningsWarnings.join(", ") : "No earnings this week"}
 
+${broadWeakness
+  ? (() => {
+      const freshWeak    = weakTickers.filter(t => parseInt(t.match(/\((\d+)d\)/)?.[1]||0) <= 3);
+      const extendedWeak = weakTickers.filter(t => parseInt(t.match(/\((\d+)d\)/)?.[1]||0) >  3);
+      const severity     = weakTickers.length >= 7 ? "SEVERE" : weakTickers.length >= 5 ? "MODERATE" : "MILD";
+      return `🔴 BROAD MARKET WEAKNESS (${severity}) — ${weakTickers.length} tickers in downtrend\n` +
+        `Fresh weakness (1-3 days) — BEST PUT CANDIDATES: ${freshWeak.join(", ") || "none"}\n` +
+        `Extended downtrend (4+ days) — AVOID FOR PUTS (mean-reversion risk): ${extendedWeak.join(", ") || "none"}\n\n` +
+        `RULES IN THIS ENVIRONMENT:\n` +
+        `- Favour PUTS on fresh weakness names (1-3 days) — trend just starting\n` +
+        `- Avoid puts on extended names (4+ days) — likely to bounce\n` +
+        `- Long Calls require score ≥ 9 AND genuine momentum AGAINST the trend\n` +
+        `- Score 8 is not enough to go long when ${weakTickers.length} names are in downtrend`;
+    })()
+  : "✅ No broad weakness — both calls and puts valid based on individual setups"}
+
 BUY CALL when: uptrend, above support, positive momentum, bullish catalyst, healthy sector
 BUY PUT when: downtrend, below resistance, negative momentum, bearish catalyst, weak sector
 
-SCORING (setupScore 1-10). Only include score ≥ 7. High-beta tickers require ≥ 8.
+SCORING (setupScore 1-10). Only include score ≥ ${LONG_OPTIONS_MIN_SCORE}. High-beta tickers require ≥ ${HIGH_BETA_MIN_SCORE}.
 HIGH-BETA (${HIGH_BETA_TICKERS.join(", ")}): fast movers, great upside — but fast losses too.
 IV NOTE: VIX > 20 means expensive options. Only highest-conviction setups. Prefer 10% OTM over 15%.
 
@@ -1495,7 +1513,7 @@ Max ${MANDATE.maxOpenPositions - state.openPositions.length} more trades (open s
 
 // ── TRADE NORMALISER + FILTER ──────────────────────────────────
 // Pure function — testable without AI call.
-function normaliseAndFilterTrades(parsed, effectiveMin = MANDATE.minPerTrade) {
+function normaliseAndFilterTrades(parsed, effectiveMin = MANDATE.minPerTrade, { broadWeakness = false } = {}) {
   if (!Array.isArray(parsed)) return [];
 
   const normalised = parsed.map(t => ({
@@ -1532,9 +1550,19 @@ function normaliseAndFilterTrades(parsed, effectiveMin = MANDATE.minPerTrade) {
         return false;
       }
     }
-    const minScore = HIGH_BETA_TICKERS.includes(t.ticker) ? HIGH_BETA_MIN_SCORE : LONG_OPTIONS_MIN_SCORE;
+    // Score threshold: base is LONG_OPTIONS_MIN_SCORE (8) for standard, HIGH_BETA_MIN_SCORE (9) for high-beta.
+    // When broadWeakness is active, Long Calls require score ≥ 9 regardless of ticker —
+    // the prompt tells the AI not to propose calls below 9 in a weak market, but the AI
+    // may not always comply. This enforces it at the filter level.
+    const isCall   = t.strategy === "Long Call";
+    const minScore = HIGH_BETA_TICKERS.includes(t.ticker)
+      ? HIGH_BETA_MIN_SCORE
+      : (broadWeakness && isCall ? 9 : LONG_OPTIONS_MIN_SCORE);
     if (t.setupScore < minScore) {
-      console.log(`  🚫 Blocked ${t.ticker} ${t.strategy} — score ${t.setupScore} below ${minScore} minimum`);
+      const reason = broadWeakness && isCall && minScore === 9
+        ? `broad weakness active — calls need score ≥ 9, got ${t.setupScore}`
+        : `score ${t.setupScore} below ${minScore} minimum`;
+      console.log(`  🚫 Blocked ${t.ticker} ${t.strategy} — ${reason}`);
       return false;
     }
     if (state.openPositions.length >= MANDATE.maxOpenPositions) {
@@ -1550,13 +1578,11 @@ async function generateTrades(portfolioData, preComputedRegime = null) {
   const today       = new Date().toLocaleDateString("en-US",{weekday:"long",month:"long",day:"numeric",year:"numeric"});
   const effectiveMin = TRADIER.sandbox ? MANDATE.minPerTrade : MANDATE.minPerTradeLive;
 
-  let spyChange, regime;
+  let spyChange, regime, broadWeakness = false, weakTickers = [];
   if (preComputedRegime) {
-    ({ spyChange, regime } = preComputedRegime);
+    ({ spyChange, regime, broadWeakness = false, weakTickers = [] } = preComputedRegime);
     console.log(`  📊 Using pre-computed regime: ${regime.label} (passed from caller)`);
   } else {
-    // Fallback: compute regime independently — fetch VIX so the regime
-    // has the same quality as when called from morningSession.
     spyChange = getSpyChangeFromPortfolio(portfolioData);
     const fallbackVix = await fetchVIX();
     regime    = getMarketRegime(spyChange, fallbackVix);
@@ -1591,6 +1617,7 @@ async function generateTrades(portfolioData, preComputedRegime = null) {
   const prompt = buildTradePrompt({
     today, optionable, regime, spyChange, sectorHealth,
     weakSectors, earningsWarnings, effectiveMin,
+    broadWeakness, weakTickers,
   });
 
   // max_tokens raised from 1000 → 3000 → 8192.
@@ -1640,7 +1667,7 @@ async function generateTrades(portfolioData, preComputedRegime = null) {
     throw new Error(`JSON parse failed in generateTrades: ${e.message}`);
   }
 
-  return normaliseAndFilterTrades(parsed, effectiveMin);
+  return normaliseAndFilterTrades(parsed, effectiveMin, { broadWeakness });
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -2458,6 +2485,21 @@ async function morningSession() {
   const regimeNow = getMarketRegime(spyNow, vix);
   console.log(`  📊 Regime: ${regimeNow.label} | SPY: ${spyNow.toFixed(2)}%`);
 
+  // ── BROAD MARKET WEAKNESS DETECTION ──────────────────────────
+  // SPY at 0.00% on open looks neutral but the portfolio may be screaming
+  // bearish. Count tickers that have hit stop loss on consecutive days —
+  // if >= broadWeaknessThreshold names are in downtrend, the market is
+  // structurally weak regardless of SPY's single-day print.
+  // This flag is passed to the AI prompt to favour puts over calls.
+  const weakTickers = Object.entries(state.downtrendCount)
+    .filter(([, dc]) => dc.count >= 1)
+    .sort((a, b) => b[1].count - a[1].count)
+    .map(([t, dc]) => `${t}(${dc.count}d)`);
+  const broadWeakness = weakTickers.length >= MANDATE.broadWeaknessThreshold;
+  if (broadWeakness) {
+    console.log(`  ⚠ BROAD WEAKNESS: ${weakTickers.length} tickers in downtrend — ${weakTickers.join(', ')} — flagging AI to favour puts`);
+  }
+
   // Effective minimum per trade: sandbox can experiment with lower floor ($250);
   // live trading needs $600 to survive commissions and slippage.
   const effectiveMin = TRADIER.sandbox ? MANDATE.minPerTrade : MANDATE.minPerTradeLive;
@@ -2471,7 +2513,7 @@ async function morningSession() {
   while (scanAttempt < 3) {
     scanAttempt++;
     try {
-      trades = await generateTrades(portfolioData, { spyChange: spyNow, regime: regimeNow });
+      trades = await generateTrades(portfolioData, { spyChange: spyNow, regime: regimeNow, broadWeakness, weakTickers });
       break; // success — empty result is valid, don't retry
     } catch(e) {
       if (!isRetryableError(e) || scanAttempt === 3) {
@@ -2644,10 +2686,19 @@ async function opportunisticScan() {
     return;
   }
 
+  // Compute broad weakness from current state — same logic as morningSession.
+  // downtrendCount is updated by each intradayCheck so by 11:02/1:02/3:02 PM
+  // it reflects today's stop loss events accurately.
+  const oppWeakTickers = Object.entries(state.downtrendCount)
+    .filter(([, dc]) => dc.count >= 1)
+    .sort((a, b) => b[1].count - a[1].count)
+    .map(([t, dc]) => `${t}(${dc.count}d)`);
+  const oppBroadWeakness = oppWeakTickers.length >= MANDATE.broadWeaknessThreshold;
+
   // Generate a trade recommendation using the same AI + mandate logic
   let trades = [];
   try {
-    trades = await generateTrades(portfolioData, { spyChange: spyNow, regime });
+    trades = await generateTrades(portfolioData, { spyChange: spyNow, regime, broadWeakness: oppBroadWeakness, weakTickers: oppWeakTickers });
   } catch(e) {
     console.log(`  ✗ Opportunistic scan generation failed: ${e.message}`);
     return;
@@ -2783,7 +2834,7 @@ async function intradayCheck() {
         dc.count++;
         dc.lastDate = todayStr;
         if (dc.count >= 3) {
-          console.log(`  ⚠ ${stock.ticker} downtrend: ${dc.count} consecutive STOP_LOSS days — CSP blocked`);
+          console.log(`  ⚠ ${stock.ticker} downtrend: ${dc.count} consecutive STOP_LOSS days — bearish bias active if broad weakness threshold met`);
         }
       }
     } else {
