@@ -12,7 +12,7 @@
 //             50% stop loss · 2 DTE time stop
 // Execution : Tradier API (sandbox or live)
 // Alerts    : Pushover push notifications
-// Schedule  : 9:10AM execute | 20min monitor | 4PM close | Sun review
+// Schedule  : 9:10AM execute | 5min monitor | 4PM close | Sun review
 // Upgraded from v2 (CSP/IC) Aug 2026 — see archive/v2-csp-ic/
 // ================================================================
 //
@@ -85,9 +85,12 @@ const MANDATE = {
   // Upside: trailing stop activates at +20% gain.
   // Trail tightens as profit grows — see monitorOpenPositions for tiers.
   trailActivationPct:   20,  // trail kicks in once position gains 20%
-  trailWidthTier1:      15,  // +20–50% peak: 15% pullback from peak closes
-  trailWidthTier2:      12,  // +50–100% peak: 12% pullback from peak closes
-  trailWidthTier3:      10,  // +100%+ peak: 10% pullback from peak closes
+  trailWidthTier1:      10,  // +20–50% peak: 10% pullback from peak closes (was 15%)
+  trailWidthTier2:       8,  // +50–100% peak: 8% pullback from peak closes (was 12%)
+  trailWidthTier3:       6,  // +100%+ peak: 6% pullback from peak closes (was 10%)
+                             // Tightened alongside 5-minute monitoring interval (Aug 2026).
+                             // At 5-min checks, whipsaw risk is lower — tighter trails
+                             // lock in more profit without frequently closing healthy positions.
 
   // Downside: tiered stop loss — grace period early, tighten late.
   stopLossPct:          50,  // standard stop after 48h (option halved)
@@ -3224,7 +3227,7 @@ console.log(`🔗 Tradier: ${TRADIER.baseUrl}`);
 console.log("⏰ Schedule:");
 console.log("   Mon–Fri 9:10 AM — Morning scan + execute");
 console.log("   Mon–Fri 9:25 AM — Analyst targets refresh");
-console.log("   Mon–Fri 9:30–4PM — Position monitor + trailing stops every 20 min");
+console.log("   Mon–Fri 9:30–4PM — Position monitor + trailing stops every 5 min");
 console.log("   Mon–Fri 11:02,1:02,3:02 — Opportunistic scan (5%+ moves only)");
 console.log("   Mon–Fri 4:05 PM — Closing summary");
 console.log("   Sunday 8:00 AM  — Full portfolio review + auto-update all levels\n");
@@ -3309,7 +3312,7 @@ async function reconcileOrphanedPositions() {
 // Schedules
 cron.schedule("10 9 * * 1-5",      () => runExclusive("morningSession",       morningSession),       { timezone:"America/New_York" });
 cron.schedule("25 9 * * 1-5",      () => runExclusive("updateAnalystTargets", updateAnalystTargets), { timezone:"America/New_York" });
-cron.schedule("*/20 9-16 * * 1-5", () => runExclusive("intradayCheck",        intradayCheck),        { timezone:"America/New_York" });
+cron.schedule("*/5 9-16 * * 1-5",  () => runExclusive("intradayCheck",        intradayCheck),        { timezone:"America/New_York" });
 
 // Opportunistic mid-day scan: 11:02 AM, 1:02 PM, 3:02 PM ET Mon-Fri.
 // CONFIRMED BUG (Jul 27 2026 live log): this used to fire at :00 exactly,
@@ -3361,7 +3364,7 @@ cron.schedule("0 8 * * 0",         () => runExclusive("sundaySummary",        su
       `${optionCount} stocks (${highIVCount} high-IV) | $${MANDATE.dailyCapMin}–$${MANDATE.dailyCapMax}/day\n` +
       `$${MANDATE.minPerTrade}–$${MANDATE.maxPerTrade}/trade | ${MANDATE.minReturnPct}%+ return | ${MANDATE.otmPctMin}–${MANDATE.otmPctMax}% OTM\n` +
       `Strategy: Long Calls & Puts | Trail from +${MANDATE.trailActivationPct}% | Stop -${MANDATE.stopLossPct}%\n` +
-      `9:10 execute | 20min monitor | 4PM close | Sun 8AM review\n` +
+      `9:10 execute | 5min monitor | 4PM close | Sun 8AM review\n` +
       `Open positions: ${state.openPositions.length}`
     );
 
