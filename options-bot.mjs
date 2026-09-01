@@ -84,7 +84,12 @@ const MANDATE = {
   // ── Exit rules ───────────────────────────────────────────
   // Upside: trailing stop activates at +20% gain.
   // Trail tightens as profit grows — see monitorOpenPositions for tiers.
-  trailActivationPct:   20,  // trail kicks in once position gains 20%
+  trailActivationPct:   15,  // trail kicks in once position gains 15% — lowered from 20%.
+                             // At 2-7% OTM, a 15% option gain requires ~2-3% move in the
+                             // underlying. Captures profitable windows that 20% missed in
+                             // live trading — HOOD, NVDA, META all decayed without the trail
+                             // ever activating. Floor at +15% with 10% tier-1 trail means
+                             // worst exit is +5% on any position that reaches the threshold.
   trailWidthTier1:      10,  // +20–50% peak: 10% pullback from peak closes (was 15%)
   trailWidthTier2:       8,  // +50–100% peak: 8% pullback from peak closes (was 12%)
   trailWidthTier3:       6,  // +100%+ peak: 6% pullback from peak closes (was 10%)
@@ -1502,7 +1507,7 @@ Return ONLY a valid JSON array. Include 2-4 genuine setups or [] if nothing comp
     "direction": "bullish",
     "reasoning": "NVDA breaking above resistance. AI capex tailwind. Strong semis sector.",
     "catalyst": "AI spending cycle",
-    "exitTarget": "Trail activates at +20%, tightens at +50% and +100% — bot manages exit automatically"
+    "exitTarget": "Trail activates at +${MANDATE.trailActivationPct}%, tightens at +50% and +100% — bot manages exit automatically"
   }
 ]
 
