@@ -769,7 +769,10 @@ async function closeOptionsPosition(position) {
       if (!orderId) {
         console.error(`  ✗ Close attempt ${attempt}: no order ID returned`);
       } else if (status && status !== "ok") {
-        console.error(`  ✗ Close attempt ${attempt}: order ${orderId} rejected (status: ${status})`);
+        // Tradier includes reason_description on rejected orders — log it so
+        // the cause is visible in Railway logs rather than just "status: rejected"
+        const reason = data?.order?.reason_description ?? status;
+        console.error(`  ✗ Close attempt ${attempt}: order ${orderId} rejected — ${reason}`);
         lastOrderId = orderId;
       } else {
         lastOrderId = orderId;
@@ -2191,16 +2194,18 @@ async function monitorOpenPositions(groups, underlyingPriceMap = {}) {
                 break;
               }
               if (orderId) lastOrderId = orderId;
-              console.error(`  ✗ Multileg close attempt ${attempt}: ${status || "no order ID"}`);
+              const mlReason = data?.order?.reason_description ?? status ?? "no order ID";
+              console.error(`  ✗ Multileg close attempt ${attempt}: ${mlReason}`);
             } catch(e) {
               console.error(`  ✗ Multileg close attempt ${attempt}: ${e.message}`);
             }
             if (attempt < 3) await new Promise(r => setTimeout(r, attempt * 5000));
           }
-          closeResult = { success };
+          closeResult = { success, error: success ? null : (data?.order?.reason_description ?? "Close order rejected after 3 attempts") };
         }
         const allClosed = closeResult.success;
         if (allClosed) {
+          ourTrade.closeFailureCount = 0; // reset on success
           state.dailyPnL   += currentPnL;
           state.weeklyPnL  += currentPnL;
           state.monthlyPnL += currentPnL;
@@ -2265,11 +2270,50 @@ ${exitNote}
 Not financial advice.`
           );
         } else {
-          // Close order rejected after retries — do NOT remove from tracking.
-          // The position remains monitored and the close will be retried next cycle.
+          // Track consecutive close failures on the position object.
+          // ourTrade is a direct reference to state.openPositions entry —
+          // mutating it here persists automatically via saveState().
+          // Each failed CYCLE counts as one failure (each cycle already
+          // retries 3 times internally). MRVL failed 10+ consecutive cycles
+          // on Sep 1 2026 — the bot only sent a generic retry message each
+          // time, giving no indication of the severity.
+          ourTrade.closeFailureCount = (ourTrade.closeFailureCount ?? 0) + 1;
+          const failureCount  = ourTrade.closeFailureCount;
           const failureReason = closeResult.error || "close order rejected after retries";
-          console.error(`  🚨 CLOSE FAILURE: ${ourTrade.ticker} ${ourTrade.strategy} (${g.positions.length} legs) failed to close. Reason: ${failureReason}. Remaining tracked for retry.`);
-          await sendSMS(`🚨 CLOSE FAILURE\n${ourTrade.ticker} ${ourTrade.strategy} (${g.positions.length} legs)\nReason: ${failureReason.slice(0, 200)}\nBot will retry next cycle.`);
+
+          console.error(`  🚨 CLOSE FAILURE #${failureCount}: ${ourTrade.ticker} ${ourTrade.strategy} — ${failureReason}`);
+
+          if (failureCount === 3) {
+            // First escalation — 3 consecutive failed cycles (~15 min at 5-min checks)
+            await sendSMS(
+              `🚨 CRITICAL — PERSISTENT CLOSE FAILURE\n` +
+              `${ourTrade.ticker} ${ourTrade.strategy}\n` +
+              `Reason: ${failureReason.slice(0, 200)}\n\n` +
+              `Failed to close ${failureCount} times in a row.\n` +
+              `Current P&L: ${currentPnL>=0?"+":""}$${currentPnL.toFixed(0)} (${currentPct.toFixed(1)}%)\n\n` +
+              `⚠️ MANUAL INTERVENTION MAY BE REQUIRED\n` +
+              `Log into Tradier and close this position manually if the bot cannot.\n` +
+              `Not financial advice.`
+            );
+          } else if (failureCount > 3 && failureCount % 5 === 0) {
+            // Reminder every 5 cycles after the first escalation — avoids
+            // spamming on every cycle while still alerting every ~25 minutes
+            await sendSMS(
+              `🚨 STILL FAILING — Close failure #${failureCount}\n` +
+              `${ourTrade.ticker} ${ourTrade.strategy}\n` +
+              `P&L: ${currentPnL>=0?"+":""}$${currentPnL.toFixed(0)} (${currentPct.toFixed(1)}%) | DTE:${dte}\n` +
+              `Reason: ${failureReason.slice(0, 150)}\n` +
+              `Check Tradier — manual close may be needed.`
+            );
+          } else {
+            // Normal retry notification for first 2 failures
+            await sendSMS(
+              `🚨 CLOSE FAILURE #${failureCount}\n` +
+              `${ourTrade.ticker} ${ourTrade.strategy}\n` +
+              `Reason: ${failureReason.slice(0, 200)}\n` +
+              `Bot will retry next cycle.`
+            );
+          }
         }
         // Small pause between DIFFERENT positions closing in the same monitoring
         // cycle — same burst-risk precaution, applied at the position level too.
