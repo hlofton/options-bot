@@ -126,6 +126,12 @@ const MANDATE = {
   // ── Trailing stops (underlying stock monitoring) ──────────
   trailPctHighIV:     15,
   trailPctMediumIV:   10,
+  reconstructedGraceHours: 2, // Grace period for orphan-reconstructed positions.
+                           // Full 48h grace doesn't apply — position may have been
+                           // held for hours before reconstruction. 2h gives just
+                           // enough buffer for Tradier to confirm before stops apply.
+                           // Confirmed Sep 3 2026: GOOGL LP held at -60% for hours
+                           // because reconstruction gave it 20h grace from date_acquired.
 };
 
 // ── INDEX TICKERS ─────────────────────────────────────────────
@@ -454,6 +460,7 @@ function abbrevStrategy(s) {
   return s
     .replace("Long Call",        "LC")
     .replace("Long Put",         "LP")
+    .replace("Short Call",       "SC")
     .replace("Cash Secured Put", "CSP")
     .replace("Iron Condor",      "IC")
     .replace("Bull Call Spread", "BCS")
@@ -1755,10 +1762,20 @@ function rebuildTradeFromPositions(underlying, legs) {
     const hasPut  = legs.some(p => /[A-Z]+\d+P\d/.test(p.symbol));
 
     let strategy;
-    if (hasCall && hasPut && legs.length >= 4) strategy = "Iron Condor";
-    else if (hasCall && legs.length >= 2)      strategy = "Bull Call Spread";
-    else if (hasPut  && legs.length >= 2)      strategy = "Bear Put Spread";
-    else if (hasPut  && legs.length === 1)     strategy = "Cash Secured Put";
+    if (hasCall && hasPut && legs.length >= 4)                        strategy = "Iron Condor";
+    else if (hasCall && legs.length >= 2 && legs.some(p=>p.quantity<0)) strategy = "Bull Call Spread";
+    else if (hasPut  && legs.length >= 2 && legs.some(p=>p.quantity<0)) strategy = "Bear Put Spread";
+    // Single-leg positions: quantity sign determines direction.
+    // quantity > 0 = long (bought) → Long Call / Long Put (debit, v3 strategy)
+    // quantity < 0 = short (sold)  → CSP / Short Call (credit, v2 strategy)
+    // Previously ALL single-leg puts defaulted to "Cash Secured Put" — causing
+    // Long Puts to be misidentified, wrong strategy label in logs, and confusion
+    // about which stop logic applies. Confirmed Sep 3 2026: GOOGL Long Put
+    // showed as "GOOGL CSP" after orphan reconstruction.
+    else if (hasCall && legs.length === 1 && legs[0].quantity > 0) strategy = "Long Call";
+    else if (hasCall && legs.length === 1 && legs[0].quantity < 0) strategy = "Short Call";
+    else if (hasPut  && legs.length === 1 && legs[0].quantity > 0) strategy = "Long Put";
+    else if (hasPut  && legs.length === 1 && legs[0].quantity < 0) strategy = "Cash Secured Put";
     else return null;
 
     const reconstructedLegs = legs.map(p => ({
@@ -1779,11 +1796,12 @@ function rebuildTradeFromPositions(underlying, legs) {
     const isCredit     = netCostBasis < 0;
     const executedCost = Math.abs(Math.round(netCostBasis));
 
-    // Use Tradier's date_acquired so the grace period ages correctly.
-    // Fallback to 2h ago to ensure the trade is past the grace window.
-    const dateAcquired = legs[0]?.date_acquired
-      ? new Date(legs[0].date_acquired).toISOString()
-      : new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString();
+    // Set executedAt so the grace period expires in MANDATE.reconstructedGraceHours (2h)
+    // from now — NOT from the original date_acquired. The full 48h grace period is for
+    // freshly placed trades; a reconstructed position could have been held for hours
+    // before the bot lost track of it, so standard stops should apply quickly.
+    const graceOffsetMs = (MANDATE.gracePeriodHours - MANDATE.reconstructedGraceHours) * 60 * 60 * 1000;
+    const dateAcquired  = new Date(Date.now() - graceOffsetMs).toISOString();
 
     return {
       ticker: underlying, strategy, legs: reconstructedLegs,
@@ -2726,7 +2744,30 @@ async function opportunisticScan() {
     return;
   }
 
-  console.log(`  🎯 Found ${exceptionalMoves.length} exceptional move(s): ${exceptionalMoves.map(p=>`${p.ticker} ${p.changePct.toFixed(1)}%`).join(", ")}`);
+  // Block tickers with earnings within 7 days — buying options the day
+  // before earnings is extremely risky. IV crush after the report destroys
+  // value even if direction is correct. Confirmed Sep 3 2026: PANW was
+  // placed by morning session despite EARNINGS alert firing same morning.
+  // Using 7 days here (vs 5 in normaliseAndFilterTrades) for extra safety
+  // in the opportunistic path which is already trading on momentum.
+  const todayUTCms = new Date(new Date().toISOString().slice(0,10) + "T00:00:00Z").getTime();
+  const safeMovers = exceptionalMoves.filter(p => {
+    const earningsDate = EARNINGS[p.ticker];
+    if (!earningsDate) return true;
+    const daysOut = Math.ceil((new Date(earningsDate + "T00:00:00Z") - todayUTCms) / (1000*60*60*24));
+    if (daysOut >= 0 && daysOut <= 7) {
+      console.log(`  ⏭ ${p.ticker} skipped — earnings in ${daysOut} day(s), too close for opportunistic trade`);
+      return false;
+    }
+    return true;
+  });
+
+  if (!safeMovers.length) {
+    console.log(`  ✓ All exceptional movers blocked by earnings proximity. Nothing to trade.`);
+    return;
+  }
+
+  console.log(`  🎯 ${safeMovers.length} safe mover(s) after earnings filter: ${safeMovers.map(p=>`${p.ticker} ${p.changePct.toFixed(1)}%`).join(", ")}`);
 
   // Re-check regime and sector health — same rules as morning session
   const spyNow = getSpyChangeFromPortfolio(portfolioData);
@@ -2756,9 +2797,9 @@ async function opportunisticScan() {
     return;
   }
 
-  // Only take the SINGLE best-scoring trade from an exceptional mover
+  // Only take the SINGLE best-scoring trade from a safe exceptional mover
   const candidate = trades
-    .filter(t => exceptionalMoves.some(m => m.ticker === t.ticker))
+    .filter(t => safeMovers.some(m => m.ticker === t.ticker))
     .sort((a,b) => b.setupScore - a.setupScore)[0];
 
   if (!candidate) {
@@ -2839,16 +2880,33 @@ async function intradayCheck() {
   }
 
   // ── DAILY CIRCUIT BREAKER EVALUATION ─────────────────────────
-  // Check combined realized + unrealized P&L against the daily max-loss
-  // limit. Fires once — subsequent cycles stay quiet until reset at 9:10 AM.
   if (!state.dailyCircuitBreakerTripped) {
     const unrealizedPnL = groups
       .filter(g => g.valid && state.openPositions.includes(g.ourTrade))
       .reduce((sum, g) => sum + computePnL(g.ourTrade, g).currentPnL, 0);
-    const totalExposure = state.dailyPnL + unrealizedPnL;
+
+    // Include positions still in grace (not yet confirmed by Tradier).
+    // These can't be monitored directly but represent real capital at risk.
+    // Conservative estimate: -50% of cost (standard stop threshold).
+    const nowMs = Date.now();
+    const unconfirmedExposure = state.openPositions
+      .filter(p => !groups.some(g => g.ourTrade === p))
+      .reduce((sum, p) => {
+        const hoursHeld = p.executedAt ? (nowMs - new Date(p.executedAt).getTime()) / 3.6e6 : 999;
+        if (hoursHeld < MANDATE.gracePeriodHours) {
+          return sum + (p.executedCost * -MANDATE.stopLossPct / 100);
+        }
+        return sum;
+      }, 0);
+
+    if (unconfirmedExposure < 0) {
+      console.log(`  ⚠ ${state.openPositions.filter(p=>!groups.some(g=>g.ourTrade===p)).length} unconfirmed position(s) — conservative exposure estimate: $${unconfirmedExposure.toFixed(0)} added to circuit breaker`);
+    }
+
+    const totalExposure = state.dailyPnL + unrealizedPnL + unconfirmedExposure;
     if (totalExposure <= -MANDATE.dailyMaxLoss) {
       state.dailyCircuitBreakerTripped = true;
-      console.error(`  🛑 CIRCUIT BREAKER: realized $${state.dailyPnL.toFixed(0)} + unrealized $${unrealizedPnL.toFixed(0)} = $${totalExposure.toFixed(0)} ≤ -$${MANDATE.dailyMaxLoss}`);
+      console.error(`  🛑 CIRCUIT BREAKER: realized $${state.dailyPnL.toFixed(0)} + unrealized $${unrealizedPnL.toFixed(0)} + unconfirmed est. $${unconfirmedExposure.toFixed(0)} = $${totalExposure.toFixed(0)} ≤ -$${MANDATE.dailyMaxLoss}`);
       await sendSMS(
         `🛑 DAILY CIRCUIT BREAKER TRIPPED\n` +
         `Realized P&L:   $${state.dailyPnL.toFixed(0)}\n` +
