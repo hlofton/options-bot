@@ -88,9 +88,10 @@ const MANDATE = {
                              // At 2-7% OTM, a 15% option gain requires ~2-3% move in the
                              // underlying. Captures profitable windows that 20% missed in
                              // live trading — HOOD, NVDA, META all decayed without the trail
-                             // ever activating. Floor at +15% with 10% tier-1 trail means
-                             // worst exit is +5% on any position that reaches the threshold.
-  trailWidthTier1:      10,  // +20–50% peak: 10% pullback from peak closes (was 15%)
+                             // ever activating. Floor at +15% with 5% tier-1 trail means
+                             // minimum exit is +10% on any position that reaches the threshold.
+  trailWidthTier1:       5,  // +15–50% peak: 5% pullback closes (was 10%)
+                             // Floor at activation = +10% minimum exit. Sep 4 2026.
   trailWidthTier2:       8,  // +50–100% peak: 8% pullback from peak closes (was 12%)
   trailWidthTier3:       6,  // +100%+ peak: 6% pullback from peak closes (was 10%)
                              // Tightened alongside 5-minute monitoring interval (Aug 2026).

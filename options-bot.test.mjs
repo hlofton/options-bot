@@ -264,7 +264,7 @@ describe("computePnL — long options (isCredit: false)", () => {
 describe("trailing stop logic", () => {
   // Inline the trailing stop logic to test it independently
   const MANDATE = {
-    trailActivationPct: 20, trailWidthTier1: 10,
+    trailActivationPct: 15, trailWidthTier1: 5,
     trailWidthTier2: 8, trailWidthTier3: 6,
     stopLossPct: 50, stopLossGracePct: 70, stopLossLatePct: 35,
     gracePeriodHours: 48, lateStopDTE: 7, timeDTE: 2,
@@ -285,22 +285,21 @@ describe("trailing stop logic", () => {
          :                                        -MANDATE.stopLossPct;
   }
 
-  test("trail does not activate below +20%", () => {
-    assert.ok(!shouldTrailClose(19, 10));  // peak +19%, now +10%
-    assert.ok(!shouldTrailClose(15, 5));   // peak +15%, now +5%
+  test("trail does not activate below +15%", () => {
+    assert.ok(!shouldTrailClose(14, 10));  // peak +14%, now +10% — not yet active
+    assert.ok(!shouldTrailClose(10, 5));   // peak +10%, now +5% — not yet active
   });
 
-  test("trail activates at +20% peak", () => {
-    // Peak +20%, trail width 15% — closes below +5%
-    assert.ok(!shouldTrailClose(20, 11));  // +11% — above trail floor (+10%)
-    assert.ok(shouldTrailClose(20, 9));    // +9% — below trail floor (+10%)
+  test("trail does not activate below +15%", () => {
+    assert.ok(!shouldTrailClose(14, 10));  // peak +14% — not yet active
+    assert.ok(!shouldTrailClose(10, 5));   // peak +10% — not yet active
   });
 
-  test("tier 1 trail: +20-50% peak, 10% width", () => {
-    assert.equal(getTrailWidth(35), 10);
-    // Peak +35%, closes below +25%
-    assert.ok(!shouldTrailClose(35, 26)); // above floor
-    assert.ok(shouldTrailClose(35, 24));  // below floor
+  test("tier 1 trail: +15-50% peak, 5% width", () => {
+    assert.equal(getTrailWidth(35), 5);
+    // Peak +35%, closes below +30%
+    assert.ok(!shouldTrailClose(35, 31)); // above floor
+    assert.ok(shouldTrailClose(35, 29));  // below floor
   });
 
   test("tier 2 trail: +50-100% peak, 8% width", () => {
@@ -317,10 +316,10 @@ describe("trailing stop logic", () => {
     assert.ok(shouldTrailClose(120, 113));
   });
 
-  test("trail locks in minimum +20% gain (floor scenario)", () => {
-    // Peak +20%, trail width 10% — floor is +10%
-    assert.ok(shouldTrailClose(20, 9));   // below floor → closes
-    assert.ok(!shouldTrailClose(20, 11)); // above floor → holds
+  test("trail locks in minimum +10% gain (floor scenario)", () => {
+    // Peak +15%, trail width 5% — floor is +10%
+    assert.ok(shouldTrailClose(15, 9));    // below floor → closes
+    assert.ok(!shouldTrailClose(15, 11)); // above floor → holds
   });
 
   test("stop threshold: grace period (first 48h)", () => {
