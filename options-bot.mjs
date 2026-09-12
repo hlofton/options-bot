@@ -73,13 +73,24 @@ const MANDATE = {
   minPerTradeLive:   250,  // same floor in live
 
   // ── Option selection ─────────────────────────────────────
-  targetMinDTE:       14,  // buy options with at least 14 DTE — enough time for move
-  targetMaxDTE:       21,  // cap at 21 DTE — beyond this theta is too slow to decay
-  otmPctMin:           2,  // minimum 2% OTM — close to the money, high delta (0.40–0.48)
-  otmPctMax:           7,  // maximum 7% OTM — still meaningful delta, moves with the stock
-                           // Previously 10–15% OTM — delta too low (0.15–0.25), needed huge
-                           // moves to reach the +20% trail activation. At 2–7% OTM a 5–8%
-                           // move in the underlying produces a 20–40% gain on the option.
+  targetMinDTE:        7,  // buy options with at least 7 DTE — reduced from 14.
+  targetMaxDTE:       14,  // cap at 14 DTE — reduced from 21.
+                           // Sep 2026: winning trades made moves within first week.
+                           // Losing trades bled theta for 2+ weeks. At 7-14 DTE:
+                           // cheaper, faster decisions, theta enforces discipline.
+  otmPctMin:           8,  // minimum 8% OTM — raised from 2%.
+  otmPctMax:          12,  // maximum 12% OTM — raised from 7%.
+                           // Sep 2026: 2-7% OTM too sensitive — 3% adverse move
+                           // turned a 2% OTM option into a -40% position within hours.
+
+  // ── Market condition gate ─────────────────────────────────
+  // Only trade when market offers genuine edge. Sitting in cash is valid.
+  // Either gate condition being true allows the morning session to run.
+  minVIXToTrade:      18,  // VIX must be ≥ 18 for vol to be meaningful.
+                           // Below 18 = compressed vol = options overpriced.
+                           // The market is complacent; setups are poor.
+  earningsWindowDays: 14,  // Hard catalyst gate: if any ticker has earnings
+                           // within 14 days, a specific event exists to trade.
 
   // ── Exit rules ───────────────────────────────────────────
   // Upside: trailing stop activates at +20% gain.
@@ -115,13 +126,18 @@ const MANDATE = {
                            // in a weak market — quality gate needs to be tighter.
 
   // ── Risk management ───────────────────────────────────────
-  maxOpenPositions:    4,  // max concurrent option positions — reduced from 6.
-                           // With 6 positions open in a weak market all 6 lose simultaneously.
-                           // 4 positions keeps exposure manageable and forces selectivity.
-  broadWeaknessThreshold: 4, // if this many tickers have consecutive stop losses, the AI
-                           // prompt is flagged with bearish bias — favour puts over calls.
-                           // Based on live data: when 4+ names hit STOP_LOSS on the same day,
-                           // the broad market is in a sustained downtrend, not isolated weakness.
+  maxOpenPositions:    2,  // max concurrent positions — reduced from 4.
+                           // Live data: with 4 positions in a weak market all 4 lose
+                           // simultaneously. 2 positions forces selectivity and keeps
+                           // exposure manageable. Sep 2026 confirmed: sessions with 3-4
+                           // simultaneous puts in downtrend all lost together.
+  broadWeaknessThreshold: 4, // if this many tickers have consecutive stop losses, AI
+                           // prompt is flagged bearish (favour puts over calls).
+  callBlockThreshold:  6,  // if this many tickers are in downtrend, block ALL Long Calls
+                           // regardless of score. When 6+ names are hitting stop loss
+                           // simultaneously the market is in risk-off regime — calls
+                           // are structurally wrong. Sep 2026 confirmed: HOOD, NVDA,
+                           // META calls all placed/held during 6+ name downtrend periods.
   dailyMaxLoss:     2000,  // circuit breaker: halt new trades if day P&L hits -$2,000.
 
   // ── Trailing stops (underlying stock monitoring) ──────────
@@ -1495,12 +1511,22 @@ ${broadWeakness
         `- Favour PUTS on fresh weakness names (1-3 days) — trend just starting\n` +
         `- Avoid puts on extended names (4+ days) — likely to bounce\n` +
         `- Long Calls require score ≥ 9 AND genuine momentum AGAINST the trend\n` +
-        `- Score 8 is not enough to go long when ${weakTickers.length} names are in downtrend`;
+        (weakTickers.length >= MANDATE.callBlockThreshold
+          ? `- 🚫 CALLS BLOCKED: ${weakTickers.length} tickers in downtrend (≥${MANDATE.callBlockThreshold} threshold) — do NOT propose any Long Calls today\n`
+          : `- Score 8 is not enough to go long when ${weakTickers.length} names are in downtrend`);
     })()
   : "✅ No broad weakness — both calls and puts valid based on individual setups"}
 
 BUY CALL when: uptrend, above support, positive momentum, bullish catalyst, healthy sector
 BUY PUT when: downtrend, below resistance, negative momentum, bearish catalyst, weak sector
+
+CATALYST REQUIREMENT — MANDATORY:
+Every trade must have a specific near-term event driving it. Generic observations are NOT catalysts.
+❌ NOT a catalyst: "stock is trending down", "sector weakness", "bearish momentum", "technical breakdown"
+✅ Valid catalysts: "earnings in X days (date)", "Fed decision [date]", "product launch [date]",
+   "index rebalancing [date]", "competitor earnings beat/miss [date]", "macro data release [date]"
+If you cannot name a specific event, do NOT propose the trade. The catalyst field will be
+checked by the filter — trades with generic catalysts will be blocked regardless of score.
 
 SCORING (setupScore 1-10). Only include score ≥ ${LONG_OPTIONS_MIN_SCORE}. High-beta tickers require ≥ ${HIGH_BETA_MIN_SCORE}.
 HIGH-BETA (${HIGH_BETA_TICKERS.join(", ")}): fast movers, great upside — but fast losses too.
@@ -1569,6 +1595,18 @@ function normaliseAndFilterTrades(parsed, effectiveMin = MANDATE.minPerTrade, { 
         return false;
       }
     }
+    // Call block: when too many names are in sustained downtrend, block ALL calls.
+    // broadWeakness (4+ names) raises the call score threshold to 9.
+    // callBlockThreshold (6+ names) blocks calls entirely — the market is in
+    // risk-off regime and directional bullish bets are structurally wrong.
+    const downtrendCount = Object.keys(state.downtrendCount).filter(
+      t => (state.downtrendCount[t]?.count ?? 0) >= 1
+    ).length;
+    if (t.strategy === "Long Call" && downtrendCount >= MANDATE.callBlockThreshold) {
+      console.log(`  🚫 Blocked ${t.ticker} Long Call — ${downtrendCount} tickers in downtrend (≥${MANDATE.callBlockThreshold} threshold), market in risk-off regime`);
+      return false;
+    }
+
     // Score threshold: base is LONG_OPTIONS_MIN_SCORE (8) for standard, HIGH_BETA_MIN_SCORE (9) for high-beta.
     // When broadWeakness is active, Long Calls require score ≥ 9 regardless of ticker —
     // the prompt tells the AI not to propose calls below 9 in a weak market, but the AI
@@ -1582,6 +1620,25 @@ function normaliseAndFilterTrades(parsed, effectiveMin = MANDATE.minPerTrade, { 
         ? `broad weakness active — calls need score ≥ 9, got ${t.setupScore}`
         : `score ${t.setupScore} below ${minScore} minimum`;
       console.log(`  🚫 Blocked ${t.ticker} ${t.strategy} — ${reason}`);
+      return false;
+    }
+    // Catalyst requirement: block trades with no specific near-term event.
+    // "Stock is trending down" or "sector weakness" is not a catalyst — it's
+    // a description of current state. A catalyst is a specific dated event:
+    // earnings, Fed decision, product launch, index rebalancing.
+    // Sep 2026 live data: losing trades (GOOGL LP, NOW LP, TSLA LP) had
+    // generic catalysts. Winning trades (COIN, PLTR, MRVL) had specific events.
+    const catalyst = (t.catalyst ?? "").toLowerCase().trim();
+    const genericPhrases = [
+      "momentum", "downtrend", "weakness", "moving lower", "moving higher",
+      "sector weak", "broad market", "technical", "trend", "continuation",
+      "selling pressure", "bearish", "bullish", "oversold", "overbought"
+    ];
+    const isCatalystGeneric = !catalyst
+      || catalyst.length < 15
+      || genericPhrases.some(p => catalyst.includes(p));
+    if (isCatalystGeneric) {
+      console.log(`  🚫 Blocked ${t.ticker} ${t.strategy} — no specific catalyst: "${t.catalyst ?? "none"}"`);
       return false;
     }
     if (state.openPositions.length >= MANDATE.maxOpenPositions) {
@@ -1614,6 +1671,46 @@ async function generateTrades(portfolioData, preComputedRegime = null) {
     await sendSMS(`⚠️ TRADING HALTED — MARKET CRASH\n${regime.note}\nAll new positions blocked. Existing positions still monitored.\nBot resumes tomorrow morning.`);
     return [];
   }
+
+  // ── MARKET CONDITION GATE ─────────────────────────────────────
+  // Only place trades when the market offers a genuine edge.
+  // Gate passes if EITHER condition is true — otherwise sit in cash.
+  //
+  // Condition 1: VIX ≥ minVIXToTrade — vol is real, options fairly priced.
+  //   Below 18 = compressed vol = market is complacent, options overpriced
+  //   relative to actual moves. Setups look attractive but risk/reward is poor.
+  //
+  // Condition 2: Hard catalyst present — a specific dated event exists.
+  //   Earnings within earningsWindowDays is the clearest signal that a
+  //   real directional move is coming. Even if VIX is low, pre-earnings
+  //   options can produce the moves needed to hit the +15% trail activation.
+  //
+  // Sep 2026 lesson: GOOGL LP, NOW LP, TSLA LP all placed in flat markets
+  // with VIX 15-16 and no specific catalyst — all lost. COIN +123%, PLTR +22%,
+  // MRVL +33% all had specific events. The gate enforces this discipline.
+  const currentVIX = regime.vix?.note
+    ? parseFloat(regime.vix.note.match(/VIX ([\d.]+)/)?.[1] ?? 0) : 0;
+  const gateUTCms = new Date(new Date().toISOString().slice(0,10) + "T00:00:00Z").getTime();
+  const hasUpcomingEarnings = Object.entries(EARNINGS).some(([, d]) => {
+    const daysOut = Math.ceil((new Date(d + "T00:00:00Z") - gateUTCms) / (1000*60*60*24));
+    return daysOut > 0 && daysOut <= MANDATE.earningsWindowDays;
+  });
+  const vixGatePass      = currentVIX >= MANDATE.minVIXToTrade;
+  const earningsGatePass = hasUpcomingEarnings;
+
+  if (!vixGatePass && !earningsGatePass) {
+    const nextEarnings = Object.entries(EARNINGS)
+      .map(([t, d]) => ({ t, days: Math.ceil((new Date(d+"T00:00:00Z") - gateUTCms) / (1000*60*60*24)) }))
+      .filter(e => e.days > 0)
+      .sort((a, b) => a.days - b.days)
+      .slice(0, 3)
+      .map(e => `${e.t} in ${e.days}d`)
+      .join(", ") || "none upcoming";
+    console.log(`  ⏭ MARKET CONDITION GATE: sitting in cash — VIX ${currentVIX.toFixed(1)} < ${MANDATE.minVIXToTrade} AND no earnings within ${MANDATE.earningsWindowDays} days. Next earnings: ${nextEarnings}.`);
+    await sendSMS(`⏭ NO TRADES TODAY — market condition gate\nVIX ${currentVIX.toFixed(1)} (need ≥${MANDATE.minVIXToTrade}) | no earnings within ${MANDATE.earningsWindowDays} days\nNext: ${nextEarnings}\nSitting in cash. Monitoring open positions.\nNot financial advice.`);
+    return [];
+  }
+  console.log(`  ✅ Market gate: ${vixGatePass ? `VIX ${currentVIX.toFixed(1)} ≥ ${MANDATE.minVIXToTrade} ✓` : `VIX ${currentVIX.toFixed(1)} low`} | ${earningsGatePass ? "earnings catalyst present ✓" : `no earnings within ${MANDATE.earningsWindowDays}d`}`);
 
   const sectorHealth = {};
   for (const stock of optionable) {
@@ -3330,7 +3427,7 @@ const modeLabel = TRADIER.sandbox ? "SANDBOX" : "LIVE";
 console.log(`\n🚀 Options Trading Bot v3 (${modeLabel} MODE)`);
 console.log(`📋 Portfolio: ${PORTFOLIO.map(p=>p.ticker).join(", ")}`);
 console.log(`📊 ${PORTFOLIO.length} stocks | ${PORTFOLIO.filter(p=>p.optionable).length} optionable`);
-console.log(`◎  Mandate: $${MANDATE.dailyCapMin}–$${MANDATE.dailyCapMax}/day | $${MANDATE.minPerTrade}–$${MANDATE.maxPerTrade}/trade | 14-21 DTE | ${MANDATE.otmPctMin}–${MANDATE.otmPctMax}% OTM | Trail from +${MANDATE.trailActivationPct}% | Stop -${MANDATE.stopLossPct}% | ${MANDATE.timeDTE} DTE exit`);
+console.log(`◎  Mandate: $${MANDATE.dailyCapMin}–$${MANDATE.dailyCapMax}/day | $${MANDATE.minPerTrade}–$${MANDATE.maxPerTrade}/trade | ${MANDATE.targetMinDTE}–${MANDATE.targetMaxDTE} DTE | ${MANDATE.otmPctMin}–${MANDATE.otmPctMax}% OTM | Max ${MANDATE.maxOpenPositions} positions | Trail from +${MANDATE.trailActivationPct}% | Stop -${MANDATE.stopLossPct}%`);
 console.log(`🔗 Tradier: ${TRADIER.baseUrl}`);
 console.log("⏰ Schedule:");
 console.log("   Mon–Fri 9:10 AM — Morning scan + execute");

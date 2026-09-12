@@ -92,8 +92,9 @@ function computePnL(ourTrade, g) {
 const MANDATE = {
   minPerTrade: 250, maxPerTrade: 1000, minReturnPct: 20,
   stopLossPct: 50, timeDTE: 2,
-  targetMinDTE: 14, targetMaxDTE: 21, otmPctMin: 2, otmPctMax: 7,
-  maxOpenPositions: 4, minSetupScore: 8,
+  targetMinDTE: 7, targetMaxDTE: 14, otmPctMin: 8, otmPctMax: 12,
+  minVIXToTrade: 18, earningsWindowDays: 14,
+  maxOpenPositions: 2, minSetupScore: 8, callBlockThreshold: 6,
 };
 const HIGH_BETA_TICKERS   = ["NVDA", "TSLA", "CRWD", "COIN", "HOOD", "ARM"];
 const LONG_OPTIONS_MIN_SCORE = 8;
@@ -134,6 +135,12 @@ function normaliseAndFilterTrades(parsed, effectiveMin = MANDATE.minPerTrade, { 
       ? HIGH_BETA_MIN_SCORE
       : (broadWeakness && isCall ? 9 : LONG_OPTIONS_MIN_SCORE);
     if (t.setupScore < minScore) return false;
+    const catalyst = (t.catalyst ?? "").toLowerCase().trim();
+    const genericPhrases = ["momentum","downtrend","weakness","moving lower","moving higher",
+      "sector weak","broad market","technical","trend","continuation","selling pressure",
+      "bearish","bullish","oversold","overbought"];
+    const isCatalystGeneric = !catalyst || catalyst.length < 15 || genericPhrases.some(p => catalyst.includes(p));
+    if (isCatalystGeneric) return false;
     if (state.openPositions.length >= MANDATE.maxOpenPositions) return false;
     return true;
   });
@@ -349,12 +356,12 @@ describe("normaliseAndFilterTrades — v3", () => {
   const validLC = {
     ticker: "MSFT", strategy: "Long Call",
     targetCost: 400, targetReturnPct: "100", setupScore: 8,
-    direction: "bullish", reasoning: "breakout", catalyst: "earnings month away",
+    direction: "bullish", reasoning: "breakout", catalyst: "earnings report October 23 2026",
   };
   const validLP = {
     ticker: "AMZN", strategy: "Long Put",
     targetCost: 350, targetReturnPct: "100", setupScore: 8,
-    direction: "bearish", reasoning: "breakdown",
+    direction: "bearish", reasoning: "breakdown", catalyst: "earnings October 30 2026 — guidance expected weak",
   };
 
   test("passes valid Long Call", () => {
@@ -374,6 +381,14 @@ describe("normaliseAndFilterTrades — v3", () => {
   test("blocks below minPerTrade ($250)", () => {
     assert.equal(normaliseAndFilterTrades([{ ...validLC, targetCost: 249 }]).length, 0);
     assert.equal(normaliseAndFilterTrades([{ ...validLC, targetCost: 250 }]).length, 1);
+  });
+
+  test("blocks trades with generic catalyst", () => {
+    assert.equal(normaliseAndFilterTrades([{ ...validLC, catalyst: "bearish momentum" }]).length, 0);
+    assert.equal(normaliseAndFilterTrades([{ ...validLC, catalyst: "sector weakness" }]).length, 0);
+    assert.equal(normaliseAndFilterTrades([{ ...validLC, catalyst: "" }]).length, 0);
+    assert.equal(normaliseAndFilterTrades([{ ...validLC, catalyst: "earnings Sep 18 2026" }]).length, 1);
+    assert.equal(normaliseAndFilterTrades([{ ...validLC, catalyst: "Fed decision September 17 2026" }]).length, 1);
   });
 
   test("blocks above maxPerTrade ($1000)", () => {
@@ -435,6 +450,7 @@ describe("normaliseAndFilterTrades — v3", () => {
     const aliased = {
       ticker: "MSFT", strategy: "Long Call",
       cost: 400, returnPct: "100", score: 8, rationale: "test",
+      catalyst: "earnings report October 23 2026",
     };
     const result = normaliseAndFilterTrades([aliased]);
     assert.equal(result.length, 1);
