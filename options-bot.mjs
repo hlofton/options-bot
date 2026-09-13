@@ -3404,8 +3404,9 @@ async function sundaySummary() {
     .map(([t, dc]) => `${t}(${dc.count}d)`).join(", ");
 
   const part2 =
-    (nearStop.length   ? `NEAR STOP:\n${nearStop.join("\n")}\n\n` : "") +
-    (nearTarget.length ? `NEAR TARGET:\n${nearTarget.join("\n")}\n\n` : "") +
+    // Cap near-stop at 8 most urgent names — 19 names overflowed 1024 chars (Sep 14 2026)
+    (nearStop.length   ? `NEAR STOP:\n${nearStop.slice(0,8).join("\n")}${nearStop.length>8?`\n…+${nearStop.length-8} more`:""}\n\n` : "") +
+    (nearTarget.length ? `NEAR TARGET:\n${nearTarget.slice(0,4).join("\n")}\n\n` : "") +
     (blockedForPart2   ? `📉 DOWNTREND (informational): ${blockedForPart2}\n\n` : "") +
     // changePct is the daily move from Friday's close — markets are closed
     // Sunday morning, so this reflects Friday's last session, not the week.
