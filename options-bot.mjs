@@ -3433,7 +3433,7 @@ console.log(`🔗 Tradier: ${TRADIER.baseUrl}`);
 console.log("⏰ Schedule:");
 console.log("   Mon–Fri 9:10 AM — Morning scan + execute");
 console.log("   Mon–Fri 9:25 AM — Analyst targets refresh");
-console.log("   Mon–Fri 9:30–4PM — Position monitor + trailing stops every 5 min");
+console.log("   Mon–Fri 9:30–3:55PM — Position monitor + trailing stops every 5 min");
 console.log("   Mon–Fri 11:02,1:02,3:02 — Opportunistic scan (5%+ moves only)");
 console.log("   Mon–Fri 4:05 PM — Closing summary");
 console.log("   Sunday 8:00 AM  — Full portfolio review + auto-update all levels\n");
@@ -3518,7 +3518,7 @@ async function reconcileOrphanedPositions() {
 // Schedules
 cron.schedule("10 9 * * 1-5",      () => runExclusive("morningSession",       morningSession),       { timezone:"America/New_York" });
 cron.schedule("25 9 * * 1-5",      () => runExclusive("updateAnalystTargets", updateAnalystTargets), { timezone:"America/New_York" });
-cron.schedule("*/5 9-16 * * 1-5",  () => runExclusive("intradayCheck",        intradayCheck),        { timezone:"America/New_York" });
+cron.schedule("*/5 9-15 * * 1-5",  () => runExclusive("intradayCheck",        intradayCheck),        { timezone:"America/New_York" }); // stops at 3:55 PM
 
 // Opportunistic mid-day scan: 11:02 AM, 1:02 PM, 3:02 PM ET Mon-Fri.
 // CONFIRMED BUG (Jul 27 2026 live log): this used to fire at :00 exactly,
@@ -3529,7 +3529,7 @@ cron.schedule("*/5 9-16 * * 1-5",  () => runExclusive("intradayCheck",        in
 // intraday -7%) that was exactly the kind of setup this scan exists to
 // catch. Offsetting by 2 minutes guarantees no collision, ever.
 cron.schedule("2 11,13,15 * * 1-5", () => runExclusive("opportunisticScan",    opportunisticScan),    { timezone:"America/New_York" });
-cron.schedule("5 16 * * 1-5",      () => runExclusive("closingSession",       closingSession),       { timezone:"America/New_York" });
+cron.schedule("7 16 * * 1-5",      () => runExclusive("closingSession",       closingSession),       { timezone:"America/New_York" }); // 4:07 PM — clears last 4:00 check
 cron.schedule("0 8 * * 0",         () => runExclusive("sundaySummary",        sundaySummary),        { timezone:"America/New_York" });
 
 // ── SECURE BOOT ──────────────────────────────────────────────
