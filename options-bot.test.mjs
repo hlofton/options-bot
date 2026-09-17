@@ -92,8 +92,8 @@ function computePnL(ourTrade, g) {
 const MANDATE = {
   minPerTrade: 250, maxPerTrade: 1000, minReturnPct: 20,
   stopLossPct: 50, timeDTE: 2,
-  targetMinDTE: 7, targetMaxDTE: 14, otmPctMin: 8, otmPctMax: 12,
-  minVIXToTrade: 18, earningsWindowDays: 14,
+  targetMinDTE: 7, targetMaxDTE: 14, otmPctMin: 3, otmPctMax: 7,
+  minVIXToTrade: 14, earningsWindowDays: 14,
   maxOpenPositions: 2, minSetupScore: 8, callBlockThreshold: 6,
 };
 const HIGH_BETA_TICKERS   = ["NVDA", "TSLA", "CRWD", "COIN", "HOOD", "ARM"];
@@ -271,7 +271,7 @@ describe("computePnL — long options (isCredit: false)", () => {
 describe("trailing stop logic", () => {
   // Inline the trailing stop logic to test it independently
   const MANDATE = {
-    trailActivationPct: 15, trailWidthTier1: 5,
+    trailActivationPct: 15, trailWidthTier1: 8,
     trailWidthTier2: 8, trailWidthTier3: 6,
     stopLossPct: 50, stopLossGracePct: 70, stopLossLatePct: 35,
     gracePeriodHours: 48, lateStopDTE: 7, timeDTE: 2,
@@ -302,11 +302,11 @@ describe("trailing stop logic", () => {
     assert.ok(!shouldTrailClose(10, 5));   // peak +10% — not yet active
   });
 
-  test("tier 1 trail: +15-50% peak, 5% width", () => {
-    assert.equal(getTrailWidth(35), 5);
-    // Peak +35%, closes below +30%
-    assert.ok(!shouldTrailClose(35, 31)); // above floor
-    assert.ok(shouldTrailClose(35, 29));  // below floor
+  test("tier 1 trail: +15-50% peak, 8% width", () => {
+    assert.equal(getTrailWidth(35), 8);
+    // Peak +35%, closes below +27%
+    assert.ok(!shouldTrailClose(35, 28)); // above floor
+    assert.ok(shouldTrailClose(35, 26));  // below floor
   });
 
   test("tier 2 trail: +50-100% peak, 8% width", () => {
@@ -323,10 +323,10 @@ describe("trailing stop logic", () => {
     assert.ok(shouldTrailClose(120, 113));
   });
 
-  test("trail locks in minimum +10% gain (floor scenario)", () => {
-    // Peak +15%, trail width 5% — floor is +10%
-    assert.ok(shouldTrailClose(15, 9));    // below floor → closes
-    assert.ok(!shouldTrailClose(15, 11)); // above floor → holds
+  test("trail locks in minimum +7% gain (floor scenario)", () => {
+    // Peak +15%, trail width 8% — floor is +7%
+    assert.ok(shouldTrailClose(15, 6));    // below floor → closes
+    assert.ok(!shouldTrailClose(15, 8));  // above floor → holds
   });
 
   test("stop threshold: grace period (first 48h)", () => {

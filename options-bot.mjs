@@ -78,19 +78,22 @@ const MANDATE = {
                            // Sep 2026: winning trades made moves within first week.
                            // Losing trades bled theta for 2+ weeks. At 7-14 DTE:
                            // cheaper, faster decisions, theta enforces discipline.
-  otmPctMin:           8,  // minimum 8% OTM — raised from 2%.
-  otmPctMax:          12,  // maximum 12% OTM — raised from 7%.
-                           // Sep 2026: 2-7% OTM too sensitive — 3% adverse move
-                           // turned a 2% OTM option into a -40% position within hours.
+  otmPctMin:           3,  // minimum 3% OTM — lowered from 8%.
+  otmPctMax:           7,  // maximum 7% OTM — lowered from 12%.
+                           // At 8-12% OTM needed 8-12% stock move in 7-14 DTE
+                           // — unrealistic in VIX 16-17 market. At 3-7% OTM
+                           // option responds to realistic 3-5% moves while
+                           // remaining cheaper than ATM. Gate only opens when
+                           // VIX is trending up — higher conviction environment.
 
   // ── Market condition gate ─────────────────────────────────
   // Only trade when market offers genuine edge. Sitting in cash is valid.
-  // Either gate condition being true allows the morning session to run.
-  minVIXToTrade:      18,  // VIX must be ≥ 18 for vol to be meaningful.
-                           // Below 18 = compressed vol = options overpriced.
-                           // The market is complacent; setups are poor.
-  earningsWindowDays: 14,  // Hard catalyst gate: if any ticker has earnings
-                           // within 14 days, a specific event exists to trade.
+  // Primary signal: VIX trending up (today > 5-day avg) AND above floor.
+  // Secondary: hard catalyst (earnings) within earningsWindowDays.
+  minVIXToTrade:      14,  // Absolute floor — never trade below VIX 14.
+                           // Lowered from 18: trend direction matters more
+                           // than absolute level. VIX 16.7↑ beats VIX 18.0↓.
+  earningsWindowDays: 14,  // Hard catalyst gate: earnings within 14 days.
 
   // ── Exit rules ───────────────────────────────────────────
   // Upside: trailing stop activates at +20% gain.
@@ -101,8 +104,11 @@ const MANDATE = {
                              // live trading — HOOD, NVDA, META all decayed without the trail
                              // ever activating. Floor at +15% with 5% tier-1 trail means
                              // minimum exit is +10% on any position that reaches the threshold.
-  trailWidthTier1:       5,  // +15–50% peak: 5% pullback closes (was 10%)
-                             // Floor at activation = +10% minimum exit. Sep 4 2026.
+  trailWidthTier1:       8,  // +15–50% peak: 8% pullback closes (raised from 5%).
+                             // At 3-7% OTM, normal intraday swings on COIN/MRVL/CRWD
+                             // are 3-5%. 5% trail fired on noise — positions shaken
+                             // out at +16% that would have reached +50%. 8% gives
+                             // room to breathe. Floor at +15% activation = +7% exit.
   trailWidthTier2:       8,  // +50–100% peak: 8% pullback from peak closes (was 12%)
   trailWidthTier3:       6,  // +100%+ peak: 6% pullback from peak closes (was 10%)
                              // Tightened alongside 5-minute monitoring interval (Aug 2026).
@@ -261,6 +267,7 @@ const state = {
   weeklyHighs:        {},   // highest price seen this week
   tradeStats:         {},   // per-strategy win/loss tracking
   downtrendCount:     {},   // { ticker: { count: N, lastDate: "YYYY-MM-DD" } }
+  vixHistory:         [],   // last 5 daily VIX readings — used to detect trending direction
                             // increments each day STOP_LOSS fires; resets on TARGET_HIT.
                             // In v3 (long calls/puts) this is INFORMATIONAL ONLY — the
                             // counter is tracked but does not block any trade decisions.
@@ -369,6 +376,7 @@ function loadState() {
     state.weeklyHighs   = persisted.weeklyHighs   || {};
     state.tradeStats        = persisted.tradeStats    || {};
     state.downtrendCount    = persisted.downtrendCount || {};
+    state.vixHistory        = persisted.vixHistory     || [];
     state._lastResetMonth   = persisted._lastResetMonth || null;
     state.weeklyPnL         = persisted.weeklyPnL     || 0;
     state.monthlyPnL        = persisted.monthlyPnL    || 0;
@@ -1676,18 +1684,13 @@ async function generateTrades(portfolioData, preComputedRegime = null) {
   // Only place trades when the market offers a genuine edge.
   // Gate passes if EITHER condition is true — otherwise sit in cash.
   //
-  // Condition 1: VIX ≥ minVIXToTrade — vol is real, options fairly priced.
-  //   Below 18 = compressed vol = market is complacent, options overpriced
-  //   relative to actual moves. Setups look attractive but risk/reward is poor.
+  // Condition 1: VIX TRENDING UP (today > 5-day avg) AND above floor.
+  //   Rising VIX = uncertainty increasing = options fairly priced.
+  //   Falling VIX (even at 20) = complacency = bad for buyers.
+  //   Sep 2026 lesson: VIX 16.7 sat the bot out for 3 weeks while names
+  //   moved 5-10% daily. VIX 16.7 ↑ is a better signal than VIX 18.0 ↓.
   //
-  // Condition 2: Hard catalyst present — a specific dated event exists.
-  //   Earnings within earningsWindowDays is the clearest signal that a
-  //   real directional move is coming. Even if VIX is low, pre-earnings
-  //   options can produce the moves needed to hit the +15% trail activation.
-  //
-  // Sep 2026 lesson: GOOGL LP, NOW LP, TSLA LP all placed in flat markets
-  // with VIX 15-16 and no specific catalyst — all lost. COIN +123%, PLTR +22%,
-  // MRVL +33% all had specific events. The gate enforces this discipline.
+  // Condition 2: Hard catalyst present within earningsWindowDays.
   const currentVIX = regime.vix?.note
     ? parseFloat(regime.vix.note.match(/VIX ([\d.]+)/)?.[1] ?? 0) : 0;
   const gateUTCms = new Date(new Date().toISOString().slice(0,10) + "T00:00:00Z").getTime();
@@ -1695,8 +1698,16 @@ async function generateTrades(portfolioData, preComputedRegime = null) {
     const daysOut = Math.ceil((new Date(d + "T00:00:00Z") - gateUTCms) / (1000*60*60*24));
     return daysOut > 0 && daysOut <= MANDATE.earningsWindowDays;
   });
-  const vixGatePass      = currentVIX >= MANDATE.minVIXToTrade;
+  // VIX trend: use 5-day history. Fall back to absolute floor if < 2 days.
+  const vix5dayAvgGate = state.vixHistory.length >= 2
+    ? state.vixHistory.reduce((s, v) => s + v, 0) / state.vixHistory.length : null;
+  const vixTrending    = vix5dayAvgGate !== null
+    ? currentVIX > vix5dayAvgGate
+    : currentVIX >= MANDATE.minVIXToTrade; // fallback to absolute when no history
+  const vixAboveFloor  = currentVIX >= MANDATE.minVIXToTrade;
+  const vixGatePass    = vixTrending && vixAboveFloor;
   const earningsGatePass = hasUpcomingEarnings;
+  const trendStr = vix5dayAvgGate ? `${currentVIX.toFixed(1)} vs ${vix5dayAvgGate.toFixed(1)} avg ${currentVIX > vix5dayAvgGate ? "↑" : "↓"}` : `${currentVIX.toFixed(1)} (no history yet)`;
 
   if (!vixGatePass && !earningsGatePass) {
     const nextEarnings = Object.entries(EARNINGS)
@@ -1706,11 +1717,12 @@ async function generateTrades(portfolioData, preComputedRegime = null) {
       .slice(0, 3)
       .map(e => `${e.t} in ${e.days}d`)
       .join(", ") || "none upcoming";
-    console.log(`  ⏭ MARKET CONDITION GATE: sitting in cash — VIX ${currentVIX.toFixed(1)} < ${MANDATE.minVIXToTrade} AND no earnings within ${MANDATE.earningsWindowDays} days. Next earnings: ${nextEarnings}.`);
-    await sendSMS(`⏭ NO TRADES TODAY — market condition gate\nVIX ${currentVIX.toFixed(1)} (need ≥${MANDATE.minVIXToTrade}) | no earnings within ${MANDATE.earningsWindowDays} days\nNext: ${nextEarnings}\nSitting in cash. Monitoring open positions.\nNot financial advice.`);
+    const reason = !vixAboveFloor ? `VIX ${currentVIX.toFixed(1)} below floor ${MANDATE.minVIXToTrade}` : `VIX ${trendStr} — not trending up`;
+    console.log(`  ⏭ MARKET CONDITION GATE: sitting in cash — ${reason} AND no earnings within ${MANDATE.earningsWindowDays} days. Next: ${nextEarnings}.`);
+    await sendSMS(`⏭ NO TRADES TODAY — market condition gate\nVIX ${trendStr} | no earnings within ${MANDATE.earningsWindowDays} days\nNext: ${nextEarnings}\nSitting in cash. Monitoring open positions.\nNot financial advice.`);
     return [];
   }
-  console.log(`  ✅ Market gate: ${vixGatePass ? `VIX ${currentVIX.toFixed(1)} ≥ ${MANDATE.minVIXToTrade} ✓` : `VIX ${currentVIX.toFixed(1)} low`} | ${earningsGatePass ? "earnings catalyst present ✓" : `no earnings within ${MANDATE.earningsWindowDays}d`}`);
+  console.log(`  ✅ Market gate: VIX ${trendStr} ${vixGatePass?"✓ trending up":"✗"} | ${earningsGatePass?"earnings catalyst ✓":`no earnings within ${MANDATE.earningsWindowDays}d`}`);
 
   const sectorHealth = {};
   for (const stock of optionable) {
@@ -2649,6 +2661,20 @@ async function morningSession() {
   // Fails gracefully to null if Tradier doesn't support the VIX symbol in sandbox.
   const vix = await fetchVIX();
 
+  // Record VIX in rolling 5-day history for trend detection.
+  // The gate now checks trend direction (rising VIX) not absolute level.
+  if (vix && vix > 0) {
+    state.vixHistory.push(parseFloat(vix.toFixed(2)));
+    if (state.vixHistory.length > 5) state.vixHistory.shift(); // keep last 5 only
+  }
+  const vix5dayAvg = state.vixHistory.length >= 2
+    ? state.vixHistory.reduce((s, v) => s + v, 0) / state.vixHistory.length
+    : null;
+  if (vix5dayAvg) {
+    const trend = vix > vix5dayAvg ? "↑ RISING" : "↓ FALLING";
+    console.log(`  📊 VIX trend: ${trend} (today ${vix?.toFixed(1)} vs ${state.vixHistory.length}d avg ${vix5dayAvg.toFixed(1)})`);
+  }
+
   const spyNow    = getSpyChangeFromPortfolio(portfolioData);
   const regimeNow = getMarketRegime(spyNow, vix);
   console.log(`  📊 Regime: ${regimeNow.label} | SPY: ${spyNow.toFixed(2)}%`);
@@ -3039,7 +3065,7 @@ async function intradayCheck() {
       }
       const dc = state.downtrendCount[stock.ticker];
       if (dc.lastDate !== todayStr) {
-        dc.count++;
+        dc.count = Math.min(dc.count + 1, 10); // cap at 10 — ARM at 25d adds no signal vs ARM at 10d
         dc.lastDate = todayStr;
         if (dc.count >= 3) {
           console.log(`  ⚠ ${stock.ticker} downtrend: ${dc.count} consecutive STOP_LOSS days — bearish bias active if broad weakness threshold met`);
@@ -3052,7 +3078,7 @@ async function intradayCheck() {
         dc.count = Math.max(0, dc.count - 1);
         if (dc.count === 0) {
           delete state.downtrendCount[stock.ticker];
-          console.log(`  📈 ${stock.ticker} downtrend counter decayed to 0 — CSP re-eligible`);
+          console.log(`  📈 ${stock.ticker} downtrend counter decayed to 0 — downtrend cleared`);
         }
       }
     }
