@@ -73,11 +73,13 @@ const MANDATE = {
   minPerTradeLive:   250,  // same floor in live
 
   // ── Option selection ─────────────────────────────────────
-  targetMinDTE:        7,  // buy options with at least 7 DTE — reduced from 14.
-  targetMaxDTE:       14,  // cap at 14 DTE — reduced from 21.
-                           // Sep 2026: winning trades made moves within first week.
-                           // Losing trades bled theta for 2+ weeks. At 7-14 DTE:
-                           // cheaper, faster decisions, theta enforces discipline.
+  targetMinDTE:       10,  // buy options with at least 10 DTE — raised from 7.
+                           // 7 DTE puts the option in the final week where theta
+                           // decay is 10-20%/day. If the move doesn't happen in
+                           // the first 2-3 days you hit the 2 DTE time stop at a
+                           // large loss regardless of direction. 10 DTE gives 8
+                           // days of productive holding before the time stop fires.
+  targetMaxDTE:       14,  // cap at 14 DTE — enough time, not too much theta paid upfront.
   otmPctMin:           3,  // minimum 3% OTM — lowered from 8%.
   otmPctMax:           7,  // maximum 7% OTM — lowered from 12%.
                            // At 8-12% OTM needed 8-12% stock move in 7-14 DTE
@@ -96,14 +98,14 @@ const MANDATE = {
   earningsWindowDays: 14,  // Hard catalyst gate: earnings within 14 days.
 
   // ── Exit rules ───────────────────────────────────────────
-  // Upside: trailing stop activates at +20% gain.
+  // Upside: trailing stop activates at +15% gain.
   // Trail tightens as profit grows — see monitorOpenPositions for tiers.
   trailActivationPct:   15,  // trail kicks in once position gains 15% — lowered from 20%.
-                             // At 2-7% OTM, a 15% option gain requires ~2-3% move in the
+                             // At 3-7% OTM, a 15% option gain requires ~2-3% move in the
                              // underlying. Captures profitable windows that 20% missed in
                              // live trading — HOOD, NVDA, META all decayed without the trail
-                             // ever activating. Floor at +15% with 5% tier-1 trail means
-                             // minimum exit is +10% on any position that reaches the threshold.
+                             // ever activating. Floor at +15% with 8% tier-1 trail means
+                             // minimum exit is +7% on any position that reaches the threshold.
   trailWidthTier1:       8,  // +15–50% peak: 8% pullback closes (raised from 5%).
                              // At 3-7% OTM, normal intraday swings on COIN/MRVL/CRWD
                              // are 3-5%. 5% trail fired on noise — positions shaken
@@ -125,7 +127,10 @@ const MANDATE = {
   timeDTE:               2,  // time stop — close all positions at 2 DTE regardless
 
   // ── Quality filters ───────────────────────────────────────
-  minReturnPct:       20,  // AI must project 20%+ upside — matches trail activation threshold.
+  minReturnPct:       10,  // AI must project 10%+ upside — lowered from 20%.
+                           // At 3-7% OTM a 2-3% stock move produces 10-20% option gain.
+                           // Trail activates at +15% so 10% is the right minimum —
+                           // the trail handles everything from there upward.
   minSetupScore:       8,  // minimum AI conviction score out of 10 — raised from 7.
                            // Live data: losing trades had scores of 7. Winning trades (COIN
                            // +123%, PLTR +22%) had scores of 8-9. Score 7 was too permissive
@@ -268,6 +273,9 @@ const state = {
   tradeStats:         {},   // per-strategy win/loss tracking
   downtrendCount:     {},   // { ticker: { count: N, lastDate: "YYYY-MM-DD" } }
   vixHistory:         [],   // last 5 daily VIX readings — used to detect trending direction
+  momentumTickers:    {},   // { ticker: isoTimestamp } — names with TARGET_HIT or BIG_MOVE
+                            // in last 24h. Used by the momentum gate in morningSession.
+                            // Entries expire automatically (24h check at gate evaluation).
                             // increments each day STOP_LOSS fires; resets on TARGET_HIT.
                             // In v3 (long calls/puts) this is INFORMATIONAL ONLY — the
                             // counter is tracked but does not block any trade decisions.
@@ -377,6 +385,7 @@ function loadState() {
     state.tradeStats        = persisted.tradeStats    || {};
     state.downtrendCount    = persisted.downtrendCount || {};
     state.vixHistory        = persisted.vixHistory     || [];
+    state.momentumTickers   = persisted.momentumTickers || {};
     state._lastResetMonth   = persisted._lastResetMonth || null;
     state.weeklyPnL         = persisted.weeklyPnL     || 0;
     state.monthlyPnL        = persisted.monthlyPnL    || 0;
@@ -1529,12 +1538,12 @@ BUY CALL when: uptrend, above support, positive momentum, bullish catalyst, heal
 BUY PUT when: downtrend, below resistance, negative momentum, bearish catalyst, weak sector
 
 CATALYST REQUIREMENT — MANDATORY:
-Every trade must have a specific near-term event driving it. Generic observations are NOT catalysts.
-❌ NOT a catalyst: "stock is trending down", "sector weakness", "bearish momentum", "technical breakdown"
-✅ Valid catalysts: "earnings in X days (date)", "Fed decision [date]", "product launch [date]",
-   "index rebalancing [date]", "competitor earnings beat/miss [date]", "macro data release [date]"
-If you cannot name a specific event, do NOT propose the trade. The catalyst field will be
-checked by the filter — trades with generic catalysts will be blocked regardless of score.
+Every trade must have a specific catalyst or technical breakout signal. Pure momentum chasing is not enough.
+❌ NOT a catalyst: "sector weakness", "selling pressure", "broad market decline", "moving lower"
+✅ Valid catalysts: "earnings in X days (date)", "Fed decision [date]", "breaking above analyst target $X",
+   "technical breakout above $X resistance", "above 52-week high", "cross above key moving average",
+   "competitor earnings beat [date]", "macro data release [date]", "target hit — continuation play"
+The catalyst field is checked by the filter — trades with no catalyst or purely generic ones will be blocked.
 
 SCORING (setupScore 1-10). Only include score ≥ ${LONG_OPTIONS_MIN_SCORE}. High-beta tickers require ≥ ${HIGH_BETA_MIN_SCORE}.
 HIGH-BETA (${HIGH_BETA_TICKERS.join(", ")}): fast movers, great upside — but fast losses too.
@@ -1637,16 +1646,26 @@ function normaliseAndFilterTrades(parsed, effectiveMin = MANDATE.minPerTrade, { 
     // Sep 2026 live data: losing trades (GOOGL LP, NOW LP, TSLA LP) had
     // generic catalysts. Winning trades (COIN, PLTR, MRVL) had specific events.
     const catalyst = (t.catalyst ?? "").toLowerCase().trim();
+    // Block purely generic catalysts that describe current state with no specific event.
+    // Allow technical breakouts — "breaking above analyst target" or "above resistance"
+    // are actionable setups even without a named dated event.
     const genericPhrases = [
-      "momentum", "downtrend", "weakness", "moving lower", "moving higher",
-      "sector weak", "broad market", "technical", "trend", "continuation",
-      "selling pressure", "bearish", "bullish", "oversold", "overbought"
+      "sector weak", "broad market", "selling pressure",
+      "continuation", "moving lower", "moving higher",
     ];
-    const isCatalystGeneric = !catalyst
+    const technicalAllowPhrases = [
+      "breakout", "above analyst", "above target", "below support",
+      "above resistance", "below resistance", "technical", "cross",
+      "target hit", "52-week", "all-time"
+    ];
+    const hasTechnicalSignal = technicalAllowPhrases.some(p => catalyst.includes(p));
+    const isCatalystGeneric = !hasTechnicalSignal && (
+      !catalyst
       || catalyst.length < 15
-      || genericPhrases.some(p => catalyst.includes(p));
+      || genericPhrases.some(p => catalyst.includes(p))
+    );
     if (isCatalystGeneric) {
-      console.log(`  🚫 Blocked ${t.ticker} ${t.strategy} — no specific catalyst: "${t.catalyst ?? "none"}"`);
+      console.log(`  🚫 Blocked ${t.ticker} ${t.strategy} — no specific catalyst or breakout: "${t.catalyst ?? "none"}"`);
       return false;
     }
     if (state.openPositions.length >= MANDATE.maxOpenPositions) {
@@ -1707,9 +1726,22 @@ async function generateTrades(portfolioData, preComputedRegime = null) {
   const vixAboveFloor  = currentVIX >= MANDATE.minVIXToTrade;
   const vixGatePass    = vixTrending && vixAboveFloor;
   const earningsGatePass = hasUpcomingEarnings;
+
+  // Momentum gate: 3+ names with TARGET_HIT or BIG_MOVE in the last 24 hours
+  // signals broad market momentum — tradeable even in low VIX environments.
+  // Sep 2026: missed CRWD +8%, MRVL +6%, COIN +5% rally because VIX was 15.
+  // These moves all fired TARGET_HIT/BIG_MOVE the day before — that's the signal.
+  const now24h = Date.now() - 24 * 60 * 60 * 1000;
+  const recentMomentumNames = Object.entries(state.momentumTickers)
+    .filter(([, ts]) => new Date(ts).getTime() > now24h)
+    .map(([t]) => t);
+  const momentumGatePass = recentMomentumNames.length >= 3;
+  if (momentumGatePass) {
+    console.log(`  📈 Momentum gate: ${recentMomentumNames.length} names with TARGET_HIT/BIG_MOVE in last 24h — ${recentMomentumNames.join(", ")}`);
+  }
   const trendStr = vix5dayAvgGate ? `${currentVIX.toFixed(1)} vs ${vix5dayAvgGate.toFixed(1)} avg ${currentVIX > vix5dayAvgGate ? "↑" : "↓"}` : `${currentVIX.toFixed(1)} (no history yet)`;
 
-  if (!vixGatePass && !earningsGatePass) {
+  if (!vixGatePass && !earningsGatePass && !momentumGatePass) {
     const nextEarnings = Object.entries(EARNINGS)
       .map(([t, d]) => ({ t, days: Math.ceil((new Date(d+"T00:00:00Z") - gateUTCms) / (1000*60*60*24)) }))
       .filter(e => e.days > 0)
@@ -1718,11 +1750,16 @@ async function generateTrades(portfolioData, preComputedRegime = null) {
       .map(e => `${e.t} in ${e.days}d`)
       .join(", ") || "none upcoming";
     const reason = !vixAboveFloor ? `VIX ${currentVIX.toFixed(1)} below floor ${MANDATE.minVIXToTrade}` : `VIX ${trendStr} — not trending up`;
-    console.log(`  ⏭ MARKET CONDITION GATE: sitting in cash — ${reason} AND no earnings within ${MANDATE.earningsWindowDays} days. Next: ${nextEarnings}.`);
-    await sendSMS(`⏭ NO TRADES TODAY — market condition gate\nVIX ${trendStr} | no earnings within ${MANDATE.earningsWindowDays} days\nNext: ${nextEarnings}\nSitting in cash. Monitoring open positions.\nNot financial advice.`);
+    console.log(`  ⏭ MARKET CONDITION GATE: sitting in cash — ${reason} | no earnings within ${MANDATE.earningsWindowDays} days | no momentum (${recentMomentumNames.length}/3 names). Next: ${nextEarnings}.`);
+    await sendSMS(`⏭ NO TRADES TODAY — market condition gate\nVIX ${trendStr} | no earnings within ${MANDATE.earningsWindowDays} days | momentum ${recentMomentumNames.length}/3 names\nNext earnings: ${nextEarnings}\nSitting in cash. Monitoring open positions.\nNot financial advice.`);
     return [];
   }
-  console.log(`  ✅ Market gate: VIX ${trendStr} ${vixGatePass?"✓ trending up":"✗"} | ${earningsGatePass?"earnings catalyst ✓":`no earnings within ${MANDATE.earningsWindowDays}d`}`);
+  const gateReasons = [
+    vixGatePass      && `VIX ${trendStr} ↑`,
+    earningsGatePass && `earnings catalyst`,
+    momentumGatePass && `momentum (${recentMomentumNames.length} names)`,
+  ].filter(Boolean).join(" | ");
+  console.log(`  ✅ Market gate open: ${gateReasons}`);
 
   const sectorHealth = {};
   for (const stock of optionable) {
@@ -2667,6 +2704,15 @@ async function morningSession() {
     state.vixHistory.push(parseFloat(vix.toFixed(2)));
     if (state.vixHistory.length > 5) state.vixHistory.shift(); // keep last 5 only
   }
+
+  // Purge stale momentum entries — entries older than 48h are never used
+  // by the gate (24h window) but accumulate in state indefinitely.
+  const staleMs = Date.now() - 48 * 60 * 60 * 1000;
+  Object.keys(state.momentumTickers).forEach(t => {
+    if (new Date(state.momentumTickers[t]).getTime() < staleMs) {
+      delete state.momentumTickers[t];
+    }
+  });
   const vix5dayAvg = state.vixHistory.length >= 2
     ? state.vixHistory.reduce((s, v) => s + v, 0) / state.vixHistory.length
     : null;
@@ -3084,14 +3130,31 @@ async function intradayCheck() {
     }
 
     if (!urgent.length) continue;
-    // Include date in the dedup key — without it, an alert at 3:58 PM (hour 15)
-    // and again at 4:02 PM (hour 16) fire twice for the same event because the
-    // hour rolls over before alertsSent.clear() runs in closingSession at 4:05.
-    const key = `${todayStr}_${stock.ticker}_${urgent.map(a=>a.type).join("_")}_${new Date().getHours()}`;
-    if (state.alertsSent.has(key)) continue;
-    state.alertsSent.add(key);
-    await sendSMS(`⚡ ${stock.ticker} ALERT\nPrice: $${stock.price.toFixed(2)} ${(stock.changePct||0)>=0?"▲":"▼"}${Math.abs(stock.changePct||0).toFixed(2)}%\n\n${urgent.map(a=>`${a.urgency}\n${a.msg}`).join("\n\n")}\n\nStop: $${getStopLoss(stock.ticker,stock.stopLoss)?.toFixed(2)||"N/A"} | Target: $${getTarget(stock.ticker,stock.target)?.toFixed(2)||"N/A"}\nNot financial advice.`);
-    console.log(`  ✅ Alert: ${stock.ticker} — ${urgent.map(a=>a.type).join(", ")}`);
+
+    // Suppress STOP_LOSS, STOP_WARNING, EARNINGS for tickers with no open position.
+    // These are informational when you have no trade on — BIG_MOVE and TARGET_HIT
+    // always fire as they're potential entry signals regardless of position status.
+    const hasOpenPosition = state.openPositions.some(p => p.ticker === stock.ticker);
+    const actionable = urgent.filter(a => {
+      if (["STOP_LOSS","STOP_WARNING","EARNINGS"].includes(a.type) && !hasOpenPosition) return false;
+      return true;
+    });
+    if (!actionable.length) {
+      console.log(`  ⏭ ${stock.ticker} — ${urgent.map(a=>a.type).join(",")} suppressed (no open position)`);
+      // Downtrend counter already updated above (lines 3092-3118) regardless of suppression.
+    } else {
+      const key = `${todayStr}_${stock.ticker}_${actionable.map(a=>a.type).join("_")}_${new Date().getHours()}`;
+      if (!state.alertsSent.has(key)) {
+        state.alertsSent.add(key);
+        await sendSMS(`⚡ ${stock.ticker} ALERT\nPrice: $${stock.price.toFixed(2)} ${(stock.changePct||0)>=0?"▲":"▼"}${Math.abs(stock.changePct||0).toFixed(2)}%\n\n${actionable.map(a=>`${a.urgency}\n${a.msg}`).join("\n\n")}\n\nStop: $${getStopLoss(stock.ticker,stock.stopLoss)?.toFixed(2)||"N/A"} | Target: $${getTarget(stock.ticker,stock.target)?.toFixed(2)||"N/A"}\nNot financial advice.`);
+        console.log(`  ✅ Alert: ${stock.ticker} — ${actionable.map(a=>a.type).join(", ")}`);
+      }
+    }
+
+    // Track momentum events for the gate — always, even if alert was suppressed.
+    if (urgent.some(a => ["TARGET_HIT","BIG_MOVE"].includes(a.type))) {
+      state.momentumTickers[stock.ticker] = new Date().toISOString();
+    }
   }
   console.log(`  ✓ Check complete. Open positions: ${state.openPositions.length}`);
 }
