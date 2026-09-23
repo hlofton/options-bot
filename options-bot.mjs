@@ -1617,7 +1617,7 @@ function normaliseAndFilterTrades(parsed, effectiveMin = MANDATE.minPerTrade, { 
     // callBlockThreshold (6+ names) blocks calls entirely — the market is in
     // risk-off regime and directional bullish bets are structurally wrong.
     const downtrendCount = Object.keys(state.downtrendCount).filter(
-      t => (state.downtrendCount[t]?.count ?? 0) >= 1
+      ticker => (state.downtrendCount[ticker]?.count ?? 0) >= 1
     ).length;
     if (t.strategy === "Long Call" && downtrendCount >= MANDATE.callBlockThreshold) {
       console.log(`  🚫 Blocked ${t.ticker} Long Call — ${downtrendCount} tickers in downtrend (≥${MANDATE.callBlockThreshold} threshold), market in risk-off regime`);
