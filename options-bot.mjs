@@ -47,6 +47,9 @@ if (!process.env.ANTHROPIC_API_KEY) {
   process.exit(1);
 }
 if (!process.env.TASTYTRADE_CLIENT_ID) {
+  // Names only (never values) — JSON.stringify exposes stray spaces/quotes in a name.
+  const seen = Object.keys(process.env).filter(k => /TASTY|TRADIER|CLIENT|REFRESH|ACCOUNT|SANDBOX|VALIDATION/i.test(k));
+  console.error(`   Env var names visible to this container: ${JSON.stringify(seen)}`);
   console.error("🛑 CRITICAL: TASTYTRADE_CLIENT_ID is not set. OAuth login will fail.");
   console.error("   Add it to Railway Variables tab and redeploy.");
   process.exit(1);
