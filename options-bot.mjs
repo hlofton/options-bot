@@ -943,6 +943,11 @@ function getSpyChangeFromPortfolio(portfolioData) {
 // startup and again in sundaySummary() every Sunday to refresh.
 async function brokerLogin() {
   try {
+    const userPreview = BROKER.username
+      ? `${BROKER.username.slice(0,3)}***${BROKER.username.slice(-4)}`
+      : "MISSING";
+    const passSet = BROKER.password ? `set (${BROKER.password.length} chars)` : "MISSING";
+    console.log(`  🔐 Auth attempt — user: ${userPreview} | pass: ${passSet} | url: ${BROKER.baseUrl}`);
     const res = await fetch(`${BROKER.baseUrl}/sessions`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
