@@ -786,7 +786,7 @@ async function buildOptionsLegs(tradeRec, stockPrice, regime = null) {
 // intradayCheck, making the per-ticker cache entirely unreachable.
 
 async function fetchAllPrices() {
-  console.log(`  Fetching ${PORTFOLIO.length} prices (${BROKER}, batched)...`);
+  console.log(`  Fetching ${PORTFOLIO.length} prices (Tastytrade, batched)...`);
   try {
     const tickers = PORTFOLIO.map(s => s.ticker);
     const quotes  = await getQuotes(tickers); // single batched call, no per-symbol rate limit
@@ -2065,7 +2065,7 @@ async function getGroupedLivePositions() {
   // version of this function conflated the two, which would have wiped
   // state.openPositions on nothing more than a transient network blip.
   if (positions === null) {
-    console.log(`  ⚠ Tradier positions fetch failed — skipping this cycle, state.openPositions left untouched.`);
+    console.log(`  ⚠ Tastytrade positions fetch failed — skipping this cycle, state.openPositions left untouched.`);
     return [];
   }
 
@@ -2099,7 +2099,7 @@ async function getGroupedLivePositions() {
           const oldList = oldTrades.map(t => `${t.ticker} ${t.strategy}`).join(", ");
           console.error(`  🧹 STALE: ${oldList} — flat for 60min+, removing`);
           state.openPositions = state.openPositions.filter(t => !oldTrades.includes(t));
-          await sendSMS(`🧹 STALE CLEANUP\n${oldList}\n\nTradier flat 60min+ since placement — assumed closed.\nVerify P&L manually.\nNot financial advice.`);
+          await sendSMS(`🧹 STALE CLEANUP\n${oldList}\n\nTastytrade flat 60min+ since placement — assumed closed.\nVerify P&L manually.\nNot financial advice.`);
           saveState();
         }
         return [];
@@ -2107,13 +2107,13 @@ async function getGroupedLivePositions() {
 
       // No recent trades — safe to treat the flat response as authoritative.
       const staleList = state.openPositions.map(t => `${t.ticker} ${t.strategy}`).join(", ");
-      console.error(`  🧹 STALE TRACKED POSITIONS: Tradier confirms account is flat but ${state.openPositions.length} trade(s) still tracked — removing: ${staleList}`);
+      console.error(`  🧹 STALE TRACKED POSITIONS: Tastytrade confirms account is flat but ${state.openPositions.length} trade(s) still tracked — removing: ${staleList}`);
       state.openPositions = [];
       await sendSMS(
 `🧹 STALE POSITION CLEANUP
 ${staleList}
 
-Tradier confirms the account is fully flat but these were still tracked as open — likely closed successfully despite an earlier reported close failure.
+Tastytrade confirms the account is fully flat but these were still tracked as open — likely closed successfully despite an earlier reported close failure.
 
 Removed from tracking. Verify final P&L manually if needed.
 Not financial advice.`
@@ -2214,7 +2214,7 @@ Not financial advice.`
     if (trulyGrouped.has(t)) return false;
     const ageMs = t.executedAt ? nowMs - new Date(t.executedAt).getTime() : Infinity;
     if (ageMs < STALE_GRACE_MS) {
-      console.log(`  ⏳ ${t.ticker} ${t.strategy}: no Tradier match yet (placed ${Math.round(ageMs/60000)}min ago — within 60-min grace, keeping)`);
+      console.log(`  ⏳ ${t.ticker} ${t.strategy}: no Tastytrade match yet (placed ${Math.round(ageMs/60000)}min ago — within 60-min grace, keeping)`);
       return false;
     }
     return true;
@@ -2222,10 +2222,10 @@ Not financial advice.`
 
   if (staleTrades.length > 0) {
     for (const stale of staleTrades) {
-      console.error(`  🧹 STALE: ${stale.ticker} ${stale.strategy} — no Tradier legs found after grace period, removing from tracking`);
+      console.error(`  🧹 STALE: ${stale.ticker} ${stale.strategy} — no Tastytrade legs found after grace period, removing from tracking`);
     }
     state.openPositions = state.openPositions.filter(t => !staleTrades.includes(t));
-    await sendSMS(`🧹 STALE POSITION CLEANUP\n${staleTrades.map(t=>`${t.ticker} ${t.strategy}`).join(", ")}\n\nNo matching legs in Tradier after 60min — assumed closed.\nVerify P&L manually.\nNot financial advice.`);
+    await sendSMS(`🧹 STALE POSITION CLEANUP\n${staleTrades.map(t=>`${t.ticker} ${t.strategy}`).join(", ")}\n\nNo matching legs in Tastytrade after 60min — assumed closed.\nVerify P&L manually.\nNot financial advice.`);
     saveState();
   }
 
@@ -2522,7 +2522,7 @@ Not financial advice.`
               `Failed to close ${failureCount} times in a row.\n` +
               `Current P&L: ${currentPnL>=0?"+":""}$${currentPnL.toFixed(0)} (${currentPct.toFixed(1)}%)\n\n` +
               `⚠️ MANUAL INTERVENTION MAY BE REQUIRED\n` +
-              `Log into Tradier and close this position manually if the bot cannot.\n` +
+              `Log into Tastytrade and close this position manually if the bot cannot.\n` +
               `Not financial advice.`
             );
           } else if (failureCount > 3 && failureCount % 5 === 0) {
@@ -2533,7 +2533,7 @@ Not financial advice.`
               `${ourTrade.ticker} ${ourTrade.strategy}\n` +
               `P&L: ${currentPnL>=0?"+":""}$${currentPnL.toFixed(0)} (${currentPct.toFixed(1)}%) | DTE:${dte}\n` +
               `Reason: ${failureReason.slice(0, 150)}\n` +
-              `Check Tradier — manual close may be needed.`
+              `Check Tastytrade — manual close may be needed.`
             );
           } else {
             // Normal retry notification for first 2 failures
@@ -2755,7 +2755,7 @@ async function morningSession() {
   // placing trades the account can't cover. Sandbox has no real capital so
   // it's fine to proceed with buyingPower=0 there.
   if (!BROKER.sandbox && balanceFetchFailed) {
-    const msg = "⚠️ MORNING SESSION ABORTED\nCould not verify account balance — refusing to place trades blind in live mode.\nCheck Tradier API connectivity and redeploy if needed.";
+    const msg = "⚠️ MORNING SESSION ABORTED\nCould not verify account balance — refusing to place trades blind in live mode.\nCheck Tastytrade API connectivity and redeploy if needed.";
     console.error(`  🛑 ${msg}`);
     await sendSMS(msg);
     return;
@@ -3612,21 +3612,21 @@ console.log("   Sunday 8:00 AM  — Full portfolio review + auto-update all leve
 
 // ═══════════════════════════════════════════════════════════════
 // ORPHANED POSITION RECONCILIATION
-// Runs once at boot: fetches real Tradier positions, compares against
+// Runs once at boot: fetches real Tastytrade positions, compares against
 // state.openPositions (restored from disk or empty after first boot),
 // and auto-retracks anything found in Tradier that the bot doesn't
 // know about — with a push notification summarising what was recovered.
 // ═══════════════════════════════════════════════════════════════
 async function reconcileOrphanedPositions() {
-  console.log("\n🔍 Checking for orphaned Tradier positions (untracked after restart)...");
+  console.log("\n🔍 Checking for orphaned Tastytrade positions (untracked after restart)...");
   try {
     const positions = await getPositions();
     if (positions === null) {
-      console.log("  ⚠ Tradier positions fetch failed — skipping reconciliation this cycle.");
+      console.log("  ⚠ Tastytrade positions fetch failed — skipping reconciliation this cycle.");
       return;
     }
     if (!positions.length) {
-      console.log("  ✓ No open Tradier positions — nothing to reconcile.");
+      console.log("  ✓ No open Tastytrade positions — nothing to reconcile.");
       return;
     }
 
@@ -3670,17 +3670,17 @@ async function reconcileOrphanedPositions() {
 
     if (reTracked.length > 0) {
       saveState();
-      await sendSMS(`✅ ORPHANED POSITIONS RE-TRACKED\nBot restarted and recovered ${reTracked.length} position(s):\n\n${reTracked.join("\n")}\n\nMonitoring (stop-loss, profit-target, breach) now active.\nCost basis reconstructed from Tradier — P&L estimates approximate.\nNot financial advice.`);
+      await sendSMS(`✅ ORPHANED POSITIONS RE-TRACKED\nBot restarted and recovered ${reTracked.length} position(s):\n\n${reTracked.join("\n")}\n\nMonitoring (stop-loss, profit-target, breach) now active.\nCost basis reconstructed from Tastytrade — P&L estimates approximate.\nNot financial advice.`);
     }
 
     if (orphanSummaries.length > 0) {
       console.error(`  🚨 ${orphanSummaries.length} orphaned position(s) could not be auto-retracked:`);
       orphanSummaries.forEach(s => console.error(`     ${s}`));
-      await sendSMS(`🚨 ORPHANED POSITIONS DETECTED\n${orphanSummaries.join("\n")}\n\nThese are REAL open positions in Tradier with NO automated protection. Close or manage manually.`);
+      await sendSMS(`🚨 ORPHANED POSITIONS DETECTED\n${orphanSummaries.join("\n")}\n\nThese are REAL open positions in Tastytrade with NO automated protection. Close or manage manually.`);
     }
 
     if (reTracked.length === 0 && orphanSummaries.length === 0) {
-      console.log(`  ✓ All ${positions.length} live Tradier position(s) are properly tracked.`);
+      console.log(`  ✓ All ${positions.length} live Tastytrade position(s) are properly tracked.`);
     }
   } catch(e) {
     console.error(`  ✗ Reconciliation check failed: ${e.message}`);
@@ -3734,7 +3734,7 @@ cron.schedule("0 8 * * 0",         () => runExclusive("sundaySummary",        su
     if (!BROKER.sandbox) {
       await sendSMS(
         `⚠️ LIVE TRADING ACTIVE — REAL MONEY\n` +
-        `Orders will execute on your real Tradier account.\n` +
+        `Orders will execute on your real Tastytrade account.\n` +
         `Verify TRADIER_SANDBOX is intentionally set to false before continuing.\n` +
         `If this was unintentional, set TRADIER_SANDBOX=true and redeploy immediately.`
       );
