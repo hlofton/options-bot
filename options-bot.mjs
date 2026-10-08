@@ -979,6 +979,9 @@ function getSpyChangeFromPortfolio(portfolioData) {
 // as needed. brokerLogin() is called at startup and auto-refreshes
 // inside brokerRequest() when the token is within 60s of expiry.
 async function brokerLogin() {
+  // After a failed login, don't hammer the token endpoint on every API call
+  // (each quote/position request would otherwise retry login and risk a lockout).
+  if (BROKER._lastLoginFailAt && Date.now() - BROKER._lastLoginFailAt < 30_000) return false;
   try {
     const clientIdSet      = BROKER.clientId     ? `${BROKER.clientId.slice(0,8)}...`    : "MISSING";
     const clientSecretSet  = BROKER.clientSecret ? `set (${BROKER.clientSecret.length} chars)` : "MISSING";
@@ -1005,10 +1008,17 @@ async function brokerLogin() {
     BROKER.tokenExpiry = Date.now() + ((data.expires_in ?? 900) - 60) * 1000;
     if (!BROKER.accessToken) throw new Error("No access_token in response");
     console.log("  ✅ Tastytrade OAuth2 token obtained");
+    BROKER._lastLoginFailAt = 0;
+    BROKER._lastAuthAlertAt = 0;
     return true;
   } catch(e) {
     console.error(`  ✗ Tastytrade login failed: ${e.message}`);
-    await sendPush(`🚨 TASTYTRADE LOGIN FAILED\n${e.message}\nBot cannot trade until auth is restored.`);
+    BROKER._lastLoginFailAt = Date.now();
+    // One alert per 30 minutes — not one per failed API call.
+    if (!BROKER._lastAuthAlertAt || Date.now() - BROKER._lastAuthAlertAt > 30 * 60_000) {
+      BROKER._lastAuthAlertAt = Date.now();
+      await sendPush(`🚨 TASTYTRADE LOGIN FAILED\n${e.message}\nBot cannot trade until auth is restored.`);
+    }
     return false;
   }
 }
@@ -3791,7 +3801,8 @@ console.log("   Mon–Fri 9:45 AM — Morning scan + execute");
 console.log("   Mon–Fri 9:25 AM — Analyst targets refresh");
 console.log("   Mon–Fri 9:30–3:55PM — Position monitor + trailing stops every 5 min");
 console.log("   Mon–Fri 11:02,1:02,3:02 — Opportunistic scan (5%+ moves only)");
-console.log("   Mon–Fri 4:05 PM — Closing summary");
+console.log("   Mon–Fri 3:50 PM — Pre-close expiry sweep (force-closes DTE≤2)");
+console.log("   Mon–Fri 4:07 PM — Closing summary");
 console.log("   Sunday 8:00 AM  — Full portfolio review + auto-update all levels\n");
 
 // ═══════════════════════════════════════════════════════════════
