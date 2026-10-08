@@ -179,8 +179,8 @@ const BROKER = {
   sandbox:   process.env.TASTYTRADE_SANDBOX === "true",
   get baseUrl() {
     return this.sandbox
-      ? "https://api.cert.tastyworks.com"
-      : "https://api.tastyworks.com";
+      ? "https://api.cert.tastytrade.com"
+      : "https://api.tastytrade.com";
   },
   username:  process.env.TASTYTRADE_USERNAME,
   password:  process.env.TASTYTRADE_PASSWORD,
