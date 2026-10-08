@@ -75,6 +75,16 @@ if (!process.env.ANTHROPIC_API_KEY.startsWith("sk-ant-")) {
   console.error("⚠️  WARNING: ANTHROPIC_API_KEY does not start with sk-ant- — may be invalid or have extra spaces.");
 }
 
+// Regular US equity-option hours (9:30–16:00 ET, Mon–Fri). Does not know holidays.
+function isMarketOpenET(d = new Date()) {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: "America/New_York", weekday: "short", hour: "numeric", minute: "numeric", hour12: false,
+  }).formatToParts(d);
+  const get  = t => parts.find(p => p.type === t)?.value;
+  const mins = (parseInt(get("hour"), 10) % 24) * 60 + parseInt(get("minute"), 10);
+  return !["Sat", "Sun"].includes(get("weekday")) && mins >= 9 * 60 + 30 && mins < 16 * 60;
+}
+
 // ── SHARED CONSTANTS ─────────────────────────────────────────
 // Override the model via env without a code change (e.g. on model rotation).
 const AI_MODEL        = process.env.AI_MODEL || "claude-sonnet-4-6";
@@ -198,6 +208,22 @@ const MANDATE = {
   // the full order lifecycle works. Remove once 2-3 cycles confirmed.
   validationMode: process.env.VALIDATION_MODE === "true",
 };
+
+// ── VALIDATION MODE LIMITS ────────────────────────────────────
+// Applied once at startup so EVERY check that reads MANDATE (strike selection,
+// morning session, midday scan, AI prompt, banners) sees the tighter limits.
+// Previously only the AI's target cost was lowered, so a single contract costing
+// up to $1,000 could still be bought and the midday scan ignored validation mode.
+// A strict $250 cap would reject nearly every contract (a 3–7% OTM, 10–14 DTE
+// option on a $200+ stock usually costs $300–$800), so the default is $500;
+// set VALIDATION_MAX_TRADE in Railway to change it.
+if (MANDATE.validationMode) {
+  const cap = parseInt(process.env.VALIDATION_MAX_TRADE || "500", 10);
+  MANDATE.maxPerTrade    = Math.max(MANDATE.minPerTrade, Number.isFinite(cap) ? cap : 500);
+  MANDATE.maxOpenPositions = 1;
+  MANDATE.dailyCapMax    = Math.min(MANDATE.dailyCapMax, MANDATE.maxPerTrade * 2);
+  MANDATE.dailyCapMin    = Math.min(MANDATE.dailyCapMin, MANDATE.maxPerTrade);
+}
 
 // ── INDEX TICKERS ─────────────────────────────────────────────
 // SPY and QQQ — included in the portfolio for directional plays on
@@ -2940,9 +2966,9 @@ async function morningSession() {
 
   // Validation mode: cap exposure while testing Tastytrade integration
   const effectiveMaxPositions = MANDATE.validationMode ? 1 : MANDATE.maxOpenPositions;
-  const effectiveMaxTrade     = MANDATE.validationMode ? 250 : MANDATE.maxPerTrade;
+  const effectiveMaxTrade     = MANDATE.maxPerTrade; // already tightened at startup in validation mode
   if (MANDATE.validationMode) {
-    console.log(`  ⚠ VALIDATION MODE: max 1 position, $250/trade — full limits resume after validation`);
+    console.log(`  ⚠ VALIDATION MODE: max ${MANDATE.maxOpenPositions} position, $${MANDATE.maxPerTrade}/trade, $${MANDATE.dailyCapMax}/day — full limits resume after validation`);
   }
 
   state.dailyTrades               = [];
@@ -3984,7 +4010,14 @@ cron.schedule("0 8 * * 0",         () => runExclusive("sundaySummary",        su
     // Run under the global lock so a cron tick during a mid-day redeploy
     // can't mutate state.openPositions concurrently with reconciliation.
     await runExclusive("startupReconciliation", reconcileOrphanedPositions);
-    await runExclusive("startupDiagnostics", intradayCheck);
+    // Only run the monitoring pass at boot while the market is open. After hours it
+    // evaluates stale prices and fires a burst of TARGET_HIT/BIG_MOVE alerts on every
+    // redeploy. The 5-minute cron picks monitoring up at the next open.
+    if (isMarketOpenET()) {
+      await runExclusive("startupDiagnostics", intradayCheck);
+    } else {
+      console.log("  ⏸ Market closed — skipping startup monitoring pass (crons resume at the open).");
+    }
     console.log("  🚀 Diagnostics clear. Background crons running.");
 
     // In live mode, send a separate loud alert first so there is no ambiguity
