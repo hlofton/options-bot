@@ -12,7 +12,7 @@
 //             50% stop loss · 2 DTE time stop
 // Execution : Tastytrade API (live or cert sandbox)
 // Alerts    : Pushover push notifications
-// Schedule  : 9:10AM execute | 5min monitor | 4PM close | Sun review
+// Schedule  : 9:45AM execute | 5min monitor | 4PM close | Sun review
 // Upgraded from v2 (CSP/IC) Aug 2026 — see archive/v2-csp-ic/
 // ================================================================
 //
@@ -23,10 +23,11 @@
 //   ANTHROPIC_API_KEY=sk-ant-...
 //   PUSHOVER_USER_KEY=<your pushover user key>
 //   PUSHOVER_API_TOKEN=<your pushover app token>
-// (Alpha Vantage keys no longer needed — all prices via Tastytrade as of Oct 2026)
-//   TRADIER_ACCESS_TOKEN=<your tradier token>
-//   TRADIER_ACCOUNT_ID=<your account id>
-//   TRADIER_SANDBOX=true                (set false for live trading)
+//   TASTYTRADE_CLIENT_ID=<your OAuth client id>
+//   TASTYTRADE_CLIENT_SECRET=<your OAuth client secret>
+//   TASTYTRADE_REFRESH_TOKEN=<your long-lived refresh token>
+//   TASTYTRADE_ACCOUNT_ID=<your account number>
+//   TASTYTRADE_SANDBOX=true             (set false for live trading)
 // ================================================================
 
 import Anthropic from "@anthropic-ai/sdk";
@@ -45,13 +46,23 @@ if (!process.env.ANTHROPIC_API_KEY) {
   console.error("   Add it to Railway Variables tab and redeploy.");
   process.exit(1);
 }
-if (!process.env.TRADIER_ACCESS_TOKEN) {
-  console.error("🛑 CRITICAL: TRADIER_ACCESS_TOKEN is not set. Every order and price fetch will fail.");
+if (!process.env.TASTYTRADE_CLIENT_ID) {
+  console.error("🛑 CRITICAL: TASTYTRADE_CLIENT_ID is not set. OAuth login will fail.");
   console.error("   Add it to Railway Variables tab and redeploy.");
   process.exit(1);
 }
-if (!process.env.TRADIER_ACCOUNT_ID) {
-  console.error("🛑 CRITICAL: TRADIER_ACCOUNT_ID is not set. Cannot target the correct account.");
+if (!process.env.TASTYTRADE_CLIENT_SECRET) {
+  console.error("🛑 CRITICAL: TASTYTRADE_CLIENT_SECRET is not set. OAuth login will fail.");
+  console.error("   Add it to Railway Variables tab and redeploy.");
+  process.exit(1);
+}
+if (!process.env.TASTYTRADE_REFRESH_TOKEN) {
+  console.error("🛑 CRITICAL: TASTYTRADE_REFRESH_TOKEN is not set. OAuth login will fail.");
+  console.error("   Add it to Railway Variables tab and redeploy.");
+  process.exit(1);
+}
+if (!process.env.TASTYTRADE_ACCOUNT_ID) {
+  console.error("🛑 CRITICAL: TASTYTRADE_ACCOUNT_ID is not set. Cannot target the correct account.");
   process.exit(1);
 }
 // Show key preview for verification (never logs full key)
@@ -59,6 +70,18 @@ const _keyPreview = `${process.env.ANTHROPIC_API_KEY.slice(0,12)}...${process.en
 console.log(`🔑 Anthropic API key loaded: ${_keyPreview}`);
 if (!process.env.ANTHROPIC_API_KEY.startsWith("sk-ant-")) {
   console.error("⚠️  WARNING: ANTHROPIC_API_KEY does not start with sk-ant- — may be invalid or have extra spaces.");
+}
+
+// ── SHARED CONSTANTS ─────────────────────────────────────────
+// Override the model via env without a code change (e.g. on model rotation).
+const AI_MODEL        = process.env.AI_MODEL || "claude-sonnet-4-6";
+const WEB_SEARCH_TOOL = { type: "web_search_20250305", name: "web_search" };
+
+// Every outbound HTTP call goes through this so a hung connection can never
+// block the single global job lock (runExclusive) forever.
+const HTTP_TIMEOUT_MS = 30_000;
+function fetchWithTimeout(url, opts = {}, timeoutMs = HTTP_TIMEOUT_MS) {
+  return fetch(url, { ...opts, signal: AbortSignal.timeout(timeoutMs) });
 }
 
 // ── MANDATE ──────────────────────────────────────────────────
@@ -149,7 +172,17 @@ const MANDATE = {
                            // simultaneously the market is in risk-off regime — calls
                            // are structurally wrong. Sep 2026 confirmed: HOOD, NVDA,
                            // META calls all placed/held during 6+ name downtrend periods.
-  dailyMaxLoss:     2000,  // circuit breaker: halt new trades if day P&L hits -$2,000.
+  dailyMaxLoss:      750,  // circuit breaker: halt new trades if day P&L hits -$750.
+                           // Was $2,000 (= dailyCapMax), which only tripped after the whole
+                           // day's capital was gone. $750 stops a bad day at roughly one
+                           // full stop-out plus change.
+  weeklyMaxLoss:    1500,  // drawdown stop: no new entries once week P&L <= -$1,500.
+  monthlyMaxLoss:   3000,  // drawdown stop: no new entries once month P&L <= -$3,000.
+
+  // ── Execution quality (live only) ─────────────────────────
+  maxSpreadPct:       12,  // reject strikes whose (ask-bid)/mid exceeds this %.
+  minOpenInterest:   100,  // reject strikes with thinner open interest than this.
+  fillWaitMs:      60_000, // how long to wait for an entry/exit order to fill before cancelling.
 
   // ── Trailing stops (underlying stock monitoring) ──────────
   trailPctHighIV:     15,
@@ -173,19 +206,22 @@ const INDEX_TICKERS = ["SPY", "QQQ"];
 
 // ── BROKER: TASTYTRADE ────────────────────────────────────────
 // Set environment variables in Railway:
-//   TASTYTRADE_USERNAME, TASTYTRADE_PASSWORD, TASTYTRADE_ACCOUNT_ID
+//   TASTYTRADE_CLIENT_ID, TASTYTRADE_CLIENT_SECRET, TASTYTRADE_REFRESH_TOKEN
+//   TASTYTRADE_ACCOUNT_ID
 //   TASTYTRADE_SANDBOX=true for certification environment
 const BROKER = {
   sandbox:   process.env.TASTYTRADE_SANDBOX === "true",
   get baseUrl() {
     return this.sandbox
-      ? "https://api.cert.tastytrade.com"
-      : "https://api.tastytrade.com";
+      ? "https://api.cert.tastyworks.com"
+      : "https://api.tastyworks.com";
   },
-  username:  process.env.TASTYTRADE_USERNAME,
-  password:  process.env.TASTYTRADE_PASSWORD,
-  accountId: process.env.TASTYTRADE_ACCOUNT_ID,
-  sessionToken: null,
+  clientId:     process.env.TASTYTRADE_CLIENT_ID,
+  clientSecret: process.env.TASTYTRADE_CLIENT_SECRET,
+  refreshToken: process.env.TASTYTRADE_REFRESH_TOKEN,
+  accountId:    process.env.TASTYTRADE_ACCOUNT_ID,
+  accessToken:  null,
+  tokenExpiry:  0,   // epoch ms when access token expires
 };
 
 // ── PORTFOLIO — Last reviewed Aug 14 2026 ─────────────────────
@@ -356,6 +392,8 @@ function saveState() {
       _lastResetMonth:            state._lastResetMonth,
       dynamicLevels:              state.dynamicLevels,
       weeklyHighs:                state.weeklyHighs,
+      vixHistory:                 state.vixHistory,
+      momentumTickers:            state.momentumTickers,
       alertsSent:                 [...state.alertsSent],
       savedAt:                    new Date().toISOString(),
     };
@@ -373,7 +411,7 @@ function saveState() {
     // stay silent after the first alert until the Volume comes back.
     if (!state._saveStateAlertSent) {
       state._saveStateAlertSent = true;
-      sendSMS(
+      sendPush(
         `🚨 STATE PERSISTENCE FAILURE\n${e.message}\n\n` +
         `All open position tracking will be LOST on next restart.\n` +
         `Check Railway Volume mount immediately — the bot is running without persistence.`
@@ -437,7 +475,7 @@ function loadState() {
 // SCHEDULER CONCURRENCY GUARD
 // node-cron fires each schedule independently and does NOT wait for
 // a previous invocation to finish before dispatching the next one.
-// Two schedules ("intradayCheck" every 20 min, "opportunisticScan"
+// Two schedules ("intradayCheck" every 5 min, "opportunisticScan"
 // at 11/1/3) land on the EXACT same minute three times a day, and
 // any job could in principle run long enough to overlap with the
 // next tick of itself. All scheduled jobs mutate shared state
@@ -457,13 +495,23 @@ async function runExclusive(jobName, fn) {
     const msg = `Skipping ${jobName} — "${state.jobRunning}" is still running`;
     console.log(`  ⏭  ${msg}`);
     if (CRITICAL_ONCE_DAILY_JOBS.has(jobName)) {
-      await sendSMS(`⚠️ SCHEDULE COLLISION\n${msg}\n${jobName} will NOT run again today — no automatic retry for this job.`);
+      await sendPush(`⚠️ SCHEDULE COLLISION\n${msg}\n${jobName} will NOT run again today — no automatic retry for this job.`);
     }
     return;
   }
   state.jobRunning = jobName;
+  // Wall-clock guard: if a job hangs past MAX_JOB_MS (e.g. a stuck promise that
+  // no per-request timeout caught) release the lock so later ticks can run
+  // instead of the bot silently going deaf for the rest of the day.
+  const MAX_JOB_MS = 15 * 60 * 1000;
+  let guard;
   try {
-    await fn();
+    await Promise.race([
+      fn(),
+      new Promise((_, reject) => {
+        guard = setTimeout(() => reject(new Error(`${jobName} exceeded ${MAX_JOB_MS/60000} min — lock released`)), MAX_JOB_MS);
+      }),
+    ]);
   } catch(e) {
     // Log the full stack — console is the primary diagnostic surface.
     console.error(`  ✗ ${jobName} crashed: ${e.message}\n${e.stack || "(no stack)"}`);
@@ -471,7 +519,7 @@ async function runExclusive(jobName, fn) {
     // closingSession means trades were not placed / positions not closed
     // with no indication to the operator. Even non-critical jobs that crash
     // unexpectedly are worth knowing about immediately.
-    await sendSMS(
+    await sendPush(
       `🚨 ${jobName} CRASHED\n${e.message.slice(0, 300)}\n\n` +
       `Crons are still running. Check Railway logs for full stack.\n` +
       (CRITICAL_ONCE_DAILY_JOBS.has(jobName)
@@ -479,13 +527,31 @@ async function runExclusive(jobName, fn) {
         : `Next scheduled run will retry automatically.`)
     ).catch(() => {}); // never let the alert itself crash the finally block
   } finally {
+    clearTimeout(guard);
     state.jobRunning = null;
   }
 }
 
+// Weekly / monthly drawdown stops. The daily breaker resets every morning, so
+// without these the bot could lose the daily limit every day indefinitely.
+function drawdownHaltReason() {
+  if (state.weeklyPnL  <= -MANDATE.weeklyMaxLoss) {
+    return `Weekly drawdown stop: week P&L $${state.weeklyPnL.toFixed(0)} ≤ -$${MANDATE.weeklyMaxLoss}`;
+  }
+  if (state.monthlyPnL <= -MANDATE.monthlyMaxLoss) {
+    return `Monthly drawdown stop: month P&L $${state.monthlyPnL.toFixed(0)} ≤ -$${MANDATE.monthlyMaxLoss}`;
+  }
+  return null;
+}
+
 // ── CLIENTS ──────────────────────────────────────────────────
 // Trim key to remove any accidental leading/trailing spaces
-const ai = new Anthropic({ apiKey: (process.env.ANTHROPIC_API_KEY || "").trim() });
+// 3-minute cap per request (web-search calls can be slow); SDK retries transient errors twice.
+const ai = new Anthropic({
+  apiKey:     (process.env.ANTHROPIC_API_KEY || "").trim(),
+  timeout:    180_000,
+  maxRetries: 2,
+});
 
 const PUSHOVER = {
   user:  process.env.PUSHOVER_USER_KEY,
@@ -528,12 +594,12 @@ function isRetryableError(e) {
 }
 
 // Maximum age of a cached price before it is considered too stale to use
-// as a fallback. 30 minutes covers a transient Tradier blip without letting
+// as a fallback. 30 minutes covers a transient broker blip without letting
 // the bot make stop-loss or profit-target decisions on hours-old data.
 const MAX_CACHE_AGE_MS = 30 * 60 * 1000;
 
 // How long after placement before a tracked trade is considered stale if
-// Tradier has no matching position. Tradier has a fill-to-position lag —
+// Tastytrade has no matching position. Broker has a fill-to-position lag —
 // confirmed Aug 18 2026: trades filled at 9:10 were not visible in the
 // positions endpoint at 9:20. Both stale-cleanup paths must use this same
 // constant so the grace window is consistent across the whole codebase.
@@ -579,8 +645,28 @@ function updateTrailingStop(ticker, currentPrice, staticStop) {
 }
 
 // ═══════════════════════════════════════════════════════════════
-// TRADIER API
+// TASTYTRADE API — OPTIONS CHAIN & MARKET DATA
 // ═══════════════════════════════════════════════════════════════
+
+// Live-only execution-quality gate: wide spreads and thin open interest are the
+// main way small single-stock option buys lose money before the trade starts.
+function passesLiquidity(ticker, label, opt, bid, ask) {
+  if (BROKER.sandbox) return true;
+  if (!(bid > 0) || !(ask > 0)) {
+    console.log(`  ✗ ${ticker} ${label} REJECTED — no live bid (bid $${bid}, ask $${ask})`);
+    return false;
+  }
+  const spreadPct = ((ask - bid) / ((ask + bid) / 2)) * 100;
+  if (spreadPct > MANDATE.maxSpreadPct) {
+    console.log(`  ✗ ${ticker} ${label} REJECTED — spread ${spreadPct.toFixed(1)}% > ${MANDATE.maxSpreadPct}% (bid $${bid} / ask $${ask})`);
+    return false;
+  }
+  if ((opt.open_interest ?? 0) < MANDATE.minOpenInterest) {
+    console.log(`  ✗ ${ticker} ${label} REJECTED — open interest ${opt.open_interest ?? 0} < ${MANDATE.minOpenInterest}`);
+    return false;
+  }
+  return true;
+}
 
 async function buildOptionsLegs(tradeRec, stockPrice, regime = null) {
   const { ticker, strategy } = tradeRec;
@@ -591,17 +677,6 @@ async function buildOptionsLegs(tradeRec, stockPrice, regime = null) {
     // Consistent with the same fix applied in monitorOpenPositions.
     const todayStr = new Date().toISOString().slice(0, 10);
     const todayUTC = new Date(todayStr + "T00:00:00Z");
-    const validExp    = expirations.find(exp => {
-      const dte = Math.ceil((new Date(exp + "T00:00:00Z") - todayUTC) / (1000*60*60*24));
-      return dte >= 5 && dte <= MANDATE.targetMaxDTE;
-    });
-    if (!validExp) return null;
-
-    const chain = await getChain(ticker, validExp);
-    if (!chain.length) return null;
-
-    const calls = chain.filter(o => o.option_type==="call").sort((a,b) => a.strike-b.strike);
-    const puts  = chain.filter(o => o.option_type==="put").sort((a,b) => b.strike-a.strike);
 
     switch(strategy) {
       case "Long Call": {
@@ -614,7 +689,7 @@ async function buildOptionsLegs(tradeRec, stockPrice, regime = null) {
           console.log(`  ✗ ${ticker} Long Call REJECTED — no expiry in ${MANDATE.targetMinDTE}–${MANDATE.targetMaxDTE} DTE window`);
           return null;
         }
-        const lcChain = lcExp === validExp ? chain : await getChain(ticker, lcExp);
+        const lcChain = await getChain(ticker, lcExp);
         const lcCalls = lcChain.filter(o => o.option_type === "call").sort((a,b) => a.strike - b.strike);
 
         // Target strike: 10–15% OTM
@@ -661,6 +736,8 @@ async function buildOptionsLegs(tradeRec, stockPrice, regime = null) {
           console.log(`  💲 ${ticker} Long Call: limit price $${limitPrice} (mid of bid $${freshBid} / ask $${freshAsk})`);
         }
 
+        if (!passesLiquidity(ticker, "Long Call", lcStrike, freshBid, freshAsk)) return null;
+
         const costPerContract = freshAsk * 100;
         if (costPerContract <= 0) return null;
         const qty       = Math.max(1, Math.floor(tradeRec.targetCost / costPerContract));
@@ -699,7 +776,7 @@ async function buildOptionsLegs(tradeRec, stockPrice, regime = null) {
           console.log(`  ✗ ${ticker} Long Put REJECTED — no expiry in ${MANDATE.targetMinDTE}–${MANDATE.targetMaxDTE} DTE window`);
           return null;
         }
-        const lpChain = lpExp === validExp ? chain : await getChain(ticker, lpExp);
+        const lpChain = await getChain(ticker, lpExp);
         const lpPuts  = lpChain.filter(o => o.option_type === "put").sort((a,b) => b.strike - a.strike);
 
         // Target strike: 2–7% OTM (below current price for puts)
@@ -733,6 +810,8 @@ async function buildOptionsLegs(tradeRec, stockPrice, regime = null) {
           limitPriceP = parseFloat((Math.round(midP / 0.05) * 0.05).toFixed(2));
           console.log(`  💲 ${ticker} Long Put: limit price $${limitPriceP} (mid of bid $${freshBidP} / ask $${freshAskP})`);
         }
+
+        if (!passesLiquidity(ticker, "Long Put", lpStrike, freshBidP, freshAskP)) return null;
 
         const costPerContractP = freshAskP * 100;
         if (costPerContractP <= 0) return null;
@@ -772,18 +851,7 @@ async function buildOptionsLegs(tradeRec, stockPrice, regime = null) {
 
 // ═══════════════════════════════════════════════════════════════
 // PRICE FEEDS — all prices via Tastytrade (batched single call).
-// Alpha Vantage fully retired Jul 29 2026 — see comment below.
 // ═══════════════════════════════════════════════════════════════
-
-// Alpha Vantage fully retired Jul 29 2026. Stock prices moved to Tradier
-// (fixed the recurring daily-quota exhaustion). VIX/SPY sentiment moved
-// to getSpyChangeFromPortfolio() (fixed the ^VIX symbol never having
-// been a valid GLOBAL_QUOTE target in the first place — see the block
-// comment above that function for the full story). No API keys needed.
-//
-// fetchStockPrice (per-ticker with cache) was removed Aug 2026 after
-// monitorOpenPositions was refactored to receive a fresh priceMap from
-// intradayCheck, making the per-ticker cache entirely unreachable.
 
 async function fetchAllPrices() {
   console.log(`  Fetching ${PORTFOLIO.length} prices (Tastytrade, batched)...`);
@@ -837,7 +905,7 @@ async function fetchAllPrices() {
 // PUSHOVER NOTIFICATIONS
 // ═══════════════════════════════════════════════════════════════
 
-async function sendSMS(body) {
+async function sendPush(body) {
   try {
     // Pushover hard-caps messages at 1024 characters. Long messages (Sunday
     // summary with 22 portfolio lines, morning session with 6+ trades) overflow
@@ -850,7 +918,7 @@ async function sendSMS(body) {
     if (body.length > LIMIT) {
       console.warn(`  ⚠ Push notification truncated: ${body.length} → ${LIMIT} chars`);
     }
-    const res = await fetch("https://api.pushover.net/1/messages.json", {
+    const res = await fetchWithTimeout("https://api.pushover.net/1/messages.json", {
       method:  "POST",
       headers: { "Content-Type":"application/x-www-form-urlencoded" },
       body:    new URLSearchParams({
@@ -868,57 +936,22 @@ async function sendSMS(body) {
 }
 
 // Sends an array of messages sequentially with a short delay between each.
-// Use instead of multiple bare sendSMS calls whenever a session needs to
+// Use instead of multiple bare sendPush calls whenever a session needs to
 // split a long summary into parts — keeps the call-site readable and
 // ensures Pushover doesn't receive concurrent requests from the same process.
 async function sendParts(parts, delayMs = 2000) {
   for (let i = 0; i < parts.length; i++) {
-    if (parts[i]) await sendSMS(parts[i]);
+    if (parts[i]) await sendPush(parts[i]);
     if (i < parts.length - 1) await new Promise(r => setTimeout(r, delayMs));
   }
 }
 
 // ═══════════════════════════════════════════════════════════════
-// MARKET SENTIMENT — SPY day change used as regime signal
+// MARKET SENTIMENT — SPY day change used as regime signal.
 // Used by generateTrades to adjust strategy selection and
 // condor wing width based on current market conditions.
-// (Alpha Vantage VIX/SPY fetching retired Jul 29 2026 — see
-//  getMarketRegime for full history of why VIX was dropped)
-// ═══════════════════════════════════════════════════════════════
-
-// VIX_REGIME history:
-// - Originally used Alpha Vantage GLOBAL_QUOTE for ^VIX — always failed
-//   (^VIX is not a valid symbol for that endpoint). VIX defaulted to 18
-//   every session so regime was always NORMAL. Retired Jul 29 2026.
-// - Re-added Aug 2026 via Tradier /markets/quotes?symbols=VIX — now
-//   optional (fails gracefully to null) and used to widen IC wings when
-//   IV is elevated and skip condors when premium is too thin (VIX < 15).
-//   See fetchVIX() and getMarketRegime() for full implementation.
-
-// ═══════════════════════════════════════════════════════════════
-// REGIME SIGNAL — retired Alpha Vantage VIX/SPY fetching entirely
-// (Jul 29 2026). Root cause of "VIX fetch failed... defaulting to 18"
-// appearing in EVERY session log: GLOBAL_QUOTE doesn't support index
-// symbols like ^VIX at all — that call could never have succeeded.
-// SPY's fetch failed too, via a different mechanism (the reserved
-// Alpha Vantage key was independently exhausted). CONSEQUENCE: since
-// a defaulted VIX of 18 can never exceed any threshold (18 IS the
-// calm boundary) and a defaulted SPY change of 0 can never be below
-// any negative threshold, getMarketRegime(18, 0) always evaluated to
-// NORMAL — every single session since this system was built never
-// once actually classified real market conditions.
-//
-// FIX: derive the regime signal from SPY's day change already
-// present in portfolioData (fetched reliably via Tradier's batched
-// quote call every cycle) — no separate network call, no external
-// dependency, no possibility of a silent default masking a real
-// failure. SPY's move is a well-established, highly-correlated
-// proxy for broad market volatility.
-//
-// VIX was re-added Aug 2026 via Tradier /markets/quotes?symbols=VIX
-// as a SECONDARY signal — it widens IC wings when IV is elevated
-// and halts all trading when VIX > 40 (crash-level fear). VIX is
-// optional and fails gracefully; the regime works without it.
+// VIX is a secondary signal — widens IC wings when elevated,
+// halts all trading when VIX > 40. Fails gracefully to null.
 // ═══════════════════════════════════════════════════════════════
 
 function getSpyChangeFromPortfolio(portfolioData) {
@@ -938,34 +971,41 @@ function getSpyChangeFromPortfolio(portfolioData) {
 // ═══════════════════════════════════════════════════════════════
 
 // ── AUTH ─────────────────────────────────────────────────────
-// Tastytrade uses session tokens (not static bearer tokens).
-// Session tokens expire after 24 hours — brokerLogin() runs at
-// startup and again in sundaySummary() every Sunday to refresh.
+// Tastytrade uses OAuth2. Access tokens expire every 15 minutes.
+// We exchange the long-lived refresh token for a new access token
+// as needed. brokerLogin() is called at startup and auto-refreshes
+// inside brokerRequest() when the token is within 60s of expiry.
 async function brokerLogin() {
   try {
-    const userPreview = BROKER.username
-      ? `${BROKER.username.slice(0,3)}***${BROKER.username.slice(-4)}`
-      : "MISSING";
-    const passSet = BROKER.password ? `set (${BROKER.password.length} chars)` : "MISSING";
-    console.log(`  🔐 Auth attempt — user: ${userPreview} | pass: ${passSet} | url: ${BROKER.baseUrl}`);
-    const res = await fetch(`${BROKER.baseUrl}/sessions`, {
+    const clientIdSet      = BROKER.clientId     ? `${BROKER.clientId.slice(0,8)}...`    : "MISSING";
+    const clientSecretSet  = BROKER.clientSecret ? `set (${BROKER.clientSecret.length} chars)` : "MISSING";
+    const refreshTokenSet  = BROKER.refreshToken ? `set (${BROKER.refreshToken.length} chars)` : "MISSING";
+    console.log(`  🔐 OAuth2 token request — client: ${clientIdSet} | secret: ${clientSecretSet} | refresh: ${refreshTokenSet} | url: ${BROKER.baseUrl}`);
+
+    const res = await fetchWithTimeout(`${BROKER.baseUrl}/oauth/token`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        "User-Agent":   "options-trading-bot/3.0",
+      },
       body: JSON.stringify({
-        login:       BROKER.username,
-        password:    BROKER.password,
-        "remember-me": true,
+        grant_type:    "refresh_token",
+        refresh_token: BROKER.refreshToken,
+        client_secret: BROKER.clientSecret,
+        client_id:     BROKER.clientId,
       }),
     });
-    if (!res.ok) throw new Error(`Login failed: ${res.status} ${await res.text()}`);
+    if (!res.ok) throw new Error(`Token request failed: ${res.status} ${await res.text()}`);
     const data = await res.json();
-    BROKER.sessionToken = data?.data?.["session-token"];
-    if (!BROKER.sessionToken) throw new Error("No session token in response");
-    console.log("  ✅ Tastytrade session established");
+    BROKER.accessToken = data.access_token;
+    // expires_in is in seconds; buffer 60s early
+    BROKER.tokenExpiry = Date.now() + ((data.expires_in ?? 900) - 60) * 1000;
+    if (!BROKER.accessToken) throw new Error("No access_token in response");
+    console.log("  ✅ Tastytrade OAuth2 token obtained");
     return true;
   } catch(e) {
     console.error(`  ✗ Tastytrade login failed: ${e.message}`);
-    await sendSMS(`🚨 TASTYTRADE LOGIN FAILED\n${e.message}\nBot cannot trade until auth is restored.`);
+    await sendPush(`🚨 TASTYTRADE LOGIN FAILED\n${e.message}\nBot cannot trade until auth is restored.`);
     return false;
   }
 }
@@ -978,8 +1018,8 @@ async function runBrokerDiagnostics() {
   const results = [];
 
   // 1. Auth — already tested in brokerLogin at startup, just confirm
-  const authOk = !!BROKER.sessionToken;
-  results.push({ name:"Auth / session token",  ok: authOk });
+  const authOk = !!BROKER.accessToken;
+  results.push({ name:"Auth / access token",  ok: authOk });
 
   // 2. Stock quotes — core price feed
   try {
@@ -1021,20 +1061,22 @@ async function runBrokerDiagnostics() {
     const msg = `🔬 TASTYTRADE DIAGNOSTICS — ${passed}/${results.length} PASSED\n\n` +
       failed.map(r => `❌ ${r.name}: ${r.detail || "failed"}`).join("\n") +
       `\n\nBot is running but failed endpoints will block trades.\nCheck Railway logs for details.`;
-    await sendSMS(msg);
+    await sendPush(msg);
   }
   return failed.length === 0;
 }
 async function brokerRequest(method, path, body = null, attempt = 1) {
-  if (!BROKER.sessionToken) {
+  // Refresh access token if missing or within 60s of expiry
+  if (!BROKER.accessToken || Date.now() >= BROKER.tokenExpiry) {
     const ok = await brokerLogin();
     if (!ok) throw new Error("Tastytrade not authenticated");
   }
   const url = `${BROKER.baseUrl}${path}`;
   const headers = {
-    "Authorization": BROKER.sessionToken,
+    "Authorization": `Bearer ${BROKER.accessToken}`,
     "Content-Type":  "application/json",
     "Accept":        "application/json",
+    "User-Agent":    "options-trading-bot/3.0",
   };
   const opts = { method, headers };
   if (body && method !== "GET") opts.body = JSON.stringify(body);
@@ -1043,12 +1085,13 @@ async function brokerRequest(method, path, body = null, attempt = 1) {
     return brokerRequest(method, `${path}?${qs}`, null, attempt);
   }
 
-  const res = await fetch(url, opts);
+  const res = await fetchWithTimeout(url, opts);
 
-  // Re-auth on 401 — session expired mid-day
+  // Re-auth on 401 — token may have expired slightly early
   if (res.status === 401 && attempt === 1) {
-    console.log("  ⚠ Tastytrade session expired — re-authenticating...");
-    BROKER.sessionToken = null;
+    console.log("  ⚠ Tastytrade token expired — refreshing...");
+    BROKER.accessToken = null;
+    BROKER.tokenExpiry = 0;
     return brokerRequest(method, path, body, 2);
   }
   if (res.status === 429) {
@@ -1095,7 +1138,30 @@ async function getPositions() {
   }
 }
 
+// ── ACCOUNT BALANCES ─────────────────────────────────────────
+// Returns buying power and cash so morningSession can verify capital
+// before placing trades. Tastytrade splits buying power by asset class;
+// option_buying_power is the relevant figure for option purchases.
+async function getAccountBalances() {
+  try {
+    const data = await brokerRequest("GET", `/accounts/${BROKER.accountId}/balances`);
+    const b    = data?.data || {};
+    return {
+      option_buying_power: parseFloat(b["derivative-buying-power"] ?? b["option-buying-power"] ?? b["buying-power"] ?? 0),
+      cash:                parseFloat(b["cash-balance"] ?? b["net-liquidating-value"] ?? 0),
+      net_liquidating:     parseFloat(b["net-liquidating-value"] ?? 0),
+    };
+  } catch(e) {
+    console.error(`  ✗ Account balances fetch failed: ${e.message}`);
+    throw e; // caller handles — morningSession aborts in live mode on throw
+  }
+}
+
 // ── QUOTES ───────────────────────────────────────────────────
+// getOptionQuote is an alias — used when fetching option-leg quotes specifically,
+// but the underlying endpoint and response shape are identical to equity quotes.
+const getOptionQuote = (symbols) => getQuotes(symbols);
+
 async function getQuotes(symbols) {
   try {
     const syms = Array.isArray(symbols) ? symbols : [symbols];
@@ -1193,7 +1259,58 @@ async function getExpirations(ticker) {
 }
 
 // ── ORDERS ───────────────────────────────────────────────────
-// Tastytrade order structure differs significantly from Tradier.
+// An accepted order (Received/Routed/Live) is NOT a filled order. These helpers
+// poll the order until it fills, and cancel it if it does not fill in time, so
+// the bot never tracks (or believes it closed) a position that does not exist.
+const ORDER_DEAD_STATES = new Set(["Cancelled","Rejected","Expired","Removed"]);
+
+function summarizeFills(order) {
+  let qty = 0, notional = 0;
+  for (const leg of order?.legs || []) {
+    for (const f of leg.fills || []) {
+      const q = parseFloat(f.quantity || 0);
+      qty      += q;
+      notional += q * parseFloat(f["fill-price"] || 0);
+    }
+  }
+  return { filledQty: qty, avgPrice: qty > 0 ? notional / qty : null };
+}
+
+async function getOrder(orderId) {
+  const data = await brokerRequest("GET", `/accounts/${BROKER.accountId}/orders/${orderId}`);
+  return data?.data || null;
+}
+
+// Returns { filled, filledQty, avgPrice, status }. On timeout the order is
+// cancelled and re-read once, so a fill that lands during the cancel is counted.
+async function waitForFill(orderId, requestedQty, timeoutMs = MANDATE.fillWaitMs) {
+  const deadline = Date.now() + timeoutMs;
+  let order = null;
+  while (Date.now() < deadline) {
+    try { order = await getOrder(orderId); } catch(e) {
+      console.log(`  ⚠ Order ${orderId} status poll failed: ${e.message}`);
+    }
+    if (order) {
+      const { filledQty, avgPrice } = summarizeFills(order);
+      if (order.status === "Filled" || filledQty >= requestedQty) {
+        return { filled: true, filledQty: filledQty || requestedQty, avgPrice, status: order.status };
+      }
+      if (ORDER_DEAD_STATES.has(order.status)) {
+        return { filled: filledQty > 0, filledQty, avgPrice, status: order.status };
+      }
+    }
+    await new Promise(r => setTimeout(r, 3000));
+  }
+  // Timed out — cancel, then re-read to catch a fill that raced the cancel.
+  console.log(`  ⏱ Order ${orderId} not filled in ${timeoutMs/1000}s — cancelling`);
+  try { await brokerRequest("DELETE", `/accounts/${BROKER.accountId}/orders/${orderId}`); }
+  catch(e) { console.log(`  ⚠ Cancel request for ${orderId}: ${e.message}`); }
+  await new Promise(r => setTimeout(r, 2000));
+  try { order = await getOrder(orderId); } catch(e) { /* fall through with last known state */ }
+  const { filledQty, avgPrice } = summarizeFills(order);
+  return { filled: filledQty > 0, filledQty, avgPrice, status: order?.status ?? "Unknown" };
+}
+
 // Single-leg long options use "Buy to Open" action.
 async function placeOrder(trade) {
   const { ticker, strategy, legs, quantity, limitPrice } = trade;
@@ -1226,54 +1343,99 @@ async function placeOrder(trade) {
       console.error(`  ✗ Tasty order ${orderId} rejected: ${reason}`);
       return { success:false, error:`Order rejected: ${reason}`, orderId };
     }
-    console.log(`  ✅ Tasty order placed: ${orderId} (${status})`);
-    return { success:true, orderId };
+    console.log(`  ✅ Tasty order accepted: ${orderId} (${status})`);
+
+    // Sandbox (cert) fills are not reliable — accept as-is there. Live orders
+    // must actually fill before the position is tracked.
+    if (BROKER.sandbox) return { success:true, orderId };
+
+    const requestedQty = quantity || 1;
+    const fill = await waitForFill(orderId, requestedQty);
+    if (!fill.filled || fill.filledQty <= 0) {
+      console.error(`  ✗ Order ${orderId} did not fill (${fill.status}) — position NOT tracked`);
+      return { success:false, error:`Order not filled (${fill.status})`, orderId };
+    }
+    if (fill.filledQty < requestedQty) {
+      console.log(`  ⚠ Partial fill ${fill.filledQty}/${requestedQty} on ${orderId} — tracking filled quantity only`);
+    }
+    console.log(`  ✅ Filled ${fill.filledQty} @ ${fill.avgPrice != null ? "$" + fill.avgPrice.toFixed(2) : "n/a"}`);
+    return { success:true, orderId, filledQuantity: fill.filledQty, fillPrice: fill.avgPrice };
   } catch(e) {
     console.error(`  ✗ Tasty order failed: ${e.message}`);
     return { success:false, error:e.message };
   }
 }
 
+// Reconcile planned quantity/cost with the actual fill (live only; sandbox
+// results carry no fill data and pass through unchanged).
+function applyFill(legs, result) {
+  const plannedQty = legs.quantity || 1;
+  const qty        = result.filledQuantity ?? plannedQty;
+  const cost       = result.fillPrice != null
+    ? Math.round(result.fillPrice * 100 * qty)
+    : Math.round((legs.cost / plannedQty) * qty);
+  return { quantity: qty, cost };
+}
+
 async function closePosition(position) {
   console.log(`  📤 Closing ${position.symbol} (Tastytrade)...`);
   try {
-    // Live midpoint limit for closes
-    let limitPrice;
-    const quotes = await getQuotes(fromTastySymbol(position.symbol));
-    const q = quotes[0];
-    if (q?.bid != null && q?.ask != null && q.bid > 0) {
-      limitPrice = ((q.bid + q.ask) / 2).toFixed(2);
-    }
-    const action = position.quantity > 0 ? "Sell to Close" : "Buy to Close";
-    const orderBody = {
-      "order-type":    limitPrice ? "Limit" : "Market",
-      "time-in-force": "Day",
-      legs: [{
-        "instrument-type": "Equity Option",
-        symbol:            toTastySymbol(position.symbol),
-        quantity:          Math.abs(position.quantity),
-        action,
-      }],
-      ...(limitPrice ? { price: limitPrice, "price-effect": "Credit" } : {}),
-    };
+    const isLong    = position.quantity > 0;
+    const action    = isLong ? "Sell to Close" : "Buy to Close";
+    const MAX_TRIES = 3;
+    let remaining   = Math.abs(position.quantity);
+    let lastOrderId;
 
-    for (let attempt = 1; attempt <= 3; attempt++) {
+    for (let attempt = 1; attempt <= MAX_TRIES; attempt++) {
       try {
+        // Re-quote every attempt so a retry doesn't reuse a stale midpoint.
+        // The final attempt goes to market: getting out beats a better price
+        // when two limit attempts have already failed to fill.
+        let limitPrice;
+        if (attempt < MAX_TRIES) {
+          const quotes = await getQuotes(fromTastySymbol(position.symbol));
+          const q = quotes[0];
+          if (q?.bid != null && q?.ask != null && q.bid > 0) {
+            limitPrice = ((q.bid + q.ask) / 2).toFixed(2);
+          }
+        }
+        const orderBody = {
+          "order-type":    limitPrice ? "Limit" : "Market",
+          "time-in-force": "Day",
+          legs: [{
+            "instrument-type": "Equity Option",
+            symbol:            toTastySymbol(position.symbol),
+            quantity:          remaining,
+            action,
+          }],
+          ...(limitPrice ? { price: limitPrice, "price-effect": "Credit" } : {}),
+        };
+
         const data    = await brokerRequest("POST", `/accounts/${BROKER.accountId}/orders`, orderBody);
         const orderId = data?.data?.order?.id;
         const status  = data?.data?.order?.status;
         if (orderId && ["Received","Routed","Live","Filled"].includes(status)) {
-          console.log(`  ✅ Tasty close order: ${orderId} (${status})`);
-          return { success:true, orderId };
+          lastOrderId = orderId;
+          console.log(`  ✅ Tasty close order accepted: ${orderId} (${status}, attempt ${attempt})`);
+          if (BROKER.sandbox) return { success:true, orderId };
+
+          const fill = await waitForFill(orderId, remaining);
+          remaining -= fill.filledQty;
+          if (remaining <= 0) {
+            console.log(`  ✅ Close filled: ${position.symbol}`);
+            return { success:true, orderId };
+          }
+          console.error(`  ✗ Close attempt ${attempt}: ${remaining} contract(s) of ${position.symbol} still open (${fill.status})`);
+        } else {
+          const reason = data?.data?.order?.["reject-reason"] ?? status ?? "unknown";
+          console.error(`  ✗ Tasty close attempt ${attempt}: ${reason}`);
         }
-        const reason = data?.data?.order?.["reject-reason"] ?? status ?? "unknown";
-        console.error(`  ✗ Tasty close attempt ${attempt}: ${reason}`);
       } catch(e) {
         console.error(`  ✗ Tasty close attempt ${attempt}: ${e.message}`);
       }
-      if (attempt < 3) await new Promise(r => setTimeout(r, attempt * 5000));
+      if (attempt < MAX_TRIES) await new Promise(r => setTimeout(r, 2000));
     }
-    return { success:false, error:"Close failed after 3 attempts" };
+    return { success:false, error:`Close not filled after ${MAX_TRIES} attempts (${remaining} still open)`, orderId:lastOrderId };
   } catch(e) {
     console.error(`  ✗ Tasty close failed: ${e.message}`);
     return { success:false, error:e.message };
@@ -1299,12 +1461,13 @@ async function fetchVIX() {
 }
 
 function getVIXLabel(vix) {
-  if (!vix)     return { label:"UNKNOWN",  note:"VIX unavailable" };
-  if (vix > 40) return { label:"CRASH",    note:`VIX ${vix.toFixed(1)} — crash-level fear. Puts expensive. No new positions.` };
-  if (vix > 30) return { label:"EXTREME",  note:`VIX ${vix.toFixed(1)} — extreme fear. Options very expensive. Only highest-conviction setups.` };
-  if (vix > 20) return { label:"ELEVATED", note:`VIX ${vix.toFixed(1)} — elevated. Options moderately expensive. Favour 10% OTM over 15%.` };
-  if (vix > 15) return { label:"NORMAL",   note:`VIX ${vix.toFixed(1)} — normal. Standard option pricing.` };
-  return         { label:"LOW",      note:`VIX ${vix.toFixed(1)} — low. Options cheap. Moves may be smaller than expected.` };
+  // Always include the raw numeric value so callers don't have to re-parse the note string.
+  if (!vix)     return { label:"UNKNOWN",  value: 0,   note:"VIX unavailable" };
+  if (vix > 40) return { label:"CRASH",    value: vix, note:`VIX ${vix.toFixed(1)} — crash-level fear. Puts expensive. No new positions.` };
+  if (vix > 30) return { label:"EXTREME",  value: vix, note:`VIX ${vix.toFixed(1)} — extreme fear. Options very expensive. Only highest-conviction setups.` };
+  if (vix > 20) return { label:"ELEVATED", value: vix, note:`VIX ${vix.toFixed(1)} — elevated. Options moderately expensive. Favour 10% OTM over 15%.` };
+  if (vix > 15) return { label:"NORMAL",   value: vix, note:`VIX ${vix.toFixed(1)} — normal. Standard option pricing.` };
+  return         { label:"LOW",      value: vix, note:`VIX ${vix.toFixed(1)} — low. Options cheap. Moves may be smaller than expected.` };
 }
 
 function getMarketRegime(spyChangePct, vix = null) {
@@ -1574,7 +1737,7 @@ function buildTradePrompt({ today, optionable, regime, spyChange, sectorHealth,
           ? ` | AT WEEK HIGH (+${pctFromHigh}%)`
           : ` | ${pctFromHigh}% from week high`)
       : "";
-    const highBetaNote = HIGH_BETA_TICKERS.includes(p.ticker) ? " | HIGH-BETA (score≥8)" : "";
+    const highBetaNote = HIGH_BETA_TICKERS.includes(p.ticker) ? ` | HIGH-BETA (score≥${HIGH_BETA_MIN_SCORE})` : "";
     return `${p.ticker}: $${p.price?.toFixed(2)} ${(p.changePct||0)>=0?"▲":"▼"}${Math.abs(p.changePct||0).toFixed(2)}% | IV:${p.ivProfile} | ${p.sector}${momentumNote}${sectorNote}${highBetaNote}`;
   }).join("\n");
 
@@ -1791,7 +1954,7 @@ async function generateTrades(portfolioData, preComputedRegime = null) {
   if (regime.skipTrading && regime.label === "MARKET CRASH") {
     // In a crash, buying calls is foolish and puts are extremely expensive (IV spike).
     // Halt all new positions. Existing positions still monitored and stopped out normally.
-    await sendSMS(`⚠️ TRADING HALTED — MARKET CRASH\n${regime.note}\nAll new positions blocked. Existing positions still monitored.\nBot resumes tomorrow morning.`);
+    await sendPush(`⚠️ TRADING HALTED — MARKET CRASH\n${regime.note}\nAll new positions blocked. Existing positions still monitored.\nBot resumes tomorrow morning.`);
     return [];
   }
 
@@ -1806,8 +1969,7 @@ async function generateTrades(portfolioData, preComputedRegime = null) {
   //   moved 5-10% daily. VIX 16.7 ↑ is a better signal than VIX 18.0 ↓.
   //
   // Condition 2: Hard catalyst present within earningsWindowDays.
-  const currentVIX = regime.vix?.note
-    ? parseFloat(regime.vix.note.match(/VIX ([\d.]+)/)?.[1] ?? 0) : 0;
+  const currentVIX = regime.vix?.value ?? 0;
   const gateUTCms = new Date(new Date().toISOString().slice(0,10) + "T00:00:00Z").getTime();
   const hasUpcomingEarnings = Object.entries(EARNINGS).some(([, d]) => {
     const daysOut = Math.ceil((new Date(d + "T00:00:00Z") - gateUTCms) / (1000*60*60*24));
@@ -1833,7 +1995,7 @@ async function generateTrades(portfolioData, preComputedRegime = null) {
     .map(([t]) => t);
   const momentumGatePass = recentMomentumNames.length >= 3;
   if (momentumGatePass) {
-    console.log(`  📈 Momentum gate: ${recentMomentumNames.length} names with TARGET_HIT/BIG_MOVE in last 24h — ${recentMomentumNames.join(", ")}`);
+    console.log(`  📈 Momentum gate: ${recentMomentumNames.length} names with TARGET_HIT/BIG_MOVE in last 36h — ${recentMomentumNames.join(", ")}`);
   }
   const trendStr = vix5dayAvgGate ? `${currentVIX.toFixed(1)} vs ${vix5dayAvgGate.toFixed(1)} avg ${currentVIX > vix5dayAvgGate ? "↑" : "↓"}` : `${currentVIX.toFixed(1)} (no history yet)`;
 
@@ -1847,7 +2009,7 @@ async function generateTrades(portfolioData, preComputedRegime = null) {
       .join(", ") || "none upcoming";
     const reason = !vixAboveFloor ? `VIX ${currentVIX.toFixed(1)} below floor ${MANDATE.minVIXToTrade}` : `VIX ${trendStr} — not trending up`;
     console.log(`  ⏭ MARKET CONDITION GATE: sitting in cash — ${reason} | no earnings within ${MANDATE.earningsWindowDays} days | no momentum (${recentMomentumNames.length}/3 names). Next: ${nextEarnings}.`);
-    await sendSMS(`⏭ NO TRADES TODAY — market condition gate\nVIX ${trendStr} | no earnings within ${MANDATE.earningsWindowDays} days | momentum ${recentMomentumNames.length}/3 names\nNext earnings: ${nextEarnings}\nSitting in cash. Monitoring open positions.\nNot financial advice.`);
+    await sendPush(`⏭ NO TRADES TODAY — market condition gate\nVIX ${trendStr} | no earnings within ${MANDATE.earningsWindowDays} days | momentum ${recentMomentumNames.length}/3 names\nNext earnings: ${nextEarnings}\nSitting in cash. Monitoring open positions.\nNot financial advice.`);
     return [];
   }
   const gateReasons = [
@@ -1887,7 +2049,7 @@ async function generateTrades(portfolioData, preComputedRegime = null) {
   // producing "Unexpected end of JSON input" on parse. 8192 is the hard
   // ceiling for this model — safe to set unconditionally.
   const msg = await retryAI(() => ai.messages.create({
-    model:      "claude-sonnet-4-6",
+    model:      AI_MODEL,
     max_tokens: 8192,
     messages:   [{ role: "user", content: prompt }],
   }));
@@ -1913,19 +2075,32 @@ async function generateTrades(portfolioData, preComputedRegime = null) {
     .replace(/```\s*$/i, "")
     .trim();
 
-  // Match ALL JSON arrays and take the LAST one. The model may emit
-  // explanation text containing [...] before the actual data array —
-  // the first-match regex would parse the wrong array. The last array
-  // in the response is always the structured data payload.
-  const allMatches = cleaned.match(/\[[\s\S]*?\]/g);
-  const match = allMatches ? allMatches[allMatches.length - 1] : null;
-  if (!match) throw new Error(`No JSON array found in generateTrades. Raw: ${cleaned.slice(0, 200)}`);
-
+  // Extract the top-level JSON array using a bracket-depth counter.
+  // A simple non-greedy regex (/\[[\s\S]*?\]/g) terminates at the first
+  // inner ']' and breaks when the AI uses square brackets in string values
+  // (e.g. "catalyst": "earnings in [3 days]"). The depth counter finds the
+  // complete outer array regardless of nested brackets in string content.
   let parsed;
   try {
-    parsed = JSON.parse(match);
-  } catch(e) {
-    throw new Error(`JSON parse failed in generateTrades: ${e.message}`);
+    // Fast path: if the whole cleaned string is valid JSON, use it directly.
+    parsed = JSON.parse(cleaned);
+    if (!Array.isArray(parsed)) throw new Error("top-level value is not an array");
+  } catch(_) {
+    // Slow path: scan for first complete top-level array with depth counter.
+    let depth = 0, start = -1, found = null;
+    for (let i = 0; i < cleaned.length; i++) {
+      if (cleaned[i] === "[") {
+        if (depth++ === 0) start = i;
+      } else if (cleaned[i] === "]" && depth > 0) {
+        if (--depth === 0 && start !== -1) { found = cleaned.slice(start, i + 1); break; }
+      }
+    }
+    if (!found) throw new Error(`No JSON array found in generateTrades. Raw: ${cleaned.slice(0, 200)}`);
+    try {
+      parsed = JSON.parse(found);
+    } catch(e) {
+      throw new Error(`JSON parse failed in generateTrades: ${e.message}`);
+    }
   }
 
   return normaliseAndFilterTrades(parsed, effectiveMin, { broadWeakness });
@@ -1991,8 +2166,8 @@ function computePnL(ourTrade, g) {
   return { openCost, maxProfitShare, currentPnL, currentPct };
 }
 
-// ── TRADE RECONSTRUCTION FROM TRADIER POSITIONS ───────────────
-// When a position is orphaned (in Tradier but not in state.openPositions),
+// ── TRADE RECONSTRUCTION FROM BROKER POSITIONS ────────────────
+// When a position is orphaned (in Tastytrade but not in state.openPositions),
 // rebuilds a minimal tracking record so monitoring can resume.
 function rebuildTradeFromPositions(underlying, legs) {
   try {
@@ -2034,7 +2209,7 @@ function rebuildTradeFromPositions(underlying, legs) {
       if (sp.length) { const m = sp[0].symbol.match(/P(\d{8})/); shortPutStrike  = m ? parseInt(m[1])/1000 : undefined; }
     }
 
-    // Tradier cost_basis is negative for short (sold) legs — summing gives net credit.
+    // cost_basis is negative for short (sold) legs — summing gives net credit.
     const netCostBasis = legs.reduce((sum, p) => sum + (p.cost_basis || 0), 0);
     const isCredit     = netCostBasis < 0;
     const executedCost = Math.abs(Math.round(netCostBasis));
@@ -2075,12 +2250,12 @@ async function getGroupedLivePositions() {
   }
 
   if (!positions.length) {
-    // Tradier confirmed the account is genuinely flat (not a fetch failure —
+    // Tastytrade confirmed the account is genuinely flat (not a fetch failure —
     // that case returns null above). Before wiping tracked positions, apply
     // the same 60-minute grace period used by the stale-leg cleanup below.
     //
     // ROOT CAUSE OF AUG 18 2026 BUG: trades filled at 9:10 were wiped at
-    // 9:20 because this branch had NO grace period. Tradier's positions
+    // 9:20 because this branch had NO grace period. Broker positions
     // endpoint lags the orders endpoint by up to 15 minutes after a fill —
     // a confirmed [] response 10 minutes after placement is NOT proof the
     // trade doesn't exist. The grace period prevents this race condition by
@@ -2095,7 +2270,7 @@ async function getGroupedLivePositions() {
       if (recentTrades.length > 0) {
         // Some positions are too recent to trust a flat response — keep them.
         // Only purge trades that are clearly old enough to be genuinely gone.
-        console.log(`  ⏳ Tradier shows flat but ${recentTrades.length} position(s) placed within ${STALE_GRACE_MS/60000}min — skipping cleanup (fill-to-position lag)`);
+        console.log(`  ⏳ Tastytrade shows flat but ${recentTrades.length} position(s) placed within ${STALE_GRACE_MS/60000}min — skipping cleanup (fill-to-position lag)`);
         const oldTrades = state.openPositions.filter(t => {
           const ageMs = t.executedAt ? nowMs - new Date(t.executedAt).getTime() : Infinity;
           return ageMs >= STALE_GRACE_MS;
@@ -2104,7 +2279,7 @@ async function getGroupedLivePositions() {
           const oldList = oldTrades.map(t => `${t.ticker} ${t.strategy}`).join(", ");
           console.error(`  🧹 STALE: ${oldList} — flat for 60min+, removing`);
           state.openPositions = state.openPositions.filter(t => !oldTrades.includes(t));
-          await sendSMS(`🧹 STALE CLEANUP\n${oldList}\n\nTastytrade flat 60min+ since placement — assumed closed.\nVerify P&L manually.\nNot financial advice.`);
+          await sendPush(`🧹 STALE CLEANUP\n${oldList}\n\nTastytrade flat 60min+ since placement — assumed closed.\nVerify P&L manually.\nNot financial advice.`);
           saveState();
         }
         return [];
@@ -2114,7 +2289,7 @@ async function getGroupedLivePositions() {
       const staleList = state.openPositions.map(t => `${t.ticker} ${t.strategy}`).join(", ");
       console.error(`  🧹 STALE TRACKED POSITIONS: Tastytrade confirms account is flat but ${state.openPositions.length} trade(s) still tracked — removing: ${staleList}`);
       state.openPositions = [];
-      await sendSMS(
+      await sendPush(
 `🧹 STALE POSITION CLEANUP
 ${staleList}
 
@@ -2134,7 +2309,7 @@ Not financial advice.`
   const quoteMap   = {};
   for (const q of quotes) quoteMap[q.symbol] = q;
 
-  // Group Tradier position rows by which internal trade they belong to.
+  // Group position rows by which internal trade they belong to.
   // Untracked legs are collected by ticker+expiry for inline reconciliation.
   const grouped    = new Map();
   const untrackedByKey = {}; // key: "TICKER:YYMMDD" — prevents merging SPY Aug5 + SPY Aug10
@@ -2170,7 +2345,7 @@ Not financial advice.`
       console.error(`  ⚠ Inline restore failed for ${underlying} (${legs.length} legs)`);
       continue;
     }
-    // Skip expired — they linger in Tradier until settlement but restoring
+    // Skip expired — they linger in Tastytrade until settlement but restoring
     // them every 20min cycle would spam notifications and trigger bogus closes.
     const expDate = new Date(rebuilt.expiration + "T00:00:00Z");
     if (expDate < new Date()) {
@@ -2192,7 +2367,7 @@ Not financial advice.`
   }
   if (inlineRestored.length > 0) {
     saveState();
-    await sendSMS(`🔄 INLINE POSITION RESTORE\n${inlineRestored.length} untracked position(s) auto-recovered mid-session:\n\n${inlineRestored.join("\n")}\n\nMonitoring (breach, DTE, stop) now active.\nNot financial advice.`);
+    await sendPush(`🔄 INLINE POSITION RESTORE\n${inlineRestored.length} untracked position(s) auto-recovered mid-session:\n\n${inlineRestored.join("\n")}\n\nMonitoring (breach, DTE, stop) now active.\nNot financial advice.`);
   }
 
   // Convert to results array
@@ -2205,13 +2380,10 @@ Not financial advice.`
   }
 
   // ── STALE POSITION CLEANUP ─────────────────────────────────────
-  // GRACE PERIOD (Aug 4 2026): Tradier has a fill-to-position lag for
-  // multileg condors — legs placed at 9:10 AM weren't visible in the
-  // positions endpoint at 9:20 AM, causing all 3 ICs to be wiped.
+  // GRACE PERIOD: broker has a fill-to-position lag for multileg condors —
+  // legs placed at 9:10 AM may not appear in the positions endpoint at 9:20 AM.
   // Trades placed within STALE_GRACE_MS (module constant) are never
-  // marked stale. Path 1 (account-flat in getGroupedLivePositions) now
-  // uses the same constant — previously it had no grace period at all,
-  // which caused the Aug 18 2026 wipe of 3 freshly-filled positions.
+  // marked stale to prevent premature cleanup of freshly-filled positions.
   const nowMs        = Date.now();
   const trulyGrouped = new Set(grouped.keys());
 
@@ -2230,7 +2402,7 @@ Not financial advice.`
       console.error(`  🧹 STALE: ${stale.ticker} ${stale.strategy} — no Tastytrade legs found after grace period, removing from tracking`);
     }
     state.openPositions = state.openPositions.filter(t => !staleTrades.includes(t));
-    await sendSMS(`🧹 STALE POSITION CLEANUP\n${staleTrades.map(t=>`${t.ticker} ${t.strategy}`).join(", ")}\n\nNo matching legs in Tastytrade after 60min — assumed closed.\nVerify P&L manually.\nNot financial advice.`);
+    await sendPush(`🧹 STALE POSITION CLEANUP\n${staleTrades.map(t=>`${t.ticker} ${t.strategy}`).join(", ")}\n\nNo matching legs in Tastytrade after 60min — assumed closed.\nVerify P&L manually.\nNot financial advice.`);
     saveState();
   }
 
@@ -2275,17 +2447,17 @@ function getLivePositionSnapshot(groups) {
 }
 
 async function sendLiveSnapshot(groups) {
-  // Accepts pre-fetched groups from the same cycle — no second Tradier round-trip.
+  // Accepts pre-fetched groups from the same cycle — no second broker round-trip.
   // Filter to trades still open (monitorOpenPositions may have closed some this cycle).
   const stillOpen = (groups || []).filter(g => state.openPositions.includes(g.ourTrade));
   const snap = getLivePositionSnapshot(stillOpen);
 
   if (!snap.hasPositions) {
-    await sendSMS(`📊 LIVE SNAPSHOT\n${new Date().toLocaleTimeString()}\n\nNo open positions.\nAll data verified via Tastytrade live quotes.`);
+    await sendPush(`📊 LIVE SNAPSHOT\n${new Date().toLocaleTimeString()}\n\nNo open positions.\nAll data verified via Tastytrade live quotes.`);
     return snap;
   }
 
-  await sendSMS(
+  await sendPush(
 `📊 LIVE POSITION SNAPSHOT
 ${new Date().toLocaleTimeString()} — VERIFIED (Tastytrade live quotes)
 
@@ -2380,63 +2552,30 @@ async function monitorOpenPositions(groups, underlyingPriceMap = {}) {
         // Previously closed each leg as an individual single-leg order
         // 500ms apart. Risk: leg 1-2 accept, leg 3-4 reject → naked short
         // left open (the exact scenario PARTIAL CLOSE ALERT was designed to
-        // catch after the fact). Tradier supports multileg close orders with
-        // class:"multileg" and side[i]: "buy_to_close"/"sell_to_close".
-        // A single multileg order is atomic: either all legs fill or none do.
+        // catch after the fact). A single multileg order is atomic: either
+        // all legs fill or none do.
         // Single-leg positions (CSPs) still use closeOptionsPosition (single).
         let closeResult;
         if (g.positions.length === 1) {
           const pos = g.positions[0];
-          closeResult = await closePosition({ symbol:pos.symbol, underlyingSymbol:ourTrade.ticker, quantity:Math.abs(pos.quantity), side:pos.quantity>0?"buy_to_open":"sell_to_open" });
+          closeResult = await closePosition({ symbol:pos.symbol, underlyingSymbol:ourTrade.ticker, quantity:Math.abs(pos.quantity) });
         } else {
-          // Multileg: build a single close order for all legs atomically.
-          // Fetch midpoint quote for limit price in live mode.
-          let orderType = "market";
-          let limitPrice;
-          if (!BROKER.sandbox) {
-            try {
-              const allSymbols = g.positions.map(p => p.symbol);
-              const quotes = await getOptionQuote(allSymbols);
-              const quoteMap = Object.fromEntries(quotes.map(q => [q.symbol, q]));
-              // Net midpoint across all legs (same sign convention as the open)
-              let netMid = 0;
-              for (const pos of g.positions) {
-                const q = quoteMap[pos.symbol];
-                if (!q || q.bid == null || q.ask == null || q.bid <= 0) { netMid = null; break; }
-                const legSign = pos.quantity > 0 ? 1 : -1; // long leg adds cost, short leg adds credit
-                netMid += legSign * (q.bid + q.ask) / 2;
-              }
-              if (netMid != null) {
-                limitPrice = Math.abs(netMid).toFixed(2);
-                orderType  = "limit";
-              }
-            } catch(e) {
-              console.log(`  ⚠ Midpoint fetch failed for multileg close — using market order`);
-            }
-          }
-          const params = {
-            class:    "multileg",
-            symbol:   ourTrade.ticker,
-            type:     orderType,
-            duration: "day",
-            ...(limitPrice ? { price: limitPrice } : {}),
-          };
-          g.positions.forEach((pos, i) => {
-            params[`option_symbol[${i}]`] = pos.symbol;
-            params[`side[${i}]`]          = pos.quantity > 0 ? "sell_to_close" : "buy_to_close";
-            params[`quantity[${i}]`]       = Math.abs(pos.quantity);
-          });
-
-          let success = false;
-          // Tastytrade: close each leg individually.
-          // v3 only uses single-leg positions so this path is rarely hit.
+          // Multileg close: v3 is long-only single-leg, so this path only fires
+          // if a reconstructed orphan position (e.g. a legacy IC) is being closed.
+          // Tastytrade does not provide a true atomic multileg close via the REST
+          // orders API — each leg must be sent individually. Risk of partial fills
+          // is accepted here; the PARTIAL CLOSE ALERT (closeFailureCount) will
+          // catch and alert if any leg rejects.
           let allClosed = true;
           for (const pos of g.positions) {
-            const r = await closePosition({ symbol:pos.symbol, underlyingSymbol:ourTrade.ticker, quantity:Math.abs(pos.quantity), side:pos.quantity>0?"buy_to_open":"sell_to_open" });
+            const r = await closePosition({
+              symbol:           pos.symbol,
+              underlyingSymbol: ourTrade.ticker,
+              quantity:         Math.abs(pos.quantity),
+            });
             if (!r.success) { allClosed = false; break; }
           }
-          success = allClosed;
-          closeResult = { success, error: success ? null : "Multileg close failed" };
+          closeResult = { success: allClosed, error: allClosed ? null : "One or more legs failed to close" };
         }
         const allClosed = closeResult.success;
         if (allClosed) {
@@ -2488,7 +2627,7 @@ async function monitorOpenPositions(groups, underlyingPriceMap = {}) {
             ? `Early exits: ${ts.earlyExits} | Held to expiry: ${ts.heldToExpiry}`
             : "";
 
-          await sendSMS(
+          await sendPush(
 `◈ POSITION CLOSED
 ${ourTrade.ticker} ${ourTrade.strategy} (${g.positions.length} legs)
 ${closeReason}
@@ -2520,7 +2659,7 @@ Not financial advice.`
 
           if (failureCount === 3) {
             // First escalation — 3 consecutive failed cycles (~15 min at 5-min checks)
-            await sendSMS(
+            await sendPush(
               `🚨 CRITICAL — PERSISTENT CLOSE FAILURE\n` +
               `${ourTrade.ticker} ${ourTrade.strategy}\n` +
               `Reason: ${failureReason.slice(0, 200)}\n\n` +
@@ -2533,7 +2672,7 @@ Not financial advice.`
           } else if (failureCount > 3 && failureCount % 5 === 0) {
             // Reminder every 5 cycles after the first escalation — avoids
             // spamming on every cycle while still alerting every ~25 minutes
-            await sendSMS(
+            await sendPush(
               `🚨 STILL FAILING — Close failure #${failureCount}\n` +
               `${ourTrade.ticker} ${ourTrade.strategy}\n` +
               `P&L: ${currentPnL>=0?"+":""}$${currentPnL.toFixed(0)} (${currentPct.toFixed(1)}%) | DTE:${dte}\n` +
@@ -2542,7 +2681,7 @@ Not financial advice.`
             );
           } else {
             // Normal retry notification for first 2 failures
-            await sendSMS(
+            await sendPush(
               `🚨 CLOSE FAILURE #${failureCount}\n` +
               `${ourTrade.ticker} ${ourTrade.strategy}\n` +
               `Reason: ${failureReason.slice(0, 200)}\n` +
@@ -2624,9 +2763,9 @@ Include every ticker. Use null for analystTarget if no data found.`;
 
   try {
     const msg = await retryAI(() => ai.messages.create({
-      model:      "claude-sonnet-4-6",
+      model:      AI_MODEL,
       max_tokens: 2000,
-      tools:      [{ type: "web_search_20250305", name: "web_search" }],
+      tools:      [WEB_SEARCH_TOOL],
       messages:   [{ role: "user", content: prompt }],
     }));
     // Collect ALL content blocks — model returns tool_use blocks first,
@@ -2643,21 +2782,27 @@ Include every ticker. Use null for analystTarget if no data found.`;
       return { totalUpdated, targetChanges, skipped };
     }
 
-    // Extract JSON array — take the LAST match in case the model emitted
-    // explanation text with embedded [...] before the actual data array.
-    const allMatches2 = allText.match(/\[[\s\S]*?\]/g);
-    const match = allMatches2 ? allMatches2[allMatches2.length - 1] : null;
-    if (!match) {
-      console.log("  ⚠ No JSON array found in response. Raw text:", allText.slice(0, 200));
-      return { totalUpdated, targetChanges, skipped };
-    }
-
+    // Extract JSON array using bracket-depth counter (safe against brackets inside string values).
     let results;
     try {
-      results = JSON.parse(match);
-    } catch(parseErr) {
-      console.error("  ✗ JSON parse failed:", parseErr.message);
-      return { totalUpdated, targetChanges, skipped };
+      results = JSON.parse(allText);
+      if (!Array.isArray(results)) throw new Error("not an array");
+    } catch(_) {
+      let depth = 0, start = -1, found = null;
+      for (let i = 0; i < allText.length; i++) {
+        if (allText[i] === "[") { if (depth++ === 0) start = i; }
+        else if (allText[i] === "]" && depth > 0) { if (--depth === 0 && start !== -1) { found = allText.slice(start, i + 1); break; } }
+      }
+      if (!found) {
+        console.log("  ⚠ No JSON array found in response. Raw text:", allText.slice(0, 200));
+        return { totalUpdated, targetChanges, skipped };
+      }
+      try {
+        results = JSON.parse(found);
+      } catch(parseErr) {
+        console.error("  ✗ JSON parse failed:", parseErr.message);
+        return { totalUpdated, targetChanges, skipped };
+      }
     }
     for (const r of results) {
       if (!r.ticker || !r.analystTarget) continue;
@@ -2762,7 +2907,7 @@ async function morningSession() {
   if (!BROKER.sandbox && balanceFetchFailed) {
     const msg = "⚠️ MORNING SESSION ABORTED\nCould not verify account balance — refusing to place trades blind in live mode.\nCheck Tastytrade API connectivity and redeploy if needed.";
     console.error(`  🛑 ${msg}`);
-    await sendSMS(msg);
+    await sendPush(msg);
     return;
   }
 
@@ -2772,12 +2917,18 @@ async function morningSession() {
     console.log("  ⏭ Daily circuit breaker tripped — no new trades this morning.");
     return;
   }
+  const haltReason = drawdownHaltReason();
+  if (haltReason) {
+    console.error(`  🛑 ${haltReason}`);
+    await sendPush(`🛑 TRADING HALTED\n${haltReason}\nNo new entries until P&L recovers or the period resets. Open positions are still monitored.`);
+    return;
+  }
 
   const portfolioData = await fetchAllPrices();
   const modeFlag      = BROKER.sandbox ? " [SANDBOX]" : "";
 
   // Fetch VIX for regime calibration — affects wing width and condor eligibility.
-  // Fails gracefully to null if Tradier doesn't support the VIX symbol in sandbox.
+  // Fails gracefully to null (VIX may not be available in sandbox).
   const vix = await fetchVIX();
 
   // Record VIX in rolling 5-day history for trend detection.
@@ -2839,7 +2990,7 @@ async function morningSession() {
       break; // success — empty result is valid, don't retry
     } catch(e) {
       if (!isRetryableError(e) || scanAttempt === 3) {
-        await sendSMS(`⚠️ Morning scan failed after ${scanAttempt} attempt(s): ${e.message}`);
+        await sendPush(`⚠️ Morning scan failed after ${scanAttempt} attempt(s): ${e.message}`);
         return;
       }
       const wait = scanAttempt * 30000;
@@ -2896,21 +3047,24 @@ async function morningSession() {
 
     const result = await placeOrder({ ticker:trade.ticker, strategy:trade.strategy, legs:legs.legs, quantity:legs.quantity || 1, limitPrice:legs.limitPrice });
     if (result.success) {
-      const ex = { ...trade, ...legs, orderId:result.orderId||"SANDBOX", executedAt:new Date().toISOString(), executedCost:legs.cost, executedPrice:stockData.price, status:"OPEN" };
+      // Use what actually filled (live): quantity and cost can differ from the plan
+      // after a partial fill or price improvement.
+      const fill = applyFill(legs, result);
+      const ex = { ...trade, ...legs, ...fill, orderId:result.orderId||"SANDBOX", executedAt:new Date().toISOString(), executedCost:fill.cost, executedPrice:stockData.price, status:"OPEN" };
       executed.push(ex);
       state.openPositions.push(ex);
       state.dailyTrades.push(ex);
-      state.totalDeployedToday   += legs.cost;
-      state.totalCollateralToday += (legs.collateral ?? legs.cost);
+      state.totalDeployedToday   += fill.cost;
+      state.totalCollateralToday += fill.cost;
       appendTradeLog({
         type: "open", ticker: trade.ticker, strategy: trade.strategy,
-        expiration: legs.expiration, executedCost: legs.cost,
+        expiration: legs.expiration, executedCost: fill.cost,
         collateral: legs.collateral ?? null, executedPrice: stockData.price,
         orderId: result.orderId || "SANDBOX", source: "morning",
       });
       // Long options: "cost" not "premium/collateral" — you're buying, not selling
       const costLabel = legs.isCredit === false ? "cost" : "premium";
-      console.log(`  ✅ ${trade.ticker} ${trade.strategy} — $${legs.cost} ${costLabel} | strike $${legs.strike ?? "?"} exp ${legs.expiration}`);
+      console.log(`  ✅ ${trade.ticker} ${trade.strategy} — $${fill.cost} ${costLabel} | strike $${legs.strike ?? "?"} exp ${legs.expiration}`);
     } else {
       console.log(`  ✗ ${trade.ticker} ${trade.strategy} — order rejected: ${result.error}`);
     }
@@ -2925,7 +3079,7 @@ async function morningSession() {
     const header =
       `◈ MORNING${modeFlag} ${new Date().toLocaleDateString()} ✅ ${executed.length} trade${executed.length>1?"s":""}${regimeFlag}${cbFlag}\n` +
       `Spent: $${state.totalDeployedToday} | Trail activates at +${MANDATE.trailActivationPct}%\n` +
-      `Monitoring every 20 min | Stop -${MANDATE.stopLossPct}% | Exit at ${MANDATE.timeDTE} DTE\nNot financial advice.`;
+      `Monitoring every 5 min | Stop -${MANDATE.stopLossPct}% | Exit at ${MANDATE.timeDTE} DTE\nNot financial advice.`;
 
     // Part 2: trade detail — one compact line per trade, always fits even with 6 trades
     // Format: "1. NVDA CSP  $420 9.5%  exp 08-22  #12345"
@@ -2939,7 +3093,7 @@ async function morningSession() {
 
     await sendParts([header, detail]);
   } else {
-    await sendSMS(
+    await sendPush(
       `◈ MORNING${modeFlag} ${new Date().toLocaleDateString()}\n` +
       `No trades — no setups met the ${MANDATE.minReturnPct}% mandate.${regimeFlag}${cbFlag}\n` +
       `Not financial advice.`
@@ -2965,6 +3119,11 @@ async function opportunisticScan() {
 
   if (state.dailyCircuitBreakerTripped) {
     console.log("  ⏭  Skipping — daily circuit breaker tripped, no new trades today.");
+    return;
+  }
+  const haltReasonOpp = drawdownHaltReason();
+  if (haltReasonOpp) {
+    console.log(`  ⏭  Skipping — ${haltReasonOpp}`);
     return;
   }
 
@@ -3079,30 +3238,31 @@ async function opportunisticScan() {
   const result = await placeOrder({ ticker:candidate.ticker, strategy:candidate.strategy, legs:legs.legs, quantity:legs.quantity || 1, limitPrice:legs.limitPrice });
 
   if (result.success) {
-    const ex = { ...candidate, ...legs, orderId:result.orderId, executedAt:new Date().toISOString(), executedCost:legs.cost, executedPrice:stockData.price, status:"OPEN", source:"opportunistic" };
+    const fill = applyFill(legs, result);
+    const ex = { ...candidate, ...legs, ...fill, orderId:result.orderId, executedAt:new Date().toISOString(), executedCost:fill.cost, executedPrice:stockData.price, status:"OPEN", source:"opportunistic" };
     state.openPositions.push(ex);
     state.dailyTrades.push(ex);
-    state.totalDeployedToday   += legs.cost;
-    state.totalCollateralToday += (legs.collateral ?? legs.cost);
+    state.totalDeployedToday   += fill.cost;
+    state.totalCollateralToday += fill.cost;
     appendTradeLog({
       type: "open", ticker: candidate.ticker, strategy: candidate.strategy,
-      expiration: legs.expiration, executedCost: legs.cost,
+      expiration: legs.expiration, executedCost: fill.cost,
       collateral: legs.collateral ?? null, executedPrice: stockData.price,
       orderId: result.orderId, source: "opportunistic",
     });
 
-    await sendSMS(
+    await sendPush(
 `🎯 OPPORTUNISTIC TRADE
 ${candidate.ticker} ${(stockData.changePct>=0?"▲":"▼")}${Math.abs(stockData.changePct).toFixed(1)}% move triggered scan
 
 ${candidate.strategy}
-Cost: $${legs.cost} | Min return: ${candidate.targetReturnPct}%
+Cost: $${fill.cost} | Min return: ${candidate.targetReturnPct}%
 Rationale: ${candidate.reasoning}
 
 Deployed today: $${state.totalDeployedToday} / $${MANDATE.dailyCapMax}
 Not financial advice.`
     );
-    console.log(`  ✅ Opportunistic trade placed: ${candidate.ticker} ${candidate.strategy} — $${legs.cost}`);
+    console.log(`  ✅ Opportunistic trade placed: ${candidate.ticker} ${candidate.strategy} — $${fill.cost}`);
     saveState(); // persist the new trade immediately
   } else {
     console.log(`  ✗ Order failed: ${result.error}`);
@@ -3135,7 +3295,7 @@ async function intradayCheck() {
       .filter(g => g.valid && state.openPositions.includes(g.ourTrade))
       .reduce((sum, g) => sum + computePnL(g.ourTrade, g).currentPnL, 0);
 
-    // Include positions still in grace (not yet confirmed by Tradier).
+    // Include positions still in grace (not yet confirmed by broker).
     // These can't be monitored directly but represent real capital at risk.
     // Conservative estimate: -50% of cost (standard stop threshold).
     const nowMs = Date.now();
@@ -3157,7 +3317,7 @@ async function intradayCheck() {
     if (totalExposure <= -MANDATE.dailyMaxLoss) {
       state.dailyCircuitBreakerTripped = true;
       console.error(`  🛑 CIRCUIT BREAKER: realized $${state.dailyPnL.toFixed(0)} + unrealized $${unrealizedPnL.toFixed(0)} + unconfirmed est. $${unconfirmedExposure.toFixed(0)} = $${totalExposure.toFixed(0)} ≤ -$${MANDATE.dailyMaxLoss}`);
-      await sendSMS(
+      await sendPush(
         `🛑 DAILY CIRCUIT BREAKER TRIPPED\n` +
         `Realized P&L:   $${state.dailyPnL.toFixed(0)}\n` +
         `Unrealized P&L: $${unrealizedPnL.toFixed(0)}\n` +
@@ -3201,7 +3361,8 @@ async function intradayCheck() {
       // No STOP_LOSS today — decay by 1 (once per day per ticker)
       const dc = state.downtrendCount[stock.ticker];
       if (dc && dc.count > 0 && dc.lastDate !== todayStr) {
-        dc.count = Math.max(0, dc.count - 1);
+        dc.count    = Math.max(0, dc.count - 1);
+        dc.lastDate = todayStr; // mark today as decayed — otherwise this fires every 5-min cycle
         if (dc.count === 0) {
           delete state.downtrendCount[stock.ticker];
           console.log(`  📈 ${stock.ticker} downtrend counter decayed to 0 — downtrend cleared`);
@@ -3226,7 +3387,7 @@ async function intradayCheck() {
       const key = `${todayStr}_${stock.ticker}_${actionable.map(a=>a.type).join("_")}_${new Date().getHours()}`;
       if (!state.alertsSent.has(key)) {
         state.alertsSent.add(key);
-        await sendSMS(`⚡ ${stock.ticker} ALERT\nPrice: $${stock.price.toFixed(2)} ${(stock.changePct||0)>=0?"▲":"▼"}${Math.abs(stock.changePct||0).toFixed(2)}%\n\n${actionable.map(a=>`${a.urgency}\n${a.msg}`).join("\n\n")}\n\nStop: $${getStopLoss(stock.ticker,stock.stopLoss)?.toFixed(2)||"N/A"} | Target: $${getTarget(stock.ticker,stock.target)?.toFixed(2)||"N/A"}\nNot financial advice.`);
+        await sendPush(`⚡ ${stock.ticker} ALERT\nPrice: $${stock.price.toFixed(2)} ${(stock.changePct||0)>=0?"▲":"▼"}${Math.abs(stock.changePct||0).toFixed(2)}%\n\n${actionable.map(a=>`${a.urgency}\n${a.msg}`).join("\n\n")}\n\nStop: $${getStopLoss(stock.ticker,stock.stopLoss)?.toFixed(2)||"N/A"} | Target: $${getTarget(stock.ticker,stock.target)?.toFixed(2)||"N/A"}\nNot financial advice.`);
         console.log(`  ✅ Alert: ${stock.ticker} — ${actionable.map(a=>a.type).join(", ")}`);
       }
     }
@@ -3239,50 +3400,56 @@ async function intradayCheck() {
   console.log(`  ✓ Check complete. Open positions: ${state.openPositions.length}`);
 }
 
+// ── PRE-CLOSE SWEEP: 3:50 PM ─────────────────────────────────
+// Force-closes any DTE ≤ timeDTE positions while the market is still
+// open. This MUST run before 4:00 PM ET; "Day" TIF orders submitted
+// after close are rejected. closingSession (4:07 PM) is P&L summary only.
+async function preCloseExpirySweep() {
+  console.log(`\n[${new Date().toLocaleTimeString()}] ⏰ Pre-close expiry sweep (3:50 PM)...`);
+  if (!state.openPositions.length) {
+    console.log("  ✓ No open positions — nothing to sweep.");
+    return;
+  }
+  const portfolioData = await fetchAllPrices();
+  const todayStrC = new Date().toISOString().slice(0, 10);
+  const todayUTCC = new Date(todayStrC + "T00:00:00Z");
+  const groups = await getGroupedLivePositions();
+  const expiringGroups = [];
+
+  for (const g of groups) {
+    if (!g.valid) continue;
+    const expDate = new Date(g.ourTrade.expiration + "T00:00:00Z");
+    const dte     = Math.ceil((expDate - todayUTCC) / (1000*60*60*24));
+    if (dte <= MANDATE.timeDTE) {
+      console.log(`  ⚠ ${g.ourTrade.ticker} ${g.ourTrade.strategy} expiring in ${dte} DTE — forcing close (time stop: ≤${MANDATE.timeDTE} DTE)`);
+      expiringGroups.push(g);
+    }
+  }
+
+  if (expiringGroups.length > 0) {
+    const underlyingPriceMap = Object.fromEntries(portfolioData.map(p => [p.ticker, p]));
+    await monitorOpenPositions(expiringGroups, underlyingPriceMap);
+    console.log(`  ✅ Pre-close sweep complete — ${expiringGroups.length} position(s) processed.`);
+  } else {
+    console.log(`  ✓ No DTE≤${MANDATE.timeDTE} positions — nothing to force-close.`);
+  }
+}
+
 async function closingSession() {
-  console.log(`\n[${new Date().toLocaleTimeString()}] 🔔 Closing session...`);
+  console.log(`\n[${new Date().toLocaleTimeString()}] 🔔 Closing session (P&L summary)...`);
   const portfolioData = await fetchAllPrices();
   const winners  = portfolioData.filter(p=>(p.changePct||0)>0).sort((a,b)=>b.changePct-a.changePct);
   const losers   = portfolioData.filter(p=>(p.changePct||0)<0).sort((a,b)=>a.changePct-b.changePct);
   const modeFlag = BROKER.sandbox ? " [SANDBOX]" : "";
 
-  // ── FORCED CLOSE: DTE ≤ 1 POSITIONS ──────────────────────────
-  const todayStrC = new Date().toISOString().slice(0, 10);
-  const todayUTCC = new Date(todayStrC + "T00:00:00Z");
-  const expiringGroups  = [];
-  let   firstFetchGroups = null; // reuse below if no closes happened
-
-  if (state.openPositions.length > 0) {
-    console.log("  🔍 Checking for DTE≤1 positions to force-close before expiry...");
-    firstFetchGroups = await getGroupedLivePositions();
-    for (const g of firstFetchGroups) {
-      if (!g.valid) continue;
-      const expDate = new Date(g.ourTrade.expiration + "T00:00:00Z");
-      const dte     = Math.ceil((expDate - todayUTCC) / (1000*60*60*24));
-      if (dte <= MANDATE.timeDTE) {
-        console.log(`  ⚠ ${g.ourTrade.ticker} ${g.ourTrade.strategy} expiring in ${dte} DTE — forcing close (time stop: ≤${MANDATE.timeDTE} DTE)`);
-        expiringGroups.push(g);
-      }
-    }
-    if (expiringGroups.length > 0) {
-      const underlyingPriceMap = Object.fromEntries(portfolioData.map(p => [p.ticker, p]));
-      await monitorOpenPositions(expiringGroups, underlyingPriceMap);
-      console.log(`  ✅ Expiry-risk close sweep complete (${expiringGroups.length} position(s) processed).`);
-      firstFetchGroups = null; // positions changed — must re-fetch for unrealized snapshot
-    } else {
-      console.log(`  ✓ No DTE≤${MANDATE.timeDTE} positions — nothing to force-close.`);
-    }
-  }
-
   // ── UNREALIZED P&L snapshot for summary ──────────────────────
-  // Reuse firstFetchGroups when no closes happened — avoids a redundant
-  // Tradier round-trip on the vast majority of days where nothing expires.
-  // After closes, firstFetchGroups is nulled so we re-fetch fresh state.
+  // DTE closes are handled by preCloseExpirySweep at 3:50 PM;
+  // this session only needs a fresh read for the P&L summary.
   let unrealizedPnL   = 0;
   let unrealizedLines = "";
   if (state.openPositions.length > 0) {
     try {
-      const remainingGroups = firstFetchGroups ?? await getGroupedLivePositions();
+      const remainingGroups = await getGroupedLivePositions();
       const snap = getLivePositionSnapshot(remainingGroups);
       unrealizedPnL   = snap.totalPnL || 0;
       unrealizedLines = snap.lines?.length
@@ -3391,17 +3558,26 @@ If no split found: {"splitDetected": false}`;
 
     try {
       const msg = await retryAI(() => ai.messages.create({
-        model:     "claude-sonnet-4-6",
+        model:     AI_MODEL,
         max_tokens: 300,
-        tools:     [{ type: "web_search_20250305", name: "web_search" }],
+        tools:     [WEB_SEARCH_TOOL],
         messages:  [{ role: "user", content: verifyPrompt }],
       }));
 
-      const text  = msg.content.filter(b => b.type === "text").map(b => b.text || "").join("").trim();
-      const match = text.match(/\{[\s\S]*?\}/);
-      if (!match) continue;
-
-      const result = JSON.parse(match[0]);
+      const text = msg.content.filter(b => b.type === "text").map(b => b.text || "").join("").trim();
+      // Use bracket-depth counter to find the complete top-level JSON object.
+      let result;
+      try {
+        result = JSON.parse(text);
+      } catch(_) {
+        let depth = 0, start = -1, found = null;
+        for (let i = 0; i < text.length; i++) {
+          if (text[i] === "{") { if (depth++ === 0) start = i; }
+          else if (text[i] === "}" && depth > 0) { if (--depth === 0 && start !== -1) { found = text.slice(start, i + 1); break; } }
+        }
+        if (!found) continue;
+        try { result = JSON.parse(found); } catch(_2) { continue; }
+      }
       if (!result.splitDetected || !result.ratio) continue;
 
       const confirmedRatio = result.ratio;
@@ -3449,7 +3625,7 @@ If no split found: {"splitDetected": false}`;
       `${s.ticker}: ${s.ratio}-for-1 split (${s.date})\nNew cost: $${s.newCost} | Stop: $${s.newStop} | Target: $${s.newTarget}`
     ).join("\n\n");
 
-    await sendSMS(
+    await sendPush(
 `🔀 SPLIT DETECTED & AUTO-FIXED
 ${new Date().toLocaleDateString()}
 
@@ -3608,7 +3784,7 @@ console.log(`📊 ${PORTFOLIO.length} stocks | ${PORTFOLIO.filter(p=>p.optionabl
 console.log(`◎  Mandate: $${MANDATE.dailyCapMin}–$${MANDATE.dailyCapMax}/day | $${MANDATE.minPerTrade}–$${MANDATE.maxPerTrade}/trade | ${MANDATE.targetMinDTE}–${MANDATE.targetMaxDTE} DTE | ${MANDATE.otmPctMin}–${MANDATE.otmPctMax}% OTM | Max ${MANDATE.maxOpenPositions} positions | Trail from +${MANDATE.trailActivationPct}% | Stop -${MANDATE.stopLossPct}%`);
 console.log(`🔗 Broker: Tastytrade ${BROKER.sandbox ? "(SANDBOX)" : "(LIVE)"} — ${BROKER.baseUrl}`);
 console.log("⏰ Schedule:");
-console.log("   Mon–Fri 9:10 AM — Morning scan + execute");
+console.log("   Mon–Fri 9:45 AM — Morning scan + execute");
 console.log("   Mon–Fri 9:25 AM — Analyst targets refresh");
 console.log("   Mon–Fri 9:30–3:55PM — Position monitor + trailing stops every 5 min");
 console.log("   Mon–Fri 11:02,1:02,3:02 — Opportunistic scan (5%+ moves only)");
@@ -3619,7 +3795,7 @@ console.log("   Sunday 8:00 AM  — Full portfolio review + auto-update all leve
 // ORPHANED POSITION RECONCILIATION
 // Runs once at boot: fetches real Tastytrade positions, compares against
 // state.openPositions (restored from disk or empty after first boot),
-// and auto-retracks anything found in Tradier that the bot doesn't
+// and auto-retracks anything found in Tastytrade that the bot doesn't
 // know about — with a push notification summarising what was recovered.
 // ═══════════════════════════════════════════════════════════════
 async function reconcileOrphanedPositions() {
@@ -3675,13 +3851,13 @@ async function reconcileOrphanedPositions() {
 
     if (reTracked.length > 0) {
       saveState();
-      await sendSMS(`✅ ORPHANED POSITIONS RE-TRACKED\nBot restarted and recovered ${reTracked.length} position(s):\n\n${reTracked.join("\n")}\n\nMonitoring (stop-loss, profit-target, breach) now active.\nCost basis reconstructed from Tastytrade — P&L estimates approximate.\nNot financial advice.`);
+      await sendPush(`✅ ORPHANED POSITIONS RE-TRACKED\nBot restarted and recovered ${reTracked.length} position(s):\n\n${reTracked.join("\n")}\n\nMonitoring (stop-loss, profit-target, breach) now active.\nCost basis reconstructed from Tastytrade — P&L estimates approximate.\nNot financial advice.`);
     }
 
     if (orphanSummaries.length > 0) {
       console.error(`  🚨 ${orphanSummaries.length} orphaned position(s) could not be auto-retracked:`);
       orphanSummaries.forEach(s => console.error(`     ${s}`));
-      await sendSMS(`🚨 ORPHANED POSITIONS DETECTED\n${orphanSummaries.join("\n")}\n\nThese are REAL open positions in Tastytrade with NO automated protection. Close or manage manually.`);
+      await sendPush(`🚨 ORPHANED POSITIONS DETECTED\n${orphanSummaries.join("\n")}\n\nThese are REAL open positions in Tastytrade with NO automated protection. Close or manage manually.`);
     }
 
     if (reTracked.length === 0 && orphanSummaries.length === 0) {
@@ -3693,7 +3869,7 @@ async function reconcileOrphanedPositions() {
 }
 
 // Schedules
-cron.schedule("10 9 * * 1-5",      () => runExclusive("morningSession",       morningSession),       { timezone:"America/New_York" });
+cron.schedule("45 9 * * 1-5",      () => runExclusive("morningSession",       morningSession),       { timezone:"America/New_York" });
 cron.schedule("25 9 * * 1-5",      () => runExclusive("updateAnalystTargets", updateAnalystTargets), { timezone:"America/New_York" });
 cron.schedule("*/5 9-15 * * 1-5",  () => runExclusive("intradayCheck",        intradayCheck),        { timezone:"America/New_York" }); // stops at 3:55 PM
 
@@ -3706,7 +3882,12 @@ cron.schedule("*/5 9-15 * * 1-5",  () => runExclusive("intradayCheck",        in
 // intraday -7%) that was exactly the kind of setup this scan exists to
 // catch. Offsetting by 2 minutes guarantees no collision, ever.
 cron.schedule("2 11,13,15 * * 1-5", () => runExclusive("opportunisticScan",    opportunisticScan),    { timezone:"America/New_York" });
-cron.schedule("7 16 * * 1-5",      () => runExclusive("closingSession",       closingSession),       { timezone:"America/New_York" }); // 4:07 PM — clears last 4:00 check
+// Pre-close sweep: 3:50 PM ET — force-closes DTE≤timeDTE positions while
+// the market is still open. Must run BEFORE 4:00 PM; "Day" TIF orders
+// submitted after close are rejected by Tastytrade.
+cron.schedule("50 15 * * 1-5",     () => runExclusive("preCloseExpirySweep",  preCloseExpirySweep),  { timezone:"America/New_York" });
+// Closing session: 4:07 PM ET — P&L summary only (no order placement).
+cron.schedule("7 16 * * 1-5",      () => runExclusive("closingSession",       closingSession),       { timezone:"America/New_York" });
 cron.schedule("0 8 * * 0",         () => runExclusive("sundaySummary",        sundaySummary),        { timezone:"America/New_York" });
 
 // ── SECURE BOOT ──────────────────────────────────────────────
@@ -3729,7 +3910,9 @@ cron.schedule("0 8 * * 0",         () => runExclusive("sundaySummary",        su
 
     // Restore state BEFORE reconciliation
     loadState();
-    await reconcileOrphanedPositions();
+    // Run under the global lock so a cron tick during a mid-day redeploy
+    // can't mutate state.openPositions concurrently with reconciliation.
+    await runExclusive("startupReconciliation", reconcileOrphanedPositions);
     await runExclusive("startupDiagnostics", intradayCheck);
     console.log("  🚀 Diagnostics clear. Background crons running.");
 
@@ -3737,11 +3920,11 @@ cron.schedule("0 8 * * 0",         () => runExclusive("sundaySummary",        su
     // about which mode is active. A copy-pasted Railway service misconfigured
     // for live would otherwise start trading without any obvious friction.
     if (!BROKER.sandbox) {
-      await sendSMS(
+      await sendPush(
         `⚠️ LIVE TRADING ACTIVE — REAL MONEY\n` +
         `Orders will execute on your real Tastytrade account.\n` +
-        `Verify TRADIER_SANDBOX is intentionally set to false before continuing.\n` +
-        `If this was unintentional, set TRADIER_SANDBOX=true and redeploy immediately.`
+        `Verify TASTYTRADE_SANDBOX is intentionally set to false before continuing.\n` +
+        `If this was unintentional, set TASTYTRADE_SANDBOX=true and redeploy immediately.`
       );
     }
 
@@ -3749,18 +3932,18 @@ cron.schedule("0 8 * * 0",         () => runExclusive("sundaySummary",        su
     // Show counts instead; full portfolio is in the Railway console log above.
     const highIVCount  = PORTFOLIO.filter(p => p.ivProfile === "high").length;
     const optionCount  = PORTFOLIO.filter(p => p.optionable).length;
-    await sendSMS(
+    await sendPush(
       `◈ OPTIONS BOT v3 ACTIVE (${modeLabel})\n` +
       `${optionCount} stocks (${highIVCount} high-IV) | $${MANDATE.dailyCapMin}–$${MANDATE.dailyCapMax}/day\n` +
       `$${MANDATE.minPerTrade}–$${MANDATE.maxPerTrade}/trade | ${MANDATE.minReturnPct}%+ return | ${MANDATE.otmPctMin}–${MANDATE.otmPctMax}% OTM\n` +
       `Strategy: Long Calls & Puts | Trail from +${MANDATE.trailActivationPct}% | Stop -${MANDATE.stopLossPct}%\n` +
-      `9:10 execute | 5min monitor | 4PM close | Sun 8AM review\n` +
+      `9:45 execute | 5min monitor | 4PM close | Sun 8AM review\n` +
       `Open positions: ${state.openPositions.length}`
     );
 
   } catch (bootError) {
     console.error("  🛑 BOOT ERROR:", bootError.message);
-    await sendSMS(
+    await sendPush(
       `⚠️ OPTIONS BOT BOOT ERROR\n${bootError.message}\nSchedules registered but startup check failed. Crons still running.`
     );
   }
