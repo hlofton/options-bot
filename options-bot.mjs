@@ -184,7 +184,7 @@ const MANDATE = {
 
   // ── Execution quality (live only) ─────────────────────────
   maxSpreadPct:       12,  // reject strikes whose (ask-bid)/mid exceeds this %.
-  minOpenInterest:   100,  // reject strikes with thinner open interest than this.
+  minOpenInterest:   100,  // reject thin open interest — enforced only if the data source supplies it (REST quotes do not).
   fillWaitMs:      60_000, // how long to wait for an entry/exit order to fill before cancelling.
 
   // ── Trailing stops (underlying stock monitoring) ──────────
@@ -664,8 +664,12 @@ function passesLiquidity(ticker, label, opt, bid, ask) {
     console.log(`  ✗ ${ticker} ${label} REJECTED — spread ${spreadPct.toFixed(1)}% > ${MANDATE.maxSpreadPct}% (bid $${bid} / ask $${ask})`);
     return false;
   }
-  if ((opt.open_interest ?? 0) < MANDATE.minOpenInterest) {
-    console.log(`  ✗ ${ticker} ${label} REJECTED — open interest ${opt.open_interest ?? 0} < ${MANDATE.minOpenInterest}`);
+  // Open interest is not in Tastytrade's REST quote response (open_interest is
+  // null), so this check only applies if a data source ever supplies it. Until
+  // then the spread filter above is the liquidity gate. Treating null as 0 here
+  // would reject every option and block all trades.
+  if (opt.open_interest != null && opt.open_interest < MANDATE.minOpenInterest) {
+    console.log(`  ✗ ${ticker} ${label} REJECTED — open interest ${opt.open_interest} < ${MANDATE.minOpenInterest}`);
     return false;
   }
   return true;
@@ -692,7 +696,7 @@ async function buildOptionsLegs(tradeRec, stockPrice, regime = null) {
           console.log(`  ✗ ${ticker} Long Call REJECTED — no expiry in ${MANDATE.targetMinDTE}–${MANDATE.targetMaxDTE} DTE window`);
           return null;
         }
-        const lcChain = await getChain(ticker, lcExp);
+        const lcChain = await getChain(ticker, lcExp, stockPrice);
         const lcCalls = lcChain.filter(o => o.option_type === "call").sort((a,b) => a.strike - b.strike);
 
         // Target strike: 10–15% OTM
@@ -779,7 +783,7 @@ async function buildOptionsLegs(tradeRec, stockPrice, regime = null) {
           console.log(`  ✗ ${ticker} Long Put REJECTED — no expiry in ${MANDATE.targetMinDTE}–${MANDATE.targetMaxDTE} DTE window`);
           return null;
         }
-        const lpChain = await getChain(ticker, lpExp);
+        const lpChain = await getChain(ticker, lpExp, stockPrice);
         const lpPuts  = lpChain.filter(o => o.option_type === "put").sort((a,b) => b.strike - a.strike);
 
         // Target strike: 2–7% OTM (below current price for puts)
@@ -1094,7 +1098,9 @@ async function brokerRequest(method, path, body = null, attempt = 1) {
   const opts = { method, headers };
   if (body && method !== "GET") opts.body = JSON.stringify(body);
   if (body && method === "GET") {
-    const qs = new URLSearchParams(body).toString();
+    // URLSearchParams encodes spaces as "+"; option symbols contain real spaces,
+    // so use %20 (a literal "+" in a value is already encoded as %2B).
+    const qs = new URLSearchParams(body).toString().replace(/\+/g, "%20");
     return brokerRequest(method, `${path}?${qs}`, null, attempt);
   }
 
@@ -1175,83 +1181,107 @@ async function getAccountBalances() {
 // but the underlying endpoint and response shape are identical to equity quotes.
 const getOptionQuote = (symbols) => getQuotes(symbols);
 
+// Tastytrade REST quotes: GET /market-data/by-type with one comma-separated
+// parameter per instrument type (equity / equity-option / index), max 100
+// symbols per request across all types. Fields are dasherized decimal strings.
+// Returned symbols are normalised: options come back in the bot's compact form.
+const OPTION_SYM_RE  = /^[A-Z.]{1,6}\s*\d{6}[CP]\d{8}$/;
+const INDEX_SYMBOLS  = new Set(["VIX", "SPX", "NDX", "RUT", "DJX"]);
+const QUOTE_BATCH    = 100;
+const numOrNull = v => (v == null || v === "" || Number.isNaN(parseFloat(v)) ? null : parseFloat(v));
+
 async function getQuotes(symbols) {
+  const syms = (Array.isArray(symbols) ? symbols : [symbols]).filter(Boolean);
+  const out  = [];
   try {
-    const syms = Array.isArray(symbols) ? symbols : [symbols];
-    // Tastytrade market data uses a different endpoint
-    const data = await brokerRequest("GET", "/market-data/quotes", {
-      symbols: syms.join(","),
-    });
-    const quotes = data?.data?.items || [];
-    return quotes.map(q => ({
-      symbol:            q.symbol,
-      last:              parseFloat(q.last ?? q["mark"] ?? 0),
-      bid:               parseFloat(q.bid ?? 0),
-      ask:               parseFloat(q.ask ?? 0),
-      change:            parseFloat(q.change ?? 0),
-      change_percentage: parseFloat(q["change-percent"] ?? 0),
-      volume:            parseInt(q.volume ?? 0),
-      high:              parseFloat(q.high ?? 0),
-      low:               parseFloat(q.low ?? 0),
-    }));
+    for (let i = 0; i < syms.length; i += QUOTE_BATCH) {
+      const equity = [], option = [], index = [];
+      for (const s of syms.slice(i, i + QUOTE_BATCH)) {
+        if (OPTION_SYM_RE.test(s))      option.push(toTastySymbol(fromTastySymbol(s)));
+        else if (INDEX_SYMBOLS.has(s))  index.push(s);
+        else                            equity.push(s);
+      }
+      const params = {};
+      if (equity.length) params["equity"]        = equity.join(",");
+      if (option.length) params["equity-option"] = option.join(",");
+      if (index.length)  params["index"]         = index.join(",");
+
+      const data  = await brokerRequest("GET", "/market-data/by-type", params);
+      const items = data?.data?.items || [];
+      for (const q of items) {
+        const lastRaw   = numOrNull(q.last);
+        const mark      = numOrNull(q.mark) ?? numOrNull(q.mid);
+        const last      = lastRaw > 0 ? lastRaw : (mark ?? 0);
+        const prevClose = numOrNull(q["prev-close"]);
+        out.push({
+          symbol:            q["instrument-type"] === "Equity Option" || OPTION_SYM_RE.test(q.symbol)
+                               ? fromTastySymbol(q.symbol) : q.symbol,
+          last,
+          mark:              mark ?? last,
+          bid:               numOrNull(q.bid) ?? 0,
+          ask:               numOrNull(q.ask) ?? 0,
+          change:            prevClose ? last - prevClose : 0,
+          change_percentage: prevClose ? ((last - prevClose) / prevClose) * 100 : 0,
+          volume:            Math.round(numOrNull(q.volume) ?? 0),
+          high:              numOrNull(q["day-high-price"]) ?? last,
+          low:               numOrNull(q["day-low-price"])  ?? last,
+        });
+      }
+    }
+    return out;
   } catch(e) {
     console.error(`  ✗ Tasty quotes: ${e.message}`);
-    return [];
+    return out; // whatever batches succeeded; callers treat missing symbols as "no quote"
   }
 }
 
 // ── OPTION CHAIN ─────────────────────────────────────────────
 // Tastytrade's /nested endpoint returns strike symbols but NOT prices.
 // We fetch the symbols first, then batch-quote them for bid/ask/greeks.
-async function getChain(ticker, expiration) {
+async function getChain(ticker, expiration, priceHint = null) {
   try {
-    // Step 1: get option symbols for this expiration from nested chain.
-    // NOTE: getExpirations() also calls /nested for the same ticker — two
-    // API calls per candidate. Acceptable at current scale (2-4 candidates
-    // per session); optimize to a single call if rate limits become an issue.
-    const chainData   = await brokerRequest("GET", `/option-chains/${ticker}/nested`);
-    const expirations = chainData?.data?.items || [];
-    const exp         = expirations.find(e => e.expiration === expiration);
+    // Step 1: option symbols for this expiration from the nested chain.
+    const expirations = await getNestedExpirations(ticker);
+    const exp         = expirations.find(e => e["expiration-date"] === expiration);
     if (!exp || !exp.strikes?.length) return [];
 
-    // Collect all option symbols (calls and puts) for this expiration
-    const symbolMap = {}; // symbol → { strike, type }
+    // Collect option symbols (calls and puts). When the caller knows the stock
+    // price, only quote strikes within ±15% of it — the bot only trades 3–7% OTM,
+    // and quoting every strike of a wide chain wastes API calls.
+    const symbolMap = {}; // tasty symbol → { strike, type }
     for (const strike of exp.strikes) {
       const strikePrice = parseFloat(strike["strike-price"]);
+      if (priceHint && (strikePrice < priceHint * 0.85 || strikePrice > priceHint * 1.15)) continue;
       if (strike.call) symbolMap[strike.call] = { strike: strikePrice, type: "call" };
       if (strike.put)  symbolMap[strike.put]  = { strike: strikePrice, type: "put" };
     }
     const symbols = Object.keys(symbolMap);
     if (!symbols.length) return [];
 
-    // Step 2: batch-fetch quotes for all symbols (bid/ask/greeks)
-    const quotesRaw = await brokerRequest("GET", "/market-data/quotes", {
-      symbols: symbols.join(","),
-    });
-    const quotesArr = quotesRaw?.data?.items || [];
-    const quoteMap  = {}; // symbol → quote
-    for (const q of quotesArr) quoteMap[q.symbol] = q;
+    // Step 2: batch-fetch bid/ask (getQuotes splits into ≤100-symbol requests
+    // and returns compact option symbols).
+    const quotes   = await getQuotes(symbols);
+    const quoteMap = {};
+    for (const q of quotes) quoteMap[q.symbol] = q;
 
-    // Step 3: combine into the shape buildOptionsLegs expects
+    // Step 3: combine into the shape buildOptionsLegs expects.
+    // Greeks and open interest are NOT in the REST market-data response, so
+    // they are null/0 here — nothing in the trade logic depends on them, and
+    // passesLiquidity() skips the open-interest check when it is null.
     return symbols.map(sym => {
       const { strike, type } = symbolMap[sym];
-      const q = quoteMap[sym] || {};
+      const compact = fromTastySymbol(sym);
+      const q = quoteMap[compact] || {};
       return {
-        symbol:        fromTastySymbol(sym),  // compact form for order placement
+        symbol:        compact,               // compact form for order placement
         strike,
         option_type:   type,
-        bid:           parseFloat(q.bid   ?? 0),
-        ask:           parseFloat(q.ask   ?? q.mark ?? 0),
-        last:          parseFloat(q.last  ?? q.mark ?? 0),
-        volume:        parseInt(q.volume  ?? 0),
-        open_interest: parseInt(q["open-interest"] ?? 0),
-        greeks: {
-          delta: parseFloat(q.delta ?? 0),
-          gamma: parseFloat(q.gamma ?? 0),
-          theta: parseFloat(q.theta ?? 0),
-          vega:  parseFloat(q.vega  ?? 0),
-          iv:    parseFloat(q.iv    ?? q["implied-volatility"] ?? 0),
-        },
+        bid:           q.bid  ?? 0,
+        ask:           q.ask  ?? 0,
+        last:          q.last ?? 0,
+        volume:        q.volume ?? 0,
+        open_interest: null,
+        greeks: { delta: 0, gamma: 0, theta: 0, vega: 0, iv: 0 },
       };
     }).filter(o => o.ask > 0); // drop options with no quote (illiquid)
   } catch(e) {
@@ -1260,11 +1290,38 @@ async function getChain(ticker, expiration) {
   }
 }
 
+// GET /option-chains/{symbol}/nested → data.items[] (one per option root), each
+// with expirations[] → { expiration-date, days-to-expiration, strikes[] }, and
+// strikes[] → { strike-price, call, put, ... }. Cached for 2 minutes: the same
+// chain is read by getExpirations and getChain for every candidate ticker.
+const nestedChainCache = new Map(); // ticker → { ts, expirations }
+async function getNestedExpirations(ticker) {
+  const cached = nestedChainCache.get(ticker);
+  if (cached && Date.now() - cached.ts < 120_000) return cached.expirations;
+
+  const data  = await brokerRequest("GET", `/option-chains/${ticker}/nested`);
+  const items = data?.data?.items || [];
+  // Prefer the standard (non-adjusted) option root when several are returned.
+  const standard = items.filter(it => !it["option-chain-type"] || it["option-chain-type"] === "Standard");
+  const roots    = standard.length ? standard : items;
+  const expirations = roots
+    .flatMap(it => Array.isArray(it.expirations) ? it.expirations : [])
+    .map(e => ({ ...e, "expiration-date": e["expiration-date"] ?? e.expiration }))
+    .filter(e => e["expiration-date"]);
+
+  if (!expirations.length) {
+    // Shape changed or empty chain — log keys (not values) so it can be diagnosed from the logs.
+    console.error(`  ✗ Nested chain ${ticker}: no expirations parsed. items=${items.length} itemKeys=${JSON.stringify(Object.keys(items[0] || {}))}`);
+  } else {
+    nestedChainCache.set(ticker, { ts: Date.now(), expirations });
+  }
+  return expirations;
+}
+
 async function getExpirations(ticker) {
   try {
-    const data = await brokerRequest("GET", `/option-chains/${ticker}/nested`);
-    const items = data?.data?.items || [];
-    return items.map(e => e.expiration).filter(Boolean).sort();
+    const exps = await getNestedExpirations(ticker);
+    return [...new Set(exps.map(e => e["expiration-date"]))].sort();
   } catch(e) {
     console.error(`  ✗ Tasty expirations ${ticker}: ${e.message}`);
     return [];
