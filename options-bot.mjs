@@ -7,10 +7,10 @@
 // Strategies: Long Call (bullish) | Long Put (bearish)
 //             AI selects direction based on momentum and technicals
 //             No premium selling — no collateral required
-// Mandate   : $300–$1,000/trade · $1,000–$3,000/day
+// Mandate   : $250–$1,000/trade · $1,000–$2,000/day
 //             2–7% OTM · 14–21 DTE · trail from +20%
 //             50% stop loss · 2 DTE time stop
-// Execution : Tradier API (sandbox or live)
+// Execution : Tastytrade API (live or cert sandbox)
 // Alerts    : Pushover push notifications
 // Schedule  : 9:10AM execute | 5min monitor | 4PM close | Sun review
 // Upgraded from v2 (CSP/IC) Aug 2026 — see archive/v2-csp-ic/
@@ -23,7 +23,7 @@
 //   ANTHROPIC_API_KEY=sk-ant-...
 //   PUSHOVER_USER_KEY=<your pushover user key>
 //   PUSHOVER_API_TOKEN=<your pushover app token>
-// (Alpha Vantage keys no longer needed — all prices via Tradier as of Jul 29 2026)
+// (Alpha Vantage keys no longer needed — all prices via Tastytrade as of Oct 2026)
 //   TRADIER_ACCESS_TOKEN=<your tradier token>
 //   TRADIER_ACCOUNT_ID=<your account id>
 //   TRADIER_SANDBOX=true                (set false for live trading)
@@ -65,7 +65,7 @@ if (!process.env.ANTHROPIC_API_KEY.startsWith("sk-ant-")) {
 const MANDATE = {
   // ── Capital ──────────────────────────────────────────────
   dailyCapMin:      1000,  // minimum to deploy per day ($)
-  dailyCapMax:      3000,  // maximum to deploy per day ($)
+  dailyCapMax:      2000,  // maximum to deploy per day ($)
   minPerTrade:       250,  // minimum cost per option purchase ($) — lowered from $300
                            // $300 was rejecting valid $290-$299 setups on a $6 difference.
                            // Quality is controlled by setupScore, not an arbitrary floor.
@@ -154,12 +154,13 @@ const MANDATE = {
   // ── Trailing stops (underlying stock monitoring) ──────────
   trailPctHighIV:     15,
   trailPctMediumIV:   10,
-  reconstructedGraceHours: 2, // Grace period for orphan-reconstructed positions.
-                           // Full 48h grace doesn't apply — position may have been
-                           // held for hours before reconstruction. 2h gives just
-                           // enough buffer for Tradier to confirm before stops apply.
-                           // Confirmed Sep 3 2026: GOOGL LP held at -60% for hours
-                           // because reconstruction gave it 20h grace from date_acquired.
+  reconstructedGraceHours: 2,
+
+  // ── Validation mode ───────────────────────────────────────
+  // Set VALIDATION_MODE=true in Railway env when testing a new broker.
+  // Caps to 1 position and $250/trade — minimum risk while confirming
+  // the full order lifecycle works. Remove once 2-3 cycles confirmed.
+  validationMode: process.env.VALIDATION_MODE === "true",
 };
 
 // ── INDEX TICKERS ─────────────────────────────────────────────
@@ -170,12 +171,21 @@ const MANDATE = {
 // HIGH VOLATILITY regime when broad market weakness is expected).
 const INDEX_TICKERS = ["SPY", "QQQ"];
 
-// ── TRADIER ───────────────────────────────────────────────────
-const TRADIER = {
-  sandbox: process.env.TRADIER_SANDBOX !== "false",
-  get baseUrl() { return this.sandbox ? "https://sandbox.tradier.com/v1" : "https://api.tradier.com/v1"; },
-  token:     process.env.TRADIER_ACCESS_TOKEN,
-  accountId: process.env.TRADIER_ACCOUNT_ID,
+// ── BROKER: TASTYTRADE ────────────────────────────────────────
+// Set environment variables in Railway:
+//   TASTYTRADE_USERNAME, TASTYTRADE_PASSWORD, TASTYTRADE_ACCOUNT_ID
+//   TASTYTRADE_SANDBOX=true for certification environment
+const BROKER = {
+  sandbox:   process.env.TASTYTRADE_SANDBOX === "true",
+  get baseUrl() {
+    return this.sandbox
+      ? "https://api.cert.tastyworks.com"
+      : "https://api.tastyworks.com";
+  },
+  username:  process.env.TASTYTRADE_USERNAME,
+  password:  process.env.TASTYTRADE_PASSWORD,
+  accountId: process.env.TASTYTRADE_ACCOUNT_ID,
+  sessionToken: null,
 };
 
 // ── PORTFOLIO — Last reviewed Aug 14 2026 ─────────────────────
@@ -187,7 +197,7 @@ const PORTFOLIO = [
   // ── AI / SEMICONDUCTORS — highest IV, most profitable ─────
   { ticker:"NVDA", name:"Nvidia",                 shares:0,    avgCost:198.00, stopLoss:175.00, target:236.00,  sector:"AI/Semis",  ivProfile:"high",   optionable:true,  earningsDate:"2026-11-19" }, // Q3 FY2027 est.
   { ticker:"AMD",  name:"Advanced Micro Devices", shares:0,    avgCost:546.72, stopLoss:420.00, target:580.00,  sector:"Semis",     ivProfile:"high",   optionable:true,  earningsDate:"2026-10-27" }, // stop lowered Aug 2026 — sustained weakness below $480 original stop
-  { ticker:"AVGO", name:"Broadcom Inc",           shares:0,    avgCost:400.39, stopLoss:340.00, target:472.00,  sector:"AI/Semis",  ivProfile:"high",   optionable:true,  earningsDate:"2026-09-04" }, // upcoming
+  { ticker:"AVGO", name:"Broadcom Inc",           shares:0,    avgCost:400.39, stopLoss:340.00, target:472.00,  sector:"AI/Semis",  ivProfile:"high",   optionable:true,  earningsDate:"2026-12-10" }, // Q4 FY2026 est (reported Sep 4 2026)
 
   // ── MEGA-CAP TECH — deepest liquidity, weekly expiries ────
   { ticker:"MSFT", name:"Microsoft",              shares:0,    avgCost:365.44, stopLoss:460.00, target:560.00,  sector:"Cloud/AI",  ivProfile:"high",   optionable:true,  earningsDate:"2026-10-23" }, // Q1 FY2027 est. | stop/target updated Aug 2026
@@ -200,7 +210,7 @@ const PORTFOLIO = [
   { ticker:"TSLA", name:"Tesla",                  shares:0,    avgCost:375.53, stopLoss:320.00, target:440.00,  sector:"EV/Tech",   ivProfile:"high",   optionable:true,  earningsDate:"2026-10-21" }, // Q3 2026 est.
 
   // ── CYBERSECURITY ─────────────────────────────────────────
-  { ticker:"PANW", name:"Palo Alto Networks",     shares:0,    avgCost:325.91, stopLoss:286.00, target:370.00,  sector:"Cyber",     ivProfile:"high",   optionable:true,  earningsDate:"2026-09-10" }, // FQ4 2026 est.
+  { ticker:"PANW", name:"Palo Alto Networks",     shares:0,    avgCost:325.91, stopLoss:286.00, target:370.00,  sector:"Cyber",     ivProfile:"high",   optionable:true,  earningsDate:"2026-12-10" }, // Q1 FY2027 est (reported Sep 10 2026)
   { ticker:"CRWD", name:"CrowdStrike",            shares:0,    avgCost:187.23, stopLoss:165.00, target:235.00,  sector:"Cyber",     ivProfile:"high",   optionable:true,  earningsDate:"2026-11-25" },  // Q2 FY2027 est. 4-for-1 split completed Jul 2026
 
   // ── CRYPTO ADJACENT / HIGH-IV FINTECH ────────────────────
@@ -224,13 +234,10 @@ const PORTFOLIO = [
   //   (ARM fiscal year ends March; Q2 FY2027 = Jul–Sep 2026).
   //   High IV post-selloff bounce; valid for directional long options in v3.
   { ticker:"ARM",  name:"Arm Holdings",           shares:0, avgCost:340.00, stopLoss:268.00, target:430.00,  sector:"AI/Semis",  ivProfile:"high",   optionable:true, earningsDate:"2026-11-05" }, // Q2 FY2027 est.
-  // MRVL: ~$187 Aug 14 2026 (bounced from $163 July low; spiked to $220s
-  //   on new AI memory platform). EARNINGS AUG 27 2026 (CONFIRMED) — that
-  //   is 13 days away. Earnings block will fire in 7 days for income trades.
-  //   Do not open new CSPs within 7 days of Aug 27. AI networking / custom
-  //   ASIC for hyperscalers. Goldman raising targets; strong AI narrative.
-  //   Beta 1.53; Q3 FY2027 est Dec 3 2026 after Aug 27 Q2 report.
-  { ticker:"MRVL", name:"Marvell Technology",     shares:0, avgCost:187.00, stopLoss:155.00, target:270.00,  sector:"AI/Semis",  ivProfile:"high",   optionable:true, earningsDate:"2026-08-27" }, // Q2 FY2027 CONFIRMED — 13 days out
+  // MRVL: Reported Q2 FY2027 on Aug 27 2026 — strong AI networking results.
+  //   Q3 FY2027 est Dec 3 2026. Beta 1.53; AI ASIC/custom silicon narrative.
+  //   Goldman raising targets; strong AI networking / hyperscaler revenue.
+  { ticker:"MRVL", name:"Marvell Technology",     shares:0, avgCost:187.00, stopLoss:155.00, target:270.00,  sector:"AI/Semis",  ivProfile:"high",   optionable:true, earningsDate:"2026-12-03" }, // Q3 FY2027 est.
   // VST: $146 Aug 14 2026. 52-wk $132–$219. Q2 adj EBITDA +30% YoY to
   //   $1.77B; data center power deals driving narrative. Analyst consensus
   //   target ~$221 (20 analysts, Strong Buy). Wells Fargo $212, BofA $196,
@@ -244,7 +251,11 @@ const PORTFOLIO = [
   { ticker:"QQQ",  name:"Nasdaq 100 ETF",         shares:0,    avgCost:725.51, stopLoss:653.00, target:790.00,  sector:"Index",     ivProfile:"medium", optionable:true,  earningsDate:null },
 
   // ── EXISTING HOLDINGS ─────────────────────────────────────
-  { ticker:"OKLO", name:"Oklo Inc",               shares:150,  avgCost:68.38,  stopLoss:42.00,  target:88.00,   sector:"Nuclear",   ivProfile:"high",   optionable:true,  earningsDate:"2026-11-12" }, // Q3 2026 est.
+  // OKLO: 2-for-1 split confirmed Sep 2026 — price $35.62 vs stored $68.38
+  //   (exactly half). Shares doubled 150→300, avgCost halved $68.38→$34.19.
+  //   Stop updated to $28 (20% below current price). Target = $79 (analyst
+  //   consensus post-split, 21 analysts). Q3 2026 est Nov 12 2026.
+  { ticker:"OKLO", name:"Oklo Inc",               shares:300,  avgCost:34.19,  stopLoss:28.00,  target:79.00,   sector:"Nuclear",   ivProfile:"high",   optionable:true,  earningsDate:"2026-11-12" }, // Q3 2026 est. POST 2-FOR-1 SPLIT
   { ticker:"LLY",  name:"Eli Lilly",              shares:4.02, avgCost:987.00, stopLoss:1045.00,target:1350.00, sector:"Pharma",    ivProfile:"medium", optionable:true,  earningsDate:"2026-10-29" }, // Q3 2026 est.
   { ticker:"PLTR", name:"Palantir",               shares:13,   avgCost:135.00, stopLoss:105.00, target:183.00,  sector:"AI/Gov",    ivProfile:"medium", optionable:true,  earningsDate:"2026-11-03" }, // Q3 2026 est.
   // NOTE: NOW did 5-for-1 split in 2025. Price $107.71. Down 42% YTD.
@@ -571,269 +582,6 @@ function updateTrailingStop(ticker, currentPrice, staticStop) {
 // TRADIER API
 // ═══════════════════════════════════════════════════════════════
 
-async function tradierRequest(method, path, params = {}, attempt = 1) {
-  const url     = `${TRADIER.baseUrl}${path}`;
-  const headers = { "Authorization": `Bearer ${TRADIER.token}`, "Accept": "application/json" };
-  let res;
-  if (method === "GET") {
-    const qs = new URLSearchParams(params).toString();
-    res = await fetch(`${url}${qs ? "?" + qs : ""}`, { headers });
-  } else {
-    headers["Content-Type"] = "application/x-www-form-urlencoded";
-    res = await fetch(url, { method, headers, body: new URLSearchParams(params).toString() });
-  }
-
-  // Explicit rate-limit handling. Confirmed via Tradier's own docs:
-  // /markets endpoints are capped at 60 req/min (sandbox) / 120 req/min
-  // (production) — a per-minute window, not a daily one. Batched
-  // multi-symbol requests (as fetchAllPrices now uses) count as ONE
-  // request regardless of symbol count, so normal usage sits well under
-  // this. Still worth handling explicitly: with the trade-count cap
-  // removed, a busy morning session can fire more Tradier calls than
-  // before, and a 429 mid-session would otherwise look identical to a
-  // normal rejection in the log.
-  //
-  // NOTE: Tradier's docs mention custom response headers for gauging
-  // rate-limit usage but don't confirm the exact header name for
-  // "seconds until reset" — checking the standard Retry-After header
-  // is a harmless best-effort first attempt (used if present), and the
-  // exponential fallback below is the real safety net either way, so
-  // this retries correctly regardless of which header Tradier sends.
-  if (res.status === 429) {
-    if (attempt >= 3) {
-      throw new Error(`Tradier ${method} ${path} (429): rate limited after ${attempt} attempts, giving up`);
-    }
-    const retryAfterHeader = res.headers.get("Retry-After");
-    const wait = retryAfterHeader ? parseInt(retryAfterHeader, 10) * 1000 : attempt * 2000;
-    console.log(`  ⚠ Tradier rate limited (429) on ${path} — retrying in ${wait/1000}s (attempt ${attempt}/3)`);
-    await new Promise(r => setTimeout(r, wait));
-    return tradierRequest(method, path, params, attempt + 1);
-  }
-
-  if (!res.ok) throw new Error(`Tradier ${method} ${path} (${res.status}): ${await res.text()}`);
-  return res.json();
-}
-
-async function getOptionChain(ticker, expiration) {
-  try {
-    const data = await tradierRequest("GET", "/markets/options/chains", { symbol:ticker, expiration, greeks:"true" });
-    return data?.options?.option || [];
-  } catch(e) { console.error(`  ✗ Chain ${ticker}: ${e.message}`); return []; }
-}
-
-async function getExpirations(ticker) {
-  try {
-    const data = await tradierRequest("GET", "/markets/options/expirations", { symbol:ticker, includeAllRoots:"true" });
-    return data?.expirations?.date || [];
-  } catch(e) { console.error(`  ✗ Expiry ${ticker}: ${e.message}`); return []; }
-}
-
-async function getAccountBalances() {
-  try {
-    const data = await tradierRequest("GET", `/accounts/${TRADIER.accountId}/balances`);
-    return data?.balances || {};
-  } catch(e) { console.error(`  ✗ Balances: ${e.message}`); return {}; }
-}
-
-async function getTradierPositions() {
-  try {
-    const data = await tradierRequest("GET", `/accounts/${TRADIER.accountId}/positions`);
-    const p = data?.positions?.position;
-    if (!p) return []; // confirmed by Tradier: genuinely zero positions
-    return Array.isArray(p) ? p : [p];
-  } catch(e) {
-    console.error(`  ✗ Positions: ${e.message}`);
-    // CRITICAL DISTINCTION: null means "fetch failed, unknown state" —
-    // NEVER treat this the same as a confirmed-empty [] response. A
-    // transient network/API failure must not be interpreted as proof
-    // the account is flat — any caller that mutates state.openPositions
-    // based on "no positions found" MUST check for null first and skip
-    // any destructive action, only proceeding on a genuine [] (or a
-    // real array of positions).
-    return null;
-  }
-}
-
-async function getOptionQuote(symbols) {
-  try {
-    const data = await tradierRequest("GET", "/markets/quotes", {
-      symbols: Array.isArray(symbols) ? symbols.join(",") : symbols, greeks:"true"
-    });
-    const q = data?.quotes?.quote;
-    if (!q) return [];
-    return Array.isArray(q) ? q : [q];
-  } catch(e) { console.error(`  ✗ Quote: ${e.message}`); return []; }
-}
-
-async function placeOptionsOrder(trade) {
-  const { ticker, strategy, legs, quantity } = trade;
-  console.log(`  📤 Placing ${strategy} on ${ticker}...`);
-  try {
-    // Use limit orders in live trading to avoid bid-ask slippage on spreads.
-    // In sandbox, market orders are fine — no real fills.
-    const orderType = TRADIER.sandbox ? "market" : "limit";
-
-    // Midpoint price — calculated from legs fetched in buildOptionsLegs
-    // passed through as trade.limitPrice when available
-    const limitPrice = (!TRADIER.sandbox && trade.limitPrice)
-      ? trade.limitPrice.toFixed(2)
-      : undefined;
-
-    let params;
-    if (legs.length === 1) {
-      // Tradier REQUIRES class:"option" for single-leg orders — "multileg"
-      // with 1 leg is rejected with a 400 error ("number of legs must be
-      // greater than 1"). Single-leg orders also use different param names:
-      // option_symbol / side / quantity (no [i] index suffix).
-      params = {
-        class:         "option",
-        symbol:        ticker,
-        option_symbol: legs[0].symbol,
-        side:          legs[0].side,
-        quantity:      quantity || 1,
-        type:          orderType,
-        duration:      "day",
-        ...(limitPrice ? { price: limitPrice } : {}),
-      };
-    } else {
-      params = {
-        class:    "multileg",
-        symbol:   ticker,
-        type:     orderType,
-        duration: "day",
-        ...(limitPrice ? { price: limitPrice } : {}),
-      };
-      legs.forEach((leg, i) => {
-        params[`option_symbol[${i}]`] = leg.symbol;
-        // Tradier multileg API requires full side values: buy_to_open, sell_to_open,
-        // buy_to_close, sell_to_close — confirmed via official Tradier docs.
-        params[`side[${i}]`]          = leg.side;
-        params[`quantity[${i}]`]      = quantity || 1;
-      });
-    }
-
-    const data    = await tradierRequest("POST", `/accounts/${TRADIER.accountId}/orders`, params);
-    const orderId = data?.order?.id;
-    const status  = data?.order?.status;
-
-    // Tradier returns an orderId even for REJECTED orders — previously we
-    // checked only for orderId presence and declared success, causing the
-    // bot to remove positions from tracking after rejected closes.
-    // Confirmed Aug 7 2026: SPY and AMZN close orders rejected 4 times each;
-    // bot removed them from state.openPositions → inline restore fired every
-    // cycle. Fix: verify status === "ok" before declaring success.
-    if (!orderId) {
-      console.error(`  ✗ No order ID returned from Tradier`);
-      return { success:false, error:"No order ID returned" };
-    }
-    if (status && status !== "ok") {
-      console.error(`  ✗ Order ${orderId} rejected by Tradier (status: ${status})`);
-      return { success:false, error:`Order rejected: ${status}`, orderId };
-    }
-
-    console.log(`  ✅ Order placed: ${orderId}`);
-    return { success:true, orderId };
-  } catch(e) {
-    console.error(`  ✗ Order failed: ${e.message}`);
-    return { success:false, error:e.message };
-  }
-}
-
-async function closeOptionsPosition(position) {
-  const closeSide = position.side === "buy_to_open" ? "sell_to_close" : "buy_to_close";
-
-  // Live mode: use midpoint limit order to avoid bid-ask slippage.
-  // Market orders on options in live mode can give back $10-50+ per leg
-  // on the spread. placeOptionsOrder already uses limits for opens —
-  // closes should match. Falls back to market if quote fetch fails.
-  let orderType  = "market";
-  let limitPrice;
-  if (!TRADIER.sandbox) {
-    try {
-      const quotes = await getOptionQuote(position.symbol);
-      const q      = quotes[0];
-      if (q?.bid != null && q?.ask != null && q.bid > 0) {
-        limitPrice = ((q.bid + q.ask) / 2).toFixed(2);
-        orderType  = "limit";
-      }
-    } catch(e) {
-      console.log(`  ⚠ Quote fetch failed for ${position.symbol} — falling back to market close`);
-    }
-  }
-
-  const orderParams = {
-    class:"option", symbol:position.underlyingSymbol || position.ticker,
-    option_symbol:position.symbol, side:closeSide,
-    quantity:Math.abs(position.quantity), type:orderType, duration:"day",
-    ...(limitPrice ? { price: limitPrice } : {}),
-  };
-
-  // Retry up to 3 times with backoff — Tradier sandbox occasionally rejects
-  // close orders on first submission due to transient liquidity/matching issues,
-  // then accepts on retry. Confirmed Aug 7 2026: SPY $712P and AMZN spread
-  // each rejected 3-4 times before eventually filling. Without retries the bot
-  // was removing positions from tracking after the first rejection and then
-  // inline-restoring them every 20-min cycle indefinitely.
-  //
-  // CRITICAL (Aug 14 2026): before each retry, check whether the previous order
-  // is still open/pending. If it is, do NOT submit a duplicate. AMZN IC generated
-  // 5 duplicate close orders because all retries submitted unconditionally —
-  // a pending order is not a rejection; duplicates all eventually fill.
-  let lastOrderId = null;
-
-  for (let attempt = 1; attempt <= 3; attempt++) {
-    if (attempt > 1 && lastOrderId && !TRADIER.sandbox) {
-      try {
-        const statusData  = await tradierRequest("GET", `/accounts/${TRADIER.accountId}/orders/${lastOrderId}`);
-        const orderStatus = statusData?.order?.status;
-        console.log(`  🔍 Close order ${lastOrderId} status: ${orderStatus}`);
-        if (orderStatus === "filled") {
-          console.log(`  ✅ Close order ${lastOrderId} already filled — no retry needed`);
-          return { success:true, orderId:lastOrderId };
-        }
-        if (["open","partially_filled","pending"].includes(orderStatus)) {
-          console.log(`  ⏳ Close order ${lastOrderId} still ${orderStatus} — waiting, not submitting duplicate`);
-          await new Promise(r => setTimeout(r, attempt * 5000));
-          continue;
-        }
-        console.log(`  ↩ Close order ${lastOrderId} is ${orderStatus} — submitting new close order`);
-      } catch(statusErr) {
-        console.log(`  ⚠ Could not check status of order ${lastOrderId}: ${statusErr.message} — proceeding with retry`);
-      }
-    }
-
-    try {
-      const data    = await tradierRequest("POST", `/accounts/${TRADIER.accountId}/orders`, orderParams);
-      const orderId = data?.order?.id;
-      const status  = data?.order?.status;
-
-      if (!orderId) {
-        console.error(`  ✗ Close attempt ${attempt}: no order ID returned`);
-      } else if (status && status !== "ok") {
-        // Tradier includes reason_description on rejected orders — log it so
-        // the cause is visible in Railway logs rather than just "status: rejected"
-        const reason = data?.order?.reason_description ?? status;
-        console.error(`  ✗ Close attempt ${attempt}: order ${orderId} rejected — ${reason}`);
-        lastOrderId = orderId;
-      } else {
-        lastOrderId = orderId;
-        console.log(`  ✅ Close order accepted: ${orderId}`);
-        return { success:true, orderId };
-      }
-    } catch(e) {
-      console.error(`  ✗ Close attempt ${attempt}: ${e.message}`);
-    }
-
-    if (attempt < 3) {
-      const wait = attempt * 5000; // 5s, 10s
-      console.log(`  ⏳ Retrying close in ${wait/1000}s...`);
-      await new Promise(r => setTimeout(r, wait));
-    }
-  }
-
-  return { success:false, error:"Close order rejected after 3 attempts" };
-}
-
 async function buildOptionsLegs(tradeRec, stockPrice, regime = null) {
   const { ticker, strategy } = tradeRec;
   try {
@@ -849,7 +597,7 @@ async function buildOptionsLegs(tradeRec, stockPrice, regime = null) {
     });
     if (!validExp) return null;
 
-    const chain = await getOptionChain(ticker, validExp);
+    const chain = await getChain(ticker, validExp);
     if (!chain.length) return null;
 
     const calls = chain.filter(o => o.option_type==="call").sort((a,b) => a.strike-b.strike);
@@ -866,7 +614,7 @@ async function buildOptionsLegs(tradeRec, stockPrice, regime = null) {
           console.log(`  ✗ ${ticker} Long Call REJECTED — no expiry in ${MANDATE.targetMinDTE}–${MANDATE.targetMaxDTE} DTE window`);
           return null;
         }
-        const lcChain = lcExp === validExp ? chain : await getOptionChain(ticker, lcExp);
+        const lcChain = lcExp === validExp ? chain : await getChain(ticker, lcExp);
         const lcCalls = lcChain.filter(o => o.option_type === "call").sort((a,b) => a.strike - b.strike);
 
         // Target strike: 10–15% OTM
@@ -893,7 +641,7 @@ async function buildOptionsLegs(tradeRec, stockPrice, regime = null) {
         let freshBid  = lcStrike.bid ?? 0;
         let limitPrice = null;
         try {
-          const freshQuotes = await getOptionQuote(lcStrike.symbol);
+          const freshQuotes = await getQuotes(lcStrike.symbol);
           const fq = freshQuotes[0];
           if (fq?.ask > 0) {
             if (fq.ask !== lcStrike.ask) {
@@ -907,7 +655,7 @@ async function buildOptionsLegs(tradeRec, stockPrice, regime = null) {
         }
         // Limit price for live orders: midpoint of fresh bid/ask, rounded to $0.05
         // Midpoint avoids paying the full spread; $0.05 rounding matches most options markets.
-        if (!TRADIER.sandbox && freshBid > 0 && freshAsk > freshBid) {
+        if (!BROKER.sandbox && freshBid > 0 && freshAsk > freshBid) {
           const mid = (freshBid + freshAsk) / 2;
           limitPrice = parseFloat((Math.round(mid / 0.05) * 0.05).toFixed(2));
           console.log(`  💲 ${ticker} Long Call: limit price $${limitPrice} (mid of bid $${freshBid} / ask $${freshAsk})`);
@@ -951,7 +699,7 @@ async function buildOptionsLegs(tradeRec, stockPrice, regime = null) {
           console.log(`  ✗ ${ticker} Long Put REJECTED — no expiry in ${MANDATE.targetMinDTE}–${MANDATE.targetMaxDTE} DTE window`);
           return null;
         }
-        const lpChain = lpExp === validExp ? chain : await getOptionChain(ticker, lpExp);
+        const lpChain = lpExp === validExp ? chain : await getChain(ticker, lpExp);
         const lpPuts  = lpChain.filter(o => o.option_type === "put").sort((a,b) => b.strike - a.strike);
 
         // Target strike: 2–7% OTM (below current price for puts)
@@ -968,7 +716,7 @@ async function buildOptionsLegs(tradeRec, stockPrice, regime = null) {
         let freshBidP  = lpStrike.bid ?? 0;
         let limitPriceP = null;
         try {
-          const freshQuotesP = await getOptionQuote(lpStrike.symbol);
+          const freshQuotesP = await getQuotes(lpStrike.symbol);
           const fqp = freshQuotesP[0];
           if (fqp?.ask > 0) {
             if (fqp.ask !== lpStrike.ask) {
@@ -980,7 +728,7 @@ async function buildOptionsLegs(tradeRec, stockPrice, regime = null) {
         } catch(e) {
           console.log(`  ⚠ ${ticker} Long Put: live quote failed (${e.message}) — using chain price $${lpStrike.ask}`);
         }
-        if (!TRADIER.sandbox && freshBidP > 0 && freshAskP > freshBidP) {
+        if (!BROKER.sandbox && freshBidP > 0 && freshAskP > freshBidP) {
           const midP = (freshBidP + freshAskP) / 2;
           limitPriceP = parseFloat((Math.round(midP / 0.05) * 0.05).toFixed(2));
           console.log(`  💲 ${ticker} Long Put: limit price $${limitPriceP} (mid of bid $${freshBidP} / ask $${freshAskP})`);
@@ -1023,7 +771,7 @@ async function buildOptionsLegs(tradeRec, stockPrice, regime = null) {
 
 
 // ═══════════════════════════════════════════════════════════════
-// PRICE FEEDS — all prices via Tradier (batched single call).
+// PRICE FEEDS — all prices via Tastytrade (batched single call).
 // Alpha Vantage fully retired Jul 29 2026 — see comment below.
 // ═══════════════════════════════════════════════════════════════
 
@@ -1038,10 +786,10 @@ async function buildOptionsLegs(tradeRec, stockPrice, regime = null) {
 // intradayCheck, making the per-ticker cache entirely unreachable.
 
 async function fetchAllPrices() {
-  console.log(`  Fetching ${PORTFOLIO.length} prices (Tradier, batched)...`);
+  console.log(`  Fetching ${PORTFOLIO.length} prices (${BROKER}, batched)...`);
   try {
     const tickers = PORTFOLIO.map(s => s.ticker);
-    const quotes  = await getOptionQuote(tickers); // single batched call, no per-symbol rate limit
+    const quotes  = await getQuotes(tickers); // single batched call, no per-symbol rate limit
     const now     = Date.now();
     const results = [];
 
@@ -1183,15 +931,358 @@ function getSpyChangeFromPortfolio(portfolioData) {
 }
 
 // ═══════════════════════════════════════════════════════════════
-// VIX FETCH — real-time fear/greed gauge for regime calibration.
+// TASTYTRADE BROKER LAYER
+// All strategy, gate, stop, alert, and state logic is unchanged.
+// Only this section (auth, positions, quotes, chain, orders) talks
+// to the Tastytrade API. Everything else is broker-agnostic.
+// ═══════════════════════════════════════════════════════════════
+
+// ── AUTH ─────────────────────────────────────────────────────
+// Tastytrade uses session tokens (not static bearer tokens).
+// Session tokens expire after 24 hours — brokerLogin() runs at
+// startup and again in sundaySummary() every Sunday to refresh.
+async function brokerLogin() {
+  try {
+    const res = await fetch(`${BROKER.baseUrl}/sessions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        login:       BROKER.username,
+        password:    BROKER.password,
+        "remember-me": true,
+      }),
+    });
+    if (!res.ok) throw new Error(`Login failed: ${res.status} ${await res.text()}`);
+    const data = await res.json();
+    BROKER.sessionToken = data?.data?.["session-token"];
+    if (!BROKER.sessionToken) throw new Error("No session token in response");
+    console.log("  ✅ Tastytrade session established");
+    return true;
+  } catch(e) {
+    console.error(`  ✗ Tastytrade login failed: ${e.message}`);
+    await sendSMS(`🚨 TASTYTRADE LOGIN FAILED\n${e.message}\nBot cannot trade until auth is restored.`);
+    return false;
+  }
+}
+
+// ── STARTUP DIAGNOSTICS ──────────────────────────────────────
+// Tests every Tastytrade endpoint before the market opens.
+// Run once at startup — results in Railway log show exactly what works.
+async function runBrokerDiagnostics() {
+  console.log("  🔬 Running Tastytrade endpoint diagnostics...");
+  const results = [];
+
+  // 1. Auth — already tested in brokerLogin at startup, just confirm
+  const authOk = !!BROKER.sessionToken;
+  results.push({ name:"Auth / session token",  ok: authOk });
+
+  // 2. Stock quotes — core price feed
+  try {
+    const quotes = await getQuotes(["NVDA", "SPY"]);
+    const ok = quotes.length === 2 && quotes[0]?.last > 0;
+    results.push({ name:"Stock quotes (NVDA, SPY)", ok, detail: ok ? `NVDA $${quotes.find(q=>q.symbol==="NVDA")?.last}` : "no data" });
+  } catch(e) { results.push({ name:"Stock quotes", ok:false, detail:e.message }); }
+
+  // 3. Option expirations
+  try {
+    const exps = await getExpirations("NVDA");
+    const ok = exps.length > 0;
+    results.push({ name:"Option expirations (NVDA)", ok, detail: ok ? `${exps.length} dates, nearest: ${exps[0]}` : "no expirations" });
+
+    // 4. Option chain + quotes for nearest expiry
+    if (ok) {
+      try {
+        const chain = await getChain("NVDA", exps[0]);
+        const ok2 = chain.length > 0 && chain[0]?.ask > 0;
+        results.push({ name:"Option chain + quotes (NVDA)", ok:ok2, detail: ok2 ? `${chain.length} strikes, sample ask $${chain[0]?.ask}` : "no strikes or zero quotes" });
+      } catch(e) { results.push({ name:"Option chain", ok:false, detail:e.message }); }
+    }
+  } catch(e) { results.push({ name:"Option expirations", ok:false, detail:e.message }); }
+
+  // 5. Positions endpoint
+  try {
+    const pos = await getPositions();
+    const ok = Array.isArray(pos);
+    results.push({ name:"Positions endpoint", ok, detail: ok ? `${pos.length} position(s)` : "returned null" });
+  } catch(e) { results.push({ name:"Positions endpoint", ok:false, detail:e.message }); }
+
+  // Report
+  const passed = results.filter(r => r.ok).length;
+  const failed = results.filter(r => !r.ok);
+  results.forEach(r => console.log(`  ${r.ok ? "✅" : "❌"} ${r.name}${r.detail ? `: ${r.detail}` : ""}`));
+  console.log(`  📊 Diagnostics: ${passed}/${results.length} passed`);
+
+  if (failed.length) {
+    const msg = `🔬 TASTYTRADE DIAGNOSTICS — ${passed}/${results.length} PASSED\n\n` +
+      failed.map(r => `❌ ${r.name}: ${r.detail || "failed"}`).join("\n") +
+      `\n\nBot is running but failed endpoints will block trades.\nCheck Railway logs for details.`;
+    await sendSMS(msg);
+  }
+  return failed.length === 0;
+}
+async function brokerRequest(method, path, body = null, attempt = 1) {
+  if (!BROKER.sessionToken) {
+    const ok = await brokerLogin();
+    if (!ok) throw new Error("Tastytrade not authenticated");
+  }
+  const url = `${BROKER.baseUrl}${path}`;
+  const headers = {
+    "Authorization": BROKER.sessionToken,
+    "Content-Type":  "application/json",
+    "Accept":        "application/json",
+  };
+  const opts = { method, headers };
+  if (body && method !== "GET") opts.body = JSON.stringify(body);
+  if (body && method === "GET") {
+    const qs = new URLSearchParams(body).toString();
+    return brokerRequest(method, `${path}?${qs}`, null, attempt);
+  }
+
+  const res = await fetch(url, opts);
+
+  // Re-auth on 401 — session expired mid-day
+  if (res.status === 401 && attempt === 1) {
+    console.log("  ⚠ Tastytrade session expired — re-authenticating...");
+    BROKER.sessionToken = null;
+    return brokerRequest(method, path, body, 2);
+  }
+  if (res.status === 429) {
+    if (attempt >= 3) throw new Error(`Tasty rate limited after ${attempt} attempts`);
+    const wait = attempt * 2000;
+    console.log(`  ⚠ Tastytrade rate limited — retrying in ${wait/1000}s`);
+    await new Promise(r => setTimeout(r, wait));
+    return brokerRequest(method, path, body, attempt + 1);
+  }
+  if (!res.ok) throw new Error(`Tasty ${method} ${path} (${res.status}): ${await res.text()}`);
+  return res.json();
+}
+
+// ── OPTION SYMBOL FORMAT ──────────────────────────────────────
+// OCC standard: ticker padded to 6 chars + YYMMDD + C/P + strike×1000 padded to 8 digits
+// Compact (bot internal): NVDA261219C00242500  (no spaces)
+// Tastytrade:             NVDA  261219C00242500 (ticker padded to 6 with spaces)
+function toTastySymbol(compactSymbol) {
+  const m = compactSymbol.match(/^([A-Z.]+)(\d{6})([CP])(\d{8})$/);
+  if (!m) return compactSymbol;
+  const [, ticker, date, type, strike] = m;
+  return ticker.padEnd(6, " ") + date + type + strike;
+}
+
+function fromTastySymbol(tastySymbol) {
+  return tastySymbol.replace(/\s+/g, ""); // strip all internal spaces → compact form
+}
+
+// ── POSITIONS ────────────────────────────────────────────────
+async function getPositions() {
+  try {
+    const data = await brokerRequest("GET", `/accounts/${BROKER.accountId}/positions`);
+    const positions = data?.data?.items || [];
+    return positions.map(p => ({
+      symbol:            fromTastySymbol(p.symbol),   // compact OCC format for rest of bot
+      quantity:         parseFloat(p.quantity) * (p["quantity-direction"] === "Long" ? 1 : -1),
+      cost_basis:       parseFloat(p["average-open-price"] || 0) * 100,
+      date_acquired:    p["created-at"] || new Date().toISOString(),
+      underlying_symbol: p["underlying-symbol"],
+    }));
+  } catch(e) {
+    console.error(`  ✗ Positions: ${e.message}`);
+    return null; // null = fetch failed, not confirmed empty
+  }
+}
+
+// ── QUOTES ───────────────────────────────────────────────────
+async function getQuotes(symbols) {
+  try {
+    const syms = Array.isArray(symbols) ? symbols : [symbols];
+    // Tastytrade market data uses a different endpoint
+    const data = await brokerRequest("GET", "/market-data/quotes", {
+      symbols: syms.join(","),
+    });
+    const quotes = data?.data?.items || [];
+    return quotes.map(q => ({
+      symbol:            q.symbol,
+      last:              parseFloat(q.last ?? q["mark"] ?? 0),
+      bid:               parseFloat(q.bid ?? 0),
+      ask:               parseFloat(q.ask ?? 0),
+      change:            parseFloat(q.change ?? 0),
+      change_percentage: parseFloat(q["change-percent"] ?? 0),
+      volume:            parseInt(q.volume ?? 0),
+      high:              parseFloat(q.high ?? 0),
+      low:               parseFloat(q.low ?? 0),
+    }));
+  } catch(e) {
+    console.error(`  ✗ Tasty quotes: ${e.message}`);
+    return [];
+  }
+}
+
+// ── OPTION CHAIN ─────────────────────────────────────────────
+// Tastytrade's /nested endpoint returns strike symbols but NOT prices.
+// We fetch the symbols first, then batch-quote them for bid/ask/greeks.
+async function getChain(ticker, expiration) {
+  try {
+    // Step 1: get option symbols for this expiration from nested chain.
+    // NOTE: getExpirations() also calls /nested for the same ticker — two
+    // API calls per candidate. Acceptable at current scale (2-4 candidates
+    // per session); optimize to a single call if rate limits become an issue.
+    const chainData   = await brokerRequest("GET", `/option-chains/${ticker}/nested`);
+    const expirations = chainData?.data?.items || [];
+    const exp         = expirations.find(e => e.expiration === expiration);
+    if (!exp || !exp.strikes?.length) return [];
+
+    // Collect all option symbols (calls and puts) for this expiration
+    const symbolMap = {}; // symbol → { strike, type }
+    for (const strike of exp.strikes) {
+      const strikePrice = parseFloat(strike["strike-price"]);
+      if (strike.call) symbolMap[strike.call] = { strike: strikePrice, type: "call" };
+      if (strike.put)  symbolMap[strike.put]  = { strike: strikePrice, type: "put" };
+    }
+    const symbols = Object.keys(symbolMap);
+    if (!symbols.length) return [];
+
+    // Step 2: batch-fetch quotes for all symbols (bid/ask/greeks)
+    const quotesRaw = await brokerRequest("GET", "/market-data/quotes", {
+      symbols: symbols.join(","),
+    });
+    const quotesArr = quotesRaw?.data?.items || [];
+    const quoteMap  = {}; // symbol → quote
+    for (const q of quotesArr) quoteMap[q.symbol] = q;
+
+    // Step 3: combine into the shape buildOptionsLegs expects
+    return symbols.map(sym => {
+      const { strike, type } = symbolMap[sym];
+      const q = quoteMap[sym] || {};
+      return {
+        symbol:        fromTastySymbol(sym),  // compact form for order placement
+        strike,
+        option_type:   type,
+        bid:           parseFloat(q.bid   ?? 0),
+        ask:           parseFloat(q.ask   ?? q.mark ?? 0),
+        last:          parseFloat(q.last  ?? q.mark ?? 0),
+        volume:        parseInt(q.volume  ?? 0),
+        open_interest: parseInt(q["open-interest"] ?? 0),
+        greeks: {
+          delta: parseFloat(q.delta ?? 0),
+          gamma: parseFloat(q.gamma ?? 0),
+          theta: parseFloat(q.theta ?? 0),
+          vega:  parseFloat(q.vega  ?? 0),
+          iv:    parseFloat(q.iv    ?? q["implied-volatility"] ?? 0),
+        },
+      };
+    }).filter(o => o.ask > 0); // drop options with no quote (illiquid)
+  } catch(e) {
+    console.error(`  ✗ Tasty chain ${ticker}: ${e.message}`);
+    return [];
+  }
+}
+
+async function getExpirations(ticker) {
+  try {
+    const data = await brokerRequest("GET", `/option-chains/${ticker}/nested`);
+    const items = data?.data?.items || [];
+    return items.map(e => e.expiration).filter(Boolean).sort();
+  } catch(e) {
+    console.error(`  ✗ Tasty expirations ${ticker}: ${e.message}`);
+    return [];
+  }
+}
+
+// ── ORDERS ───────────────────────────────────────────────────
+// Tastytrade order structure differs significantly from Tradier.
+// Single-leg long options use "Buy to Open" action.
+async function placeOrder(trade) {
+  const { ticker, strategy, legs, quantity, limitPrice } = trade;
+  console.log(`  📤 Placing ${strategy} on ${ticker} (Tastytrade)...`);
+  try {
+    const leg = legs[0]; // v3 is single-leg only (Long Call / Long Put)
+    const action = leg.side === "buy_to_open" ? "Buy to Open" : "Sell to Close";
+    const orderBody = {
+      "order-type":    limitPrice ? "Limit" : "Market",
+      "time-in-force": "Day",
+      legs: [{
+        "instrument-type": "Equity Option",
+        symbol:            toTastySymbol(leg.symbol),
+        quantity:          quantity || 1,
+        action,
+      }],
+      ...(limitPrice ? { price: parseFloat(limitPrice).toFixed(2), "price-effect": "Debit" } : {}),
+    };
+
+    const data    = await brokerRequest("POST", `/accounts/${BROKER.accountId}/orders`, orderBody);
+    const orderId = data?.data?.order?.id;
+    const status  = data?.data?.order?.status;
+
+    if (!orderId) {
+      console.error(`  ✗ No order ID returned from Tastytrade`);
+      return { success:false, error:"No order ID returned" };
+    }
+    if (status && !["Received","Routed","Live","Filled"].includes(status)) {
+      const reason = data?.data?.order?.["reject-reason"] ?? status;
+      console.error(`  ✗ Tasty order ${orderId} rejected: ${reason}`);
+      return { success:false, error:`Order rejected: ${reason}`, orderId };
+    }
+    console.log(`  ✅ Tasty order placed: ${orderId} (${status})`);
+    return { success:true, orderId };
+  } catch(e) {
+    console.error(`  ✗ Tasty order failed: ${e.message}`);
+    return { success:false, error:e.message };
+  }
+}
+
+async function closePosition(position) {
+  console.log(`  📤 Closing ${position.symbol} (Tastytrade)...`);
+  try {
+    // Live midpoint limit for closes
+    let limitPrice;
+    const quotes = await getQuotes(fromTastySymbol(position.symbol));
+    const q = quotes[0];
+    if (q?.bid != null && q?.ask != null && q.bid > 0) {
+      limitPrice = ((q.bid + q.ask) / 2).toFixed(2);
+    }
+    const action = position.quantity > 0 ? "Sell to Close" : "Buy to Close";
+    const orderBody = {
+      "order-type":    limitPrice ? "Limit" : "Market",
+      "time-in-force": "Day",
+      legs: [{
+        "instrument-type": "Equity Option",
+        symbol:            toTastySymbol(position.symbol),
+        quantity:          Math.abs(position.quantity),
+        action,
+      }],
+      ...(limitPrice ? { price: limitPrice, "price-effect": "Credit" } : {}),
+    };
+
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try {
+        const data    = await brokerRequest("POST", `/accounts/${BROKER.accountId}/orders`, orderBody);
+        const orderId = data?.data?.order?.id;
+        const status  = data?.data?.order?.status;
+        if (orderId && ["Received","Routed","Live","Filled"].includes(status)) {
+          console.log(`  ✅ Tasty close order: ${orderId} (${status})`);
+          return { success:true, orderId };
+        }
+        const reason = data?.data?.order?.["reject-reason"] ?? status ?? "unknown";
+        console.error(`  ✗ Tasty close attempt ${attempt}: ${reason}`);
+      } catch(e) {
+        console.error(`  ✗ Tasty close attempt ${attempt}: ${e.message}`);
+      }
+      if (attempt < 3) await new Promise(r => setTimeout(r, attempt * 5000));
+    }
+    return { success:false, error:"Close failed after 3 attempts" };
+  } catch(e) {
+    console.error(`  ✗ Tasty close failed: ${e.message}`);
+    return { success:false, error:e.message };
+  }
+}
+
+
 // In v3 (long calls/puts): high VIX means expensive options but
 // bigger moves. Low VIX means cheap options but smaller moves.
 // ═══════════════════════════════════════════════════════════════
 async function fetchVIX() {
   try {
-    const data = await tradierRequest("GET", "/markets/quotes", { symbols: "VIX", greeks: "false" });
-    const q    = data?.quotes?.quote;
-    const vix  = q?.last ?? q?.close;
+    const quotes = await getQuotes(["VIX"]);
+    const vix    = quotes[0]?.last;
     if (vix && vix > 0) {
       console.log(`  📊 VIX: ${parseFloat(vix).toFixed(2)}`);
       return parseFloat(vix);
@@ -1199,7 +1290,7 @@ async function fetchVIX() {
   } catch(e) {
     console.log(`  ⚠ VIX fetch failed (${e.message}) — regime will use SPY-only signals`);
   }
-  return null; // graceful fallback — regime still works without VIX
+  return null;
 }
 
 function getVIXLabel(vix) {
@@ -1679,7 +1770,7 @@ function normaliseAndFilterTrades(parsed, effectiveMin = MANDATE.minPerTrade, { 
 async function generateTrades(portfolioData, preComputedRegime = null) {
   const optionable  = portfolioData.filter(p => p.optionable && p.price);
   const today       = new Date().toLocaleDateString("en-US",{weekday:"long",month:"long",day:"numeric",year:"numeric"});
-  const effectiveMin = TRADIER.sandbox ? MANDATE.minPerTrade : MANDATE.minPerTradeLive;
+  const effectiveMin = BROKER.sandbox ? MANDATE.minPerTrade : MANDATE.minPerTradeLive;
 
   let spyChange, regime, broadWeakness = false, weakTickers = [];
   if (preComputedRegime) {
@@ -1727,13 +1818,13 @@ async function generateTrades(portfolioData, preComputedRegime = null) {
   const vixGatePass    = vixTrending && vixAboveFloor;
   const earningsGatePass = hasUpcomingEarnings;
 
-  // Momentum gate: 3+ names with TARGET_HIT or BIG_MOVE in the last 24 hours
+  // Momentum gate: 3+ names with TARGET_HIT or BIG_MOVE in the last 36 hours
   // signals broad market momentum — tradeable even in low VIX environments.
-  // Sep 2026: missed CRWD +8%, MRVL +6%, COIN +5% rally because VIX was 15.
-  // These moves all fired TARGET_HIT/BIG_MOVE the day before — that's the signal.
-  const now24h = Date.now() - 24 * 60 * 60 * 1000;
+  // 36h (not 24h) ensures yesterday's early-morning moves are still captured
+  // by the 9:10 AM morning session — 24h expired 70min before the session ran.
+  const now36h = Date.now() - 36 * 60 * 60 * 1000;
   const recentMomentumNames = Object.entries(state.momentumTickers)
-    .filter(([, ts]) => new Date(ts).getTime() > now24h)
+    .filter(([, ts]) => new Date(ts).getTime() > now36h)
     .map(([t]) => t);
   const momentumGatePass = recentMomentumNames.length >= 3;
   if (momentumGatePass) {
@@ -1965,7 +2056,7 @@ function rebuildTradeFromPositions(underlying, legs) {
 }
 
 async function getGroupedLivePositions() {
-  const positions = await getTradierPositions();
+  const positions = await getPositions();
 
   // CRITICAL: positions can now be null (fetch failed) or [] (confirmed
   // empty) — these must NEVER be treated the same. null means "unknown
@@ -2185,13 +2276,13 @@ async function sendLiveSnapshot(groups) {
   const snap = getLivePositionSnapshot(stillOpen);
 
   if (!snap.hasPositions) {
-    await sendSMS(`📊 LIVE SNAPSHOT\n${new Date().toLocaleTimeString()}\n\nNo open positions.\nAll data verified via Tradier live quotes.`);
+    await sendSMS(`📊 LIVE SNAPSHOT\n${new Date().toLocaleTimeString()}\n\nNo open positions.\nAll data verified via Tastytrade live quotes.`);
     return snap;
   }
 
   await sendSMS(
 `📊 LIVE POSITION SNAPSHOT
-${new Date().toLocaleTimeString()} — VERIFIED (Tradier live quotes)
+${new Date().toLocaleTimeString()} — VERIFIED (Tastytrade live quotes)
 
 ${snap.lines.join("\n")}
 
@@ -2291,13 +2382,13 @@ async function monitorOpenPositions(groups, underlyingPriceMap = {}) {
         let closeResult;
         if (g.positions.length === 1) {
           const pos = g.positions[0];
-          closeResult = await closeOptionsPosition({ symbol:pos.symbol, underlyingSymbol:ourTrade.ticker, quantity:Math.abs(pos.quantity), side:pos.quantity>0?"buy_to_open":"sell_to_open" });
+          closeResult = await closePosition({ symbol:pos.symbol, underlyingSymbol:ourTrade.ticker, quantity:Math.abs(pos.quantity), side:pos.quantity>0?"buy_to_open":"sell_to_open" });
         } else {
           // Multileg: build a single close order for all legs atomically.
           // Fetch midpoint quote for limit price in live mode.
           let orderType = "market";
           let limitPrice;
-          if (!TRADIER.sandbox) {
+          if (!BROKER.sandbox) {
             try {
               const allSymbols = g.positions.map(p => p.symbol);
               const quotes = await getOptionQuote(allSymbols);
@@ -2331,42 +2422,16 @@ async function monitorOpenPositions(groups, underlyingPriceMap = {}) {
             params[`quantity[${i}]`]       = Math.abs(pos.quantity);
           });
 
-          let lastOrderId = null;
-          let success     = false;
-          for (let attempt = 1; attempt <= 3; attempt++) {
-            if (attempt > 1 && lastOrderId && !TRADIER.sandbox) {
-              try {
-                const statusData  = await tradierRequest("GET", `/accounts/${TRADIER.accountId}/orders/${lastOrderId}`);
-                const orderStatus = statusData?.order?.status;
-                console.log(`  🔍 Multileg close ${lastOrderId} status: ${orderStatus}`);
-                if (orderStatus === "filled")   { success = true; break; }
-                if (["open","partially_filled","pending"].includes(orderStatus)) {
-                  await new Promise(r => setTimeout(r, attempt * 5000));
-                  continue;
-                }
-              } catch(se) {
-                console.log(`  ⚠ Status check failed for ${lastOrderId}: ${se.message}`);
-              }
-            }
-            try {
-              const data    = await tradierRequest("POST", `/accounts/${TRADIER.accountId}/orders`, params);
-              const orderId = data?.order?.id;
-              const status  = data?.order?.status;
-              if (orderId && (!status || status === "ok")) {
-                lastOrderId = orderId;
-                success     = true;
-                console.log(`  ✅ Multileg close accepted: ${orderId} (${g.positions.length} legs)`);
-                break;
-              }
-              if (orderId) lastOrderId = orderId;
-              const mlReason = data?.order?.reason_description ?? status ?? "no order ID";
-              console.error(`  ✗ Multileg close attempt ${attempt}: ${mlReason}`);
-            } catch(e) {
-              console.error(`  ✗ Multileg close attempt ${attempt}: ${e.message}`);
-            }
-            if (attempt < 3) await new Promise(r => setTimeout(r, attempt * 5000));
+          let success = false;
+          // Tastytrade: close each leg individually.
+          // v3 only uses single-leg positions so this path is rarely hit.
+          let allClosed = true;
+          for (const pos of g.positions) {
+            const r = await closePosition({ symbol:pos.symbol, underlyingSymbol:ourTrade.ticker, quantity:Math.abs(pos.quantity), side:pos.quantity>0?"buy_to_open":"sell_to_open" });
+            if (!r.success) { allClosed = false; break; }
           }
-          closeResult = { success, error: success ? null : (data?.order?.reason_description ?? "Close order rejected after 3 attempts") };
+          success = allClosed;
+          closeResult = { success, error: success ? null : "Multileg close failed" };
         }
         const allClosed = closeResult.success;
         if (allClosed) {
@@ -2648,6 +2713,18 @@ async function updateAnalystTargets() {
 
 async function morningSession() {
   console.log(`\n[${new Date().toLocaleTimeString()}] 🌅 Morning session...`);
+
+  // Refresh broker session token daily — Tastytrade sessions expire after 24h.
+  // Proactive refresh here avoids a mid-trade 401 during order placement.
+  await brokerLogin();
+
+  // Validation mode: cap exposure while testing Tastytrade integration
+  const effectiveMaxPositions = MANDATE.validationMode ? 1 : MANDATE.maxOpenPositions;
+  const effectiveMaxTrade     = MANDATE.validationMode ? 250 : MANDATE.maxPerTrade;
+  if (MANDATE.validationMode) {
+    console.log(`  ⚠ VALIDATION MODE: max 1 position, $250/trade — full limits resume after validation`);
+  }
+
   state.dailyTrades               = [];
   state.totalDeployedToday        = 0;
   state.totalCollateralToday      = 0;
@@ -2677,7 +2754,7 @@ async function morningSession() {
   // In live mode, if we can't verify buying power, abort rather than risk
   // placing trades the account can't cover. Sandbox has no real capital so
   // it's fine to proceed with buyingPower=0 there.
-  if (!TRADIER.sandbox && balanceFetchFailed) {
+  if (!BROKER.sandbox && balanceFetchFailed) {
     const msg = "⚠️ MORNING SESSION ABORTED\nCould not verify account balance — refusing to place trades blind in live mode.\nCheck Tradier API connectivity and redeploy if needed.";
     console.error(`  🛑 ${msg}`);
     await sendSMS(msg);
@@ -2692,7 +2769,7 @@ async function morningSession() {
   }
 
   const portfolioData = await fetchAllPrices();
-  const modeFlag      = TRADIER.sandbox ? " [SANDBOX]" : "";
+  const modeFlag      = BROKER.sandbox ? " [SANDBOX]" : "";
 
   // Fetch VIX for regime calibration — affects wing width and condor eligibility.
   // Fails gracefully to null if Tradier doesn't support the VIX symbol in sandbox.
@@ -2742,7 +2819,7 @@ async function morningSession() {
 
   // Effective minimum per trade: sandbox can experiment with lower floor ($250);
   // live trading needs $600 to survive commissions and slippage.
-  const effectiveMin = TRADIER.sandbox ? MANDATE.minPerTrade : MANDATE.minPerTradeLive;
+  const effectiveMin = BROKER.sandbox ? MANDATE.minPerTrade : MANDATE.minPerTradeLive;
 
   // Generate trades — retry up to 3x on network/connection errors ONLY.
   // Previously: `while (trades.length === 0)` retried even when the AI
@@ -2777,22 +2854,20 @@ async function morningSession() {
     const stockData = portfolioData.find(p => p.ticker === trade.ticker);
     if (!stockData?.price) continue;
 
-    // Skip tickers already in an open position — prevents doubling up if
-    // morning session and opportunistic scan both recommend the same ticker.
-    // Duplicate ticker guard — only one position per ticker at a time.
     if (state.openPositions.some(p => p.ticker === trade.ticker)) {
       console.log(`  ⏭  ${trade.ticker} — already have an open position on this ticker`);
       continue;
     }
 
-    // Total position cap — count positions already open PLUS those placed this
-    // session so far. The normaliseAndFilterTrades check only snapshots state
-    // at filter time; this loop-level check prevents over-allocation when
-    // multiple trades pass the filter and execute in the same session.
     const totalOpen = state.openPositions.length;
-    if (totalOpen >= MANDATE.maxOpenPositions) {
-      console.log(`  ⏭  ${trade.ticker} — max ${MANDATE.maxOpenPositions} positions reached (${totalOpen} open)`);
-      break; // no point checking further trades — cap is global
+    if (totalOpen >= effectiveMaxPositions) {
+      console.log(`  ⏭  ${trade.ticker} — max ${effectiveMaxPositions} position(s) reached${MANDATE.validationMode?" (validation mode)":""}`);
+      break;
+    }
+
+    // In validation mode cap the per-trade cost
+    if (MANDATE.validationMode && trade.targetCost > effectiveMaxTrade) {
+      trade.targetCost = effectiveMaxTrade;
     }
 
     const legs = cachedLegs.get(trade) || await buildOptionsLegs(trade, stockData.price, regimeNow);
@@ -2805,7 +2880,7 @@ async function morningSession() {
     // Buying power gate (live only). For long options, the full cost is the
     // capital at risk — no collateral concept. legs.collateral is undefined
     // for Long Call/Put so the ?? falls back to legs.cost correctly.
-    if (!TRADIER.sandbox && buyingPower > 0) {
+    if (!BROKER.sandbox && buyingPower > 0) {
       const capitalRequired = legs.collateral ?? legs.cost;
       const bpRemaining     = buyingPower - state.totalCollateralToday;
       if (capitalRequired > bpRemaining) {
@@ -2814,7 +2889,7 @@ async function morningSession() {
       }
     }
 
-    const result = await placeOptionsOrder({ ticker:trade.ticker, strategy:trade.strategy, legs:legs.legs, quantity:legs.quantity || 1 });
+    const result = await placeOrder({ ticker:trade.ticker, strategy:trade.strategy, legs:legs.legs, quantity:legs.quantity || 1, limitPrice:legs.limitPrice });
     if (result.success) {
       const ex = { ...trade, ...legs, orderId:result.orderId||"SANDBOX", executedAt:new Date().toISOString(), executedCost:legs.cost, executedPrice:stockData.price, status:"OPEN" };
       executed.push(ex);
@@ -2888,7 +2963,7 @@ async function opportunisticScan() {
     return;
   }
 
-  const effectiveMin    = TRADIER.sandbox ? MANDATE.minPerTrade : MANDATE.minPerTradeLive;
+  const effectiveMin    = BROKER.sandbox ? MANDATE.minPerTrade : MANDATE.minPerTradeLive;
   const budgetRemaining = MANDATE.dailyCapMax - state.totalDeployedToday;
   if (budgetRemaining < effectiveMin) {
     console.log(`  ⏭  Skipping — daily budget exhausted ($${state.totalDeployedToday} deployed, $${budgetRemaining} remaining, need ≥$${effectiveMin})`);
@@ -2996,7 +3071,7 @@ async function opportunisticScan() {
     return;
   }
 
-  const result = await placeOptionsOrder({ ticker:candidate.ticker, strategy:candidate.strategy, legs:legs.legs, quantity:legs.quantity || 1 });
+  const result = await placeOrder({ ticker:candidate.ticker, strategy:candidate.strategy, legs:legs.legs, quantity:legs.quantity || 1, limitPrice:legs.limitPrice });
 
   if (result.success) {
     const ex = { ...candidate, ...legs, orderId:result.orderId, executedAt:new Date().toISOString(), executedCost:legs.cost, executedPrice:stockData.price, status:"OPEN", source:"opportunistic" };
@@ -3164,7 +3239,7 @@ async function closingSession() {
   const portfolioData = await fetchAllPrices();
   const winners  = portfolioData.filter(p=>(p.changePct||0)>0).sort((a,b)=>b.changePct-a.changePct);
   const losers   = portfolioData.filter(p=>(p.changePct||0)<0).sort((a,b)=>a.changePct-b.changePct);
-  const modeFlag = TRADIER.sandbox ? " [SANDBOX]" : "";
+  const modeFlag = BROKER.sandbox ? " [SANDBOX]" : "";
 
   // ── FORCED CLOSE: DTE ≤ 1 POSITIONS ──────────────────────────
   const todayStrC = new Date().toISOString().slice(0, 10);
@@ -3388,6 +3463,12 @@ Not financial advice.`
 
 async function sundaySummary() {
   console.log("\n📋 Sunday portfolio review...");
+
+  // Refresh Tastytrade session token — runs every 24h and Sunday is the
+  // natural checkpoint. Proactive refresh avoids a mid-request 401 during
+  // the Sunday price fetch or analyst target update.
+  await brokerLogin();
+
   const portfolioData = await fetchAllPrices();
 
   // Reset weekly highs at the start of each new week.
@@ -3442,7 +3523,7 @@ async function sundaySummary() {
   const skipLines  = skipped.map(s => `⚠ ${s.ticker} skipped (bad data $${s.newVal} vs $${s.oldVal})`);
   const targetSection = [...changeLines, ...skipLines].join("\n") || "No target changes";
 
-  const modeFlag = TRADIER.sandbox ? " [SANDBOX]" : "";
+  const modeFlag = BROKER.sandbox ? " [SANDBOX]" : "";
   const part1 =
     `📋 SUNDAY${modeFlag} ${new Date().toLocaleDateString("en-US",{month:"short",day:"numeric",year:"numeric"})}` +
     `\nWEEK: ${closingWeeklyPnL>=0?"+":""}$${closingWeeklyPnL.toFixed(0)} | MONTH: ${state.monthlyPnL>=0?"+":""}$${state.monthlyPnL.toFixed(0)}` +
@@ -3512,13 +3593,15 @@ async function sundaySummary() {
 // SCHEDULER
 // ═══════════════════════════════════════════════════════════════
 
-const modeLabel = TRADIER.sandbox ? "SANDBOX" : "LIVE";
+const modeLabel = BROKER.sandbox
+  ? "CERTIFICATION"
+  : MANDATE.validationMode ? "LIVE — VALIDATION" : "LIVE";
 
 console.log(`\n🚀 Options Trading Bot v3 (${modeLabel} MODE)`);
 console.log(`📋 Portfolio: ${PORTFOLIO.map(p=>p.ticker).join(", ")}`);
 console.log(`📊 ${PORTFOLIO.length} stocks | ${PORTFOLIO.filter(p=>p.optionable).length} optionable`);
 console.log(`◎  Mandate: $${MANDATE.dailyCapMin}–$${MANDATE.dailyCapMax}/day | $${MANDATE.minPerTrade}–$${MANDATE.maxPerTrade}/trade | ${MANDATE.targetMinDTE}–${MANDATE.targetMaxDTE} DTE | ${MANDATE.otmPctMin}–${MANDATE.otmPctMax}% OTM | Max ${MANDATE.maxOpenPositions} positions | Trail from +${MANDATE.trailActivationPct}% | Stop -${MANDATE.stopLossPct}%`);
-console.log(`🔗 Tradier: ${TRADIER.baseUrl}`);
+console.log(`🔗 Broker: Tastytrade ${BROKER.sandbox ? "(SANDBOX)" : "(LIVE)"} — ${BROKER.baseUrl}`);
 console.log("⏰ Schedule:");
 console.log("   Mon–Fri 9:10 AM — Morning scan + execute");
 console.log("   Mon–Fri 9:25 AM — Analyst targets refresh");
@@ -3537,7 +3620,7 @@ console.log("   Sunday 8:00 AM  — Full portfolio review + auto-update all leve
 async function reconcileOrphanedPositions() {
   console.log("\n🔍 Checking for orphaned Tradier positions (untracked after restart)...");
   try {
-    const positions = await getTradierPositions();
+    const positions = await getPositions();
     if (positions === null) {
       console.log("  ⚠ Tradier positions fetch failed — skipping reconciliation this cycle.");
       return;
@@ -3630,9 +3713,16 @@ cron.schedule("0 8 * * 0",         () => runExclusive("sundaySummary",        su
 (async () => {
   try {
     console.log("  ⏳ Running startup diagnostics...");
-    // Restore state BEFORE reconciliation — so a legitimate restart with
-    // a working persisted state finds its own positions already tracked,
-    // rather than falsely flagging them as orphaned.
+
+    // Authenticate with Tastytrade
+    const ok = await brokerLogin();
+    if (!ok) console.error("  ⚠ Tastytrade auth failed at startup — will retry on first trade");
+
+    // Run endpoint diagnostics — verifies quotes, chain, positions all work
+    // before the market opens. Results sent to Pushover if any fail.
+    await runBrokerDiagnostics();
+
+    // Restore state BEFORE reconciliation
     loadState();
     await reconcileOrphanedPositions();
     await runExclusive("startupDiagnostics", intradayCheck);
@@ -3641,7 +3731,7 @@ cron.schedule("0 8 * * 0",         () => runExclusive("sundaySummary",        su
     // In live mode, send a separate loud alert first so there is no ambiguity
     // about which mode is active. A copy-pasted Railway service misconfigured
     // for live would otherwise start trading without any obvious friction.
-    if (!TRADIER.sandbox) {
+    if (!BROKER.sandbox) {
       await sendSMS(
         `⚠️ LIVE TRADING ACTIVE — REAL MONEY\n` +
         `Orders will execute on your real Tradier account.\n` +
