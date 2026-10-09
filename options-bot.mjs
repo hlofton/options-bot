@@ -37,6 +37,12 @@ import fs        from "fs";
 import dotenv    from "dotenv";
 dotenv.config();
 
+// Run all local-time formatting and "today" checks in US Eastern time. Railway containers
+// default to UTC, so log timestamps read 4–5 hours ahead of market time and the daily
+// rollover (toDateString) happened at 8 PM ET. Cron schedules already pass an explicit
+// timezone, so they are unaffected. A TZ variable set in Railway still takes precedence.
+process.env.TZ = process.env.TZ || "America/New_York";
+
 // ── CRITICAL STARTUP GUARD ────────────────────────────────────
 // Exit immediately if required keys are missing — prevents silent
 // failures where the bot starts, logs nothing useful, then silently
@@ -464,6 +470,10 @@ function loadState() {
     state.downtrendCount    = persisted.downtrendCount || {};
     state.vixHistory        = persisted.vixHistory     || [];
     state.momentumTickers   = persisted.momentumTickers || {};
+    // Drop momentum entries recorded outside market hours (stale after-hours prices).
+    for (const [t, ts] of Object.entries(state.momentumTickers)) {
+      if (!isMarketOpenET(new Date(ts))) delete state.momentumTickers[t];
+    }
     state._lastResetMonth   = persisted._lastResetMonth || null;
     state.weeklyPnL         = persisted.weeklyPnL     || 0;
     state.monthlyPnL        = persisted.monthlyPnL    || 0;
@@ -516,7 +526,7 @@ function loadState() {
 // collision skips one of these, it simply does not happen at all that
 // day. Worth an explicit alert rather than a silent console line.
 const CRITICAL_ONCE_DAILY_JOBS = new Set([
-  "morningSession", "updateAnalystTargets", "closingSession", "sundaySummary",
+  "morningSession", "updateAnalystTargets", "preCloseExpirySweep", "closingSession", "sundaySummary",
 ]);
 
 async function runExclusive(jobName, fn) {
@@ -2210,11 +2220,24 @@ async function generateTrades(portfolioData, preComputedRegime = null) {
 // contains both config fields (ticker, stopLoss, target) and live price fields
 // (price, changePct). Previously took (stock, priceData) with the same object
 // passed twice — simplified to one arg since they were always identical.
+// A target far below the live price is bad data (e.g. a stale pre-split analyst
+// consensus: PANW showed "reached target $217.22" at $408). Use the stored dynamic
+// target only if it is within a sane band of the live price; otherwise fall back to
+// the static portfolio target, and to no target if that is out of band too.
+function effectiveTargetFor(stock) {
+  const price = stock.price;
+  const ok = t => t && (!price || (t >= price * 0.7 && t <= price * 2));
+  const dynamic = state.dynamicLevels[stock.ticker]?.target;
+  if (ok(dynamic))      return dynamic;
+  if (ok(stock.target)) return stock.target;
+  return null;
+}
+
 function detectAlerts(stock) {
   const alerts         = [];
   const price          = stock.price;
   const effectiveStop  = getStopLoss(stock.ticker, stock.stopLoss);
-  const effectiveTarget= getTarget(stock.ticker, stock.target);
+  const effectiveTarget= effectiveTargetFor(stock);
 
   // Update trailing stop on every check
   if (stock.optionable && price && effectiveStop) {
@@ -2920,6 +2943,14 @@ Include every ticker. Use null for analystTarget if no data found.`;
         continue;
       }
 
+      // SANITY CHECK 2: a target far from the live price is bad data, not a view
+      // (PANW: $217 consensus vs a $408 price). Reject below 70% or above 200% of price.
+      if (currentPrice && (r.analystTarget < currentPrice * 0.7 || r.analystTarget > currentPrice * 2)) {
+        console.warn(`  ⚠ ${r.ticker}: analyst target $${r.analystTarget} is out of range for price $${currentPrice} (0.7×–2×) — skipping (source: ${r.source || "unknown"})`);
+        skipped.push({ ticker: r.ticker, newVal: r.analystTarget, oldVal: oldTarget, pct: "range" });
+        continue;
+      }
+
       const targetChanged  = Math.abs(r.analystTarget - oldTarget) / oldTarget > 0.03;
       const priceBasedStop = parseFloat((currentPrice * 0.85).toFixed(2));
       const newStop        = Math.max(priceBasedStop, oldStop || 0);
@@ -3483,25 +3514,30 @@ async function intradayCheck() {
       const key = `${todayStr}_${stock.ticker}_${actionable.map(a=>a.type).join("_")}_${new Date().getHours()}`;
       if (!state.alertsSent.has(key)) {
         state.alertsSent.add(key);
-        await sendPush(`⚡ ${stock.ticker} ALERT\nPrice: $${stock.price.toFixed(2)} ${(stock.changePct||0)>=0?"▲":"▼"}${Math.abs(stock.changePct||0).toFixed(2)}%\n\n${actionable.map(a=>`${a.urgency}\n${a.msg}`).join("\n\n")}\n\nStop: $${getStopLoss(stock.ticker,stock.stopLoss)?.toFixed(2)||"N/A"} | Target: $${getTarget(stock.ticker,stock.target)?.toFixed(2)||"N/A"}\nNot financial advice.`);
+        await sendPush(`⚡ ${stock.ticker} ALERT\nPrice: $${stock.price.toFixed(2)} ${(stock.changePct||0)>=0?"▲":"▼"}${Math.abs(stock.changePct||0).toFixed(2)}%\n\n${actionable.map(a=>`${a.urgency}\n${a.msg}`).join("\n\n")}\n\nStop: $${getStopLoss(stock.ticker,stock.stopLoss)?.toFixed(2)||"N/A"} | Target: $${effectiveTargetFor(stock)?.toFixed(2)||"N/A"}\nNot financial advice.`);
         console.log(`  ✅ Alert: ${stock.ticker} — ${actionable.map(a=>a.type).join(", ")}`);
       }
     }
 
-    // Track momentum events for the gate — always, even if alert was suppressed.
-    if (urgent.some(a => ["TARGET_HIT","BIG_MOVE"].includes(a.type))) {
+    // Track momentum events for the gate — even if the alert itself was suppressed.
+    // Only during market hours, and TARGET_HIT counts only alongside a real move today:
+    // a stock simply sitting above an old portfolio target is not momentum. (After-hours
+    // startup checks used to record six names this way and could open the gate by themselves.)
+    const moveToday = Math.abs(stock.changePct || 0);
+    if (isMarketOpenET() && urgent.some(a =>
+          a.type === "BIG_MOVE" || (a.type === "TARGET_HIT" && moveToday >= 2))) {
       state.momentumTickers[stock.ticker] = new Date().toISOString();
     }
   }
   console.log(`  ✓ Check complete. Open positions: ${state.openPositions.length}`);
 }
 
-// ── PRE-CLOSE SWEEP: 3:50 PM ─────────────────────────────────
+// ── PRE-CLOSE SWEEP: 3:52 PM ─────────────────────────────────
 // Force-closes any DTE ≤ timeDTE positions while the market is still
 // open. This MUST run before 4:00 PM ET; "Day" TIF orders submitted
 // after close are rejected. closingSession (4:07 PM) is P&L summary only.
 async function preCloseExpirySweep() {
-  console.log(`\n[${new Date().toLocaleTimeString()}] ⏰ Pre-close expiry sweep (3:50 PM)...`);
+  console.log(`\n[${new Date().toLocaleTimeString()}] ⏰ Pre-close expiry sweep (3:52 PM)...`);
   if (!state.openPositions.length) {
     console.log("  ✓ No open positions — nothing to sweep.");
     return;
@@ -3539,7 +3575,7 @@ async function closingSession() {
   const modeFlag = BROKER.sandbox ? " [SANDBOX]" : "";
 
   // ── UNREALIZED P&L snapshot for summary ──────────────────────
-  // DTE closes are handled by preCloseExpirySweep at 3:50 PM;
+  // DTE closes are handled by preCloseExpirySweep at 3:52 PM;
   // this session only needs a fresh read for the P&L summary.
   let unrealizedPnL   = 0;
   let unrealizedLines = "";
@@ -3884,7 +3920,7 @@ console.log("   Mon–Fri 9:45 AM — Morning scan + execute");
 console.log("   Mon–Fri 9:25 AM — Analyst targets refresh");
 console.log("   Mon–Fri 9:30–3:55PM — Position monitor + trailing stops every 5 min");
 console.log("   Mon–Fri 11:02,1:02,3:02 — Opportunistic scan (5%+ moves only)");
-console.log("   Mon–Fri 3:50 PM — Pre-close expiry sweep (force-closes DTE≤2)");
+console.log("   Mon–Fri 3:52 PM — Pre-close expiry sweep (force-closes DTE≤2)");
 console.log("   Mon–Fri 4:07 PM — Closing summary");
 console.log("   Sunday 8:00 AM  — Full portfolio review + auto-update all levels\n");
 
@@ -3979,10 +4015,10 @@ cron.schedule("*/5 9-15 * * 1-5",  () => runExclusive("intradayCheck",        in
 // intraday -7%) that was exactly the kind of setup this scan exists to
 // catch. Offsetting by 2 minutes guarantees no collision, ever.
 cron.schedule("2 11,13,15 * * 1-5", () => runExclusive("opportunisticScan",    opportunisticScan),    { timezone:"America/New_York" });
-// Pre-close sweep: 3:50 PM ET — force-closes DTE≤timeDTE positions while
+// Pre-close sweep: 3:52 PM ET (NOT :50 — intradayCheck already fires at :50 and the global lock skipped the sweep on its first day) — force-closes DTE≤timeDTE positions while
 // the market is still open. Must run BEFORE 4:00 PM; "Day" TIF orders
 // submitted after close are rejected by Tastytrade.
-cron.schedule("50 15 * * 1-5",     () => runExclusive("preCloseExpirySweep",  preCloseExpirySweep),  { timezone:"America/New_York" });
+cron.schedule("52 15 * * 1-5",     () => runExclusive("preCloseExpirySweep",  preCloseExpirySweep),  { timezone:"America/New_York" });
 // Closing session: 4:07 PM ET — P&L summary only (no order placement).
 cron.schedule("7 16 * * 1-5",      () => runExclusive("closingSession",       closingSession),       { timezone:"America/New_York" });
 cron.schedule("0 8 * * 0",         () => runExclusive("sundaySummary",        sundaySummary),        { timezone:"America/New_York" });
