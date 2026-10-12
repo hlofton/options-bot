@@ -424,7 +424,8 @@ function saveState() {
       monthlyPnL:                 state.monthlyPnL,
       tradeStats:                 state.tradeStats,
       downtrendCount:             state.downtrendCount,
-      _lastResetMonth:            state._lastResetMonth,
+      _downtrendMigrated:         state._downtrendMigrated ?? "2026-10-12",
+      _lastResetMonth:           state._lastResetMonth,
       dynamicLevels:              state.dynamicLevels,
       weeklyHighs:                state.weeklyHighs,
       vixHistory:                 state.vixHistory,
@@ -468,7 +469,16 @@ function loadState() {
     state.weeklyHighs   = persisted.weeklyHighs   || {};
     state.tradeStats        = persisted.tradeStats    || {};
     state.downtrendCount    = persisted.downtrendCount || {};
-    state.vixHistory        = persisted.vixHistory     || [];
+    // One-time migration (2026-10-12): counts built from never-clearing stops (and
+    // the Tradier era) pinned names at 10 days. Clear once; decay handles it after.
+    state._downtrendMigrated = persisted._downtrendMigrated || null;
+    if (state._downtrendMigrated !== "2026-10-12") {
+      const n = Object.keys(state.downtrendCount).length;
+      state.downtrendCount = {};
+      state._downtrendMigrated = "2026-10-12";
+      if (n) console.log(`  🧹 Cleared ${n} stale downtrend counter(s) (one-time migration)`);
+    }
+    state.vixHistory       = persisted.vixHistory     || [];
     state.momentumTickers   = persisted.momentumTickers || {};
     // Drop momentum entries recorded outside market hours (stale after-hours prices).
     for (const [t, ts] of Object.entries(state.momentumTickers)) {
@@ -1502,7 +1512,10 @@ async function closePosition(position) {
           const quotes = await getQuotes(fromTastySymbol(position.symbol));
           const q = quotes[0];
           if (q?.bid != null && q?.ask != null && q.bid > 0) {
-            limitPrice = ((q.bid + q.ask) / 2).toFixed(2);
+            // Tastytrade rejects limits off the option tick ($0.05) with 422
+            // invalid_price_increment — round the midpoint like the entry path does.
+            const mid = (q.bid + q.ask) / 2;
+            limitPrice = Math.max(0.05, Math.round(mid / 0.05) * 0.05).toFixed(2);
           }
         }
         const orderBody = {
@@ -2209,7 +2222,18 @@ async function generateTrades(portfolioData, preComputedRegime = null) {
     }
   }
 
-  return normaliseAndFilterTrades(parsed, effectiveMin, { broadWeakness });
+  // Call/put audit trail: what the AI proposed vs. what survived the filters.
+  const tally = list => {
+    const c = list.filter(t => t.strategy === "Long Call").length;
+    const p = list.filter(t => t.strategy === "Long Put").length;
+    return `${c} call${c===1?"":"s"} / ${p} put${p===1?"":"s"}`;
+  };
+  const dtNames = Object.entries(state.downtrendCount).filter(([, dc]) => dc.count >= 1).map(([t, dc]) => `${t}(${dc.count}d)`);
+  console.log(`  🧮 Call/put audit — downtrend names: ${dtNames.length} [${dtNames.join(", ") || "none"}] (calls need score 9 at ≥${MANDATE.broadWeaknessThreshold}, blocked at ≥${MANDATE.callBlockThreshold}) | broadWeakness: ${broadWeakness}`);
+  console.log(`  🧮 AI proposed: ${tally(parsed)} — ${parsed.map(t => `${t.ticker} ${t.strategy === "Long Call" ? "C" : "P"}(${t.setupScore ?? t.score ?? "?"})`).join(", ") || "none"}`);
+  const kept = normaliseAndFilterTrades(parsed, effectiveMin, { broadWeakness });
+  console.log(`  🧮 After filters: ${tally(kept)}`);
+  return kept;
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -2936,7 +2960,12 @@ Include every ticker. Use null for analystTarget if no data found.`;
       // value in a single update. Confirmed: CRWD oscillated $193→$701→$195 —
       // clearly bad API data. Skip this cycle; if the API returns the same
       // value again next session it will pass (oldTarget updates to the new value).
-      if (oldTarget && Math.abs(r.analystTarget - oldTarget) / oldTarget > 0.50) {
+      // Only applies when the OLD target is itself sane vs the live price. A stale
+      // old target (PANW: $217 vs a $410 price) would otherwise reject every correct
+      // update forever (81% jump from the stale value).
+      const oldTargetSane = oldTarget && currentPrice
+        && oldTarget >= currentPrice * 0.7 && oldTarget <= currentPrice * 2;
+      if (oldTargetSane && Math.abs(r.analystTarget - oldTarget) / oldTarget > 0.50) {
         const pct = (((r.analystTarget - oldTarget) / oldTarget) * 100).toFixed(0);
         console.warn(`  ⚠ ${r.ticker}: analyst target $${r.analystTarget} changed ${pct}% from $${oldTarget} — exceeds 50% sanity threshold, skipping (source: ${r.source || "unknown"})`);
         skipped.push({ ticker: r.ticker, newVal: r.analystTarget, oldVal: oldTarget, pct });
@@ -2951,7 +2980,7 @@ Include every ticker. Use null for analystTarget if no data found.`;
         continue;
       }
 
-      const targetChanged  = Math.abs(r.analystTarget - oldTarget) / oldTarget > 0.03;
+      const targetChanged  = !oldTarget || Math.abs(r.analystTarget - oldTarget) / oldTarget > 0.03;
       const priceBasedStop = parseFloat((currentPrice * 0.85).toFixed(2));
       const newStop        = Math.max(priceBasedStop, oldStop || 0);
       const stopChanged    = newStop > oldStop;
@@ -2973,6 +3002,27 @@ Include every ticker. Use null for analystTarget if no data found.`;
       }
     }
   } catch(e) { console.error(`  ✗ Analyst fetch failed: ${e.message}`); }
+
+  // ── STEP 3: rebase dead stops on names we don't hold ────────
+  // Stops only ratchet up, so a name that fell below its stop fired STOP_LOSS every
+  // day forever and kept the downtrend counter pinned (calls then need score 9, or
+  // are blocked). Options positions use their own premium stops, so for tickers with
+  // no open position the stock stop is informational only: reset it to 85% of price.
+  for (const stock of PORTFOLIO) {
+    if (ETF_TICKERS.includes(stock.ticker)) continue;
+    const live = portfolioData.find(p => p.ticker === stock.ticker);
+    if (!live?.price) continue;
+    if (state.openPositions.some(p => p.ticker === stock.ticker)) continue;
+    const stop = getStopLoss(stock.ticker, stock.stopLoss);
+    if (stop && live.price <= stop) {
+      const rebased = parseFloat((live.price * 0.85).toFixed(2));
+      state.dynamicLevels[stock.ticker] = {
+        ...(state.dynamicLevels[stock.ticker] || {}),
+        stopLoss: rebased, lastUpdated: new Date().toISOString(),
+      };
+      console.log(`  🔧 ${stock.ticker}: price $${live.price} below stop $${stop} with no position — stop rebased to $${rebased}`);
+    }
+  }
 
   saveState();
   console.log(`  ✅ Auto-update complete: ${totalUpdated} positions updated`);
