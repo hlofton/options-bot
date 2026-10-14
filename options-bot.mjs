@@ -2471,13 +2471,15 @@ Not financial advice.`
       continue;
     }
 
-    if (!grouped.has(ourTrade)) grouped.set(ourTrade, { positions: [], netValue: 0, missingQuote: false });
+    if (!grouped.has(ourTrade)) grouped.set(ourTrade, { positions: [], netValue: 0, missingQuote: false, spreadPct: 0 });
     const g = grouped.get(ourTrade);
     g.positions.push(pos);
     const quote = quoteMap[pos.symbol];
     if (!quote) { g.missingQuote = true; continue; }
     const legSign = pos.quantity > 0 ? 1 : -1;
-    g.netValue += legSign * (quote.bid + quote.ask) / 2;
+    const legMid  = (quote.bid + quote.ask) / 2;
+    g.netValue += legSign * legMid;
+    g.spreadPct = Math.max(g.spreadPct || 0, legMid > 0 ? ((quote.ask - quote.bid) / legMid) * 100 : 100);
   }
 
   // ── INLINE RECONCILIATION: re-track untracked positions mid-session ──
@@ -2519,7 +2521,7 @@ Not financial advice.`
     if (g.missingQuote) { results.push({ ourTrade, positions: g.positions, valid: false }); continue; }
     const qty          = ourTrade.quantity || Math.abs(g.positions[0]?.quantity || 1);
     const currentValue = Math.abs(g.netValue);
-    results.push({ ourTrade, positions: g.positions, valid: true, currentValue, qty });
+    results.push({ ourTrade, positions: g.positions, valid: true, currentValue, qty, spreadPct: g.spreadPct || 0 });
   }
 
   // ── STALE POSITION CLEANUP ─────────────────────────────────────
@@ -2614,12 +2616,30 @@ Not financial advice.`
   return snap;
 }
 
-async function monitorOpenPositions(groups, underlyingPriceMap = {}) {
+// ── EXIT-SAFETY STATE (shared by the 5-min check and the 30-s fast watcher) ──
+// closingNow:    trades with a close order in flight — the other job must not send a second one.
+// lastReading:   previous evaluation per trade, used to require two consecutive breaching
+//                readings before a trail/stop exit (filters one-off bad option quotes).
+// closeCooldown: after a failed close, wait before retrying so a 30-s loop can't hammer the broker.
+const closingNow    = new WeakSet();
+const lastReading   = new WeakMap();
+const closeCooldown = new WeakMap();
+const CONFIRM_WINDOW_MS   = 150_000; // a prior reading older than this doesn't count
+const NOISY_SPREAD_PCT    = 30;      // quote spread above this % of mid: don't trust it for a new peak
+const CLOSE_RETRY_WAIT_MS = 120_000;
+
+async function monitorOpenPositions(groups, underlyingPriceMap = {}, { fast = false } = {}) {
   if (!groups || !groups.length) return;
-  console.log(`  Monitoring ${groups.length} open trade(s) (grouped by all legs)...`);
+  if (!fast) console.log(`  Monitoring ${groups.length} open trade(s) (grouped by all legs)...`);
 
   for (const g of groups) {
     const { ourTrade } = g;
+    // Guards run BEFORE the try block on purpose: the finally below clears closingNow,
+    // and a skipped group must never clear another job's in-flight marker.
+    if (!state.openPositions.includes(ourTrade)) continue;   // already closed by the other job
+    if (closingNow.has(ourTrade)) continue;                  // the other job is closing it right now
+    const retryAt = closeCooldown.get(ourTrade);
+    if (retryAt && Date.now() < retryAt) continue;           // recent close failure — wait
     try {
       if (!g.valid) {
         console.log(`  ⚠ ${ourTrade.ticker} ${ourTrade.strategy}: quote unavailable for one or more legs — skipping this cycle`);
@@ -2642,8 +2662,15 @@ async function monitorOpenPositions(groups, underlyingPriceMap = {}) {
       // ── HIGH-WATER MARK (trailing stop state) ────────────────────
       // ourTrade is the live reference in state.openPositions — mutating
       // it here is persisted automatically on next saveState() call.
+      // A wide bid/ask makes the midpoint unreliable: don't let a noisy spike set the peak
+      // (a false peak makes the trail fire on an ordinary move).
+      const noisyQuote = (g.spreadPct ?? 0) > NOISY_SPREAD_PCT;
       if (currentPct > (ourTrade.peakGainPct ?? -Infinity)) {
-        ourTrade.peakGainPct = currentPct;
+        if (noisyQuote) {
+          console.log(`  ⚠ ${ourTrade.ticker}: ${currentPct.toFixed(1)}% would set a new peak but spread is ${g.spreadPct.toFixed(0)}% — ignoring noisy quote`);
+        } else {
+          ourTrade.peakGainPct = currentPct;
+        }
       }
       const peakGain = ourTrade.peakGainPct ?? currentPct;
 
@@ -2672,7 +2699,7 @@ async function monitorOpenPositions(groups, underlyingPriceMap = {}) {
       const stopNote   = hoursHeld < MANDATE.gracePeriodHours
         ? ` | stop:${stopThreshold}%(grace ${graceRemaining}h left)`
         : ` | stop:${stopThreshold}%`;
-      console.log(`  ${ourTrade.ticker} ${abbrevStrategy(ourTrade.strategy)} (${g.positions.length} leg): $${g.currentValue.toFixed(2)}/sh | P&L: ${currentPnL>=0?"+":""}$${currentPnL.toFixed(0)} (${currentPct.toFixed(1)}%)${basisNote}${trailNote}${stopNote} | DTE:${dte}`);
+      console.log(`  ${fast ? "⏱ fast " : ""}${ourTrade.ticker} ${abbrevStrategy(ourTrade.strategy)} (${g.positions.length} leg): $${g.currentValue.toFixed(2)}/sh | P&L: ${currentPnL>=0?"+":""}$${currentPnL.toFixed(0)} (${currentPct.toFixed(1)}%)${basisNote}${trailNote}${stopNote} | spr:${(g.spreadPct ?? 0).toFixed(0)}% | DTE:${dte}`);
 
       // ── CLOSE DECISION ────────────────────────────────────────────
       let shouldClose = false, closeReason = "";
@@ -2690,7 +2717,23 @@ async function monitorOpenPositions(groups, underlyingPriceMap = {}) {
         closeReason = `🛑 STOP LOSS ${stopThreshold}% — ${currentPct.toFixed(1)}% (${stopContext}) = -$${Math.abs(currentPnL).toFixed(0)}`;
       }
 
+      // ── TWO-READING CONFIRMATION (trail / stop only; time stop is deterministic) ──
+      // A first breach is held for one more reading when a recent previous reading exists
+      // (i.e. the 30-s watcher is running). If none exists, behaviour is unchanged: exit now.
+      const rawBreach = shouldClose;
+      const nowReadMs = Date.now();
+      const prevRead  = lastReading.get(ourTrade);
+      if (shouldClose && dte > MANDATE.timeDTE) {
+        const recentPrev = prevRead && (nowReadMs - prevRead.t) <= CONFIRM_WINDOW_MS;
+        if (recentPrev && !prevRead.breached) {
+          console.log(`  ⏳ ${ourTrade.ticker}: first breach (${closeReason.slice(0, 60)}) — waiting for a confirming reading`);
+          shouldClose = false;
+        }
+      }
+      lastReading.set(ourTrade, { t: nowReadMs, breached: rawBreach });
+
       if (shouldClose) {
+        closingNow.add(ourTrade); // synchronous — no await between decision and marker
         // ── ATOMIC MULTILEG CLOSE ───────────────────────────────────
         // Previously closed each leg as an individual single-leg order
         // 500ms apart. Risk: leg 1-2 accept, leg 3-4 reject → naked short
@@ -2795,6 +2838,7 @@ Not financial advice.`
           // on Sep 1 2026 — the bot only sent a generic retry message each
           // time, giving no indication of the severity.
           ourTrade.closeFailureCount = (ourTrade.closeFailureCount ?? 0) + 1;
+          closeCooldown.set(ourTrade, Date.now() + CLOSE_RETRY_WAIT_MS);
           const failureCount  = ourTrade.closeFailureCount;
           const failureReason = closeResult.error || "close order rejected after retries";
 
@@ -2837,9 +2881,62 @@ Not financial advice.`
         await new Promise(r => setTimeout(r, 500));
       }
     } catch(e) { console.error(`  ✗ Monitor ${ourTrade?.ticker || "unknown"}: ${e.message}`); }
+    finally { closingNow.delete(ourTrade); }
     await new Promise(r => setTimeout(r, 500));
   }
 }
+
+// ── FAST POSITION WATCHER ─────────────────────────────────────
+// Every 30 s during market hours, quote ONLY the legs of positions we hold and run the
+// same exit rules as the 5-minute check. No broker positions call, no reconciliation —
+// the 5-minute check still owns that. Skips entirely (zero API calls) when flat.
+async function getFastGroups() {
+  const trades = state.openPositions.filter(t => Array.isArray(t.legs) && t.legs.length);
+  if (!trades.length) return [];
+  const symbols = [...new Set(trades.flatMap(t => t.legs.map(l => l.symbol)))];
+  const quotes  = await getOptionQuote(symbols);
+  const quoteMap = {};
+  for (const q of quotes || []) quoteMap[q.symbol] = q;
+
+  return trades.map(ourTrade => {
+    const qty = ourTrade.quantity || 1;
+    const positions = ourTrade.legs.map(l => ({
+      symbol:   l.symbol,
+      quantity: (String(l.side || "").startsWith("buy") ? 1 : -1) * qty,
+    }));
+    let net = 0, spreadPct = 0, valid = true;
+    for (const p of positions) {
+      const q = quoteMap[p.symbol];
+      if (!q || q.bid == null || q.ask == null || !(q.ask > 0)) { valid = false; break; }
+      const mid = (q.bid + q.ask) / 2;
+      net += (p.quantity > 0 ? 1 : -1) * mid;
+      spreadPct = Math.max(spreadPct, mid > 0 ? ((q.ask - q.bid) / mid) * 100 : 100);
+    }
+    if (!valid) return { ourTrade, positions, valid: false };
+    return { ourTrade, positions, valid: true, currentValue: Math.abs(net), qty, spreadPct };
+  });
+}
+
+let fastWatchBusy = false;
+async function fastPositionWatch() {
+  if (fastWatchBusy) return;                     // previous cycle still running
+  if (!state.openPositions.length) return;       // flat — nothing to watch
+  if (!isMarketOpenET()) return;
+  fastWatchBusy = true;
+  try {
+    const sigBefore = JSON.stringify(state.openPositions.map(p => p.peakGainPct ?? null));
+    const countBefore = state.openPositions.length;
+    const groups = await getFastGroups();
+    await monitorOpenPositions(groups, {}, { fast: true });
+    const sigAfter = JSON.stringify(state.openPositions.map(p => p.peakGainPct ?? null));
+    if (state.openPositions.length !== countBefore || sigAfter !== sigBefore) saveState();
+  } catch (e) {
+    console.error(`  ✗ Fast watcher: ${e.message}`);
+  } finally {
+    fastWatchBusy = false;
+  }
+}
+setInterval(fastPositionWatch, 30_000);
 
 // ═══════════════════════════════════════════════════════════════
 // ANALYST TARGET AUTO-UPDATE (runs daily 9:15 AM)
