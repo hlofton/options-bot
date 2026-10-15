@@ -115,13 +115,18 @@ const MANDATE = {
   minPerTradeLive:   250,  // same floor in live
 
   // ── Option selection ─────────────────────────────────────
-  targetMinDTE:       10,  // buy options with at least 10 DTE — raised from 7.
+  targetMinDTE:        9,  // Oct 2026: widened from 10–14 to 9–15. Weekly options expire on
+                           // Fridays, and 10–14 DTE contains NO Friday on Wednesdays or
+                           // Thursdays — the bot could not open a trade those two days.
+                           // 9–15 is the narrowest window with a Friday on every weekday
+                           // (Mon 11, Tue 10, Wed 9, Thu 15, Fri 14).
+                           // (Previously: buy options with at least 10 DTE — raised from 7.
                            // 7 DTE puts the option in the final week where theta
                            // decay is 10-20%/day. If the move doesn't happen in
                            // the first 2-3 days you hit the 2 DTE time stop at a
                            // large loss regardless of direction. 10 DTE gives 8
                            // days of productive holding before the time stop fires.
-  targetMaxDTE:       14,  // cap at 14 DTE — enough time, not too much theta paid upfront.
+  targetMaxDTE:       15,  // cap at 15 DTE — enough time, not too much theta paid upfront (was 14).
   otmPctMin:           3,  // minimum 3% OTM — lowered from 8%.
   otmPctMax:           7,  // maximum 7% OTM — lowered from 12%.
                            // At 8-12% OTM needed 8-12% stock move in 7-14 DTE
@@ -721,6 +726,46 @@ function passesLiquidity(ticker, label, opt, bid, ask) {
   return true;
 }
 
+// DTE helpers for the mandate window (UTC date strings, same convention as below).
+function dteOf(exp, todayUTC) {
+  return Math.ceil((new Date(exp + "T00:00:00Z") - todayUTC) / (1000*60*60*24));
+}
+function dteListNote(expirations, todayUTC) {
+  const dtes = (expirations || []).map(e => dteOf(e, todayUTC)).filter(d => d >= 0).slice(0, 5);
+  return dtes.length ? ` (available DTEs: ${dtes.join(", ")})` : "";
+}
+
+// Which of these tickers have an expiry inside the mandate DTE window? Used BEFORE the AI
+// call so it is only offered names the bot can actually buy (the AI cannot see expiries —
+// on Oct 14 it proposed the same untradable ticker all day). Fails open: a ticker whose
+// expirations can't be fetched stays in; if every lookup fails the caller gets null (no filter).
+async function tickersWithUsableExpiry(tickers) {
+  const todayUTC = new Date(new Date().toISOString().slice(0, 10) + "T00:00:00Z");
+  const usable = new Set(), none = [];
+  let failed = 0;
+  const queue = [...tickers];
+  const worker = async () => {
+    while (queue.length) {
+      const t = queue.shift();
+      try {
+        const exps = await getExpirations(t);
+        // getExpirations swallows API errors and returns [] — treat empty as a failed
+        // lookup (keep the ticker), never as "no expiries", or one API blip empties the list.
+        if (!exps || !exps.length) { failed++; usable.add(t); continue; }
+        const has  = exps.some(e => {
+          const d = dteOf(e, todayUTC);
+          return d >= MANDATE.targetMinDTE && d <= MANDATE.targetMaxDTE;
+        });
+        if (has) usable.add(t); else none.push(t);
+      } catch (_) { failed++; usable.add(t); }
+    }
+  };
+  await Promise.all([worker(), worker(), worker(), worker()]);
+  if (failed === tickers.length) return null;
+  console.log(`  📅 Expiry check (${MANDATE.targetMinDTE}–${MANDATE.targetMaxDTE} DTE): ${usable.size}/${tickers.length} tickers have a usable expiry${none.length ? ` — none: ${none.join(", ")}` : ""}${failed ? ` (${failed} lookup failure(s), kept)` : ""}`);
+  return usable;
+}
+
 async function buildOptionsLegs(tradeRec, stockPrice, regime = null) {
   const { ticker, strategy } = tradeRec;
   try {
@@ -739,7 +784,7 @@ async function buildOptionsLegs(tradeRec, stockPrice, regime = null) {
           return dte >= MANDATE.targetMinDTE && dte <= MANDATE.targetMaxDTE;
         });
         if (!lcExp) {
-          console.log(`  ✗ ${ticker} Long Call REJECTED — no expiry in ${MANDATE.targetMinDTE}–${MANDATE.targetMaxDTE} DTE window`);
+          console.log(`  ✗ ${ticker} Long Call REJECTED — no expiry in ${MANDATE.targetMinDTE}–${MANDATE.targetMaxDTE} DTE window${dteListNote(expirations, todayUTC)}`);
           return null;
         }
         const lcChain = await getChain(ticker, lcExp, stockPrice);
@@ -826,7 +871,7 @@ async function buildOptionsLegs(tradeRec, stockPrice, regime = null) {
           return dte >= MANDATE.targetMinDTE && dte <= MANDATE.targetMaxDTE;
         });
         if (!lpExp) {
-          console.log(`  ✗ ${ticker} Long Put REJECTED — no expiry in ${MANDATE.targetMinDTE}–${MANDATE.targetMaxDTE} DTE window`);
+          console.log(`  ✗ ${ticker} Long Put REJECTED — no expiry in ${MANDATE.targetMinDTE}–${MANDATE.targetMaxDTE} DTE window${dteListNote(expirations, todayUTC)}`);
           return null;
         }
         const lpChain = await getChain(ticker, lpExp, stockPrice);
@@ -2059,9 +2104,9 @@ async function generateTrades(portfolioData, preComputedRegime = null) {
   const today       = new Date().toLocaleDateString("en-US",{weekday:"long",month:"long",day:"numeric",year:"numeric"});
   const effectiveMin = BROKER.sandbox ? MANDATE.minPerTrade : MANDATE.minPerTradeLive;
 
-  let spyChange, regime, broadWeakness = false, weakTickers = [];
+  let spyChange, regime, broadWeakness = false, weakTickers = [], onlyTickers = null;
   if (preComputedRegime) {
-    ({ spyChange, regime, broadWeakness = false, weakTickers = [] } = preComputedRegime);
+    ({ spyChange, regime, broadWeakness = false, weakTickers = [], onlyTickers = null } = preComputedRegime);
     console.log(`  📊 Using pre-computed regime: ${regime.label} (passed from caller)`);
   } else {
     spyChange = getSpyChangeFromPortfolio(portfolioData);
@@ -2156,8 +2201,23 @@ async function generateTrades(portfolioData, preComputedRegime = null) {
     .filter(e => e.days > 0 && e.days <= 5)
     .map(e => `${e.t} in ${e.days} days`);
 
+  // Offer the AI only names it can act on: (opportunistic scan) the 5%+ movers that triggered
+  // the scan, and (always) names with an expiry inside the DTE window. Sector health above
+  // still uses the full list so peer context is unchanged.
+  let promptList = optionable;
+  if (onlyTickers) {
+    promptList = promptList.filter(p => onlyTickers.includes(p.ticker));
+    console.log(`  🎯 Scan restricted to movers: ${promptList.map(p => p.ticker).join(", ") || "none"}`);
+  }
+  const usableExp = await tickersWithUsableExpiry(promptList.map(p => p.ticker));
+  if (usableExp) promptList = promptList.filter(p => usableExp.has(p.ticker));
+  if (!promptList.length) {
+    console.log(`  ⏭ No candidate tickers have an expiry in the ${MANDATE.targetMinDTE}–${MANDATE.targetMaxDTE} DTE window — nothing to propose.`);
+    return [];
+  }
+
   const prompt = buildTradePrompt({
-    today, optionable, regime, spyChange, sectorHealth,
+    today, optionable: promptList, regime, spyChange, sectorHealth,
     weakSectors, earningsWarnings, effectiveMin,
     broadWeakness, weakTickers,
   });
@@ -3474,7 +3534,7 @@ async function opportunisticScan() {
   // Generate a trade recommendation using the same AI + mandate logic
   let trades = [];
   try {
-    trades = await generateTrades(portfolioData, { spyChange: spyNow, regime, broadWeakness: oppBroadWeakness, weakTickers: oppWeakTickers });
+    trades = await generateTrades(portfolioData, { spyChange: spyNow, regime, broadWeakness: oppBroadWeakness, weakTickers: oppWeakTickers, onlyTickers: safeMovers.map(p => p.ticker) });
   } catch(e) {
     console.log(`  ✗ Opportunistic scan generation failed: ${e.message}`);
     return;
