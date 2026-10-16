@@ -192,6 +192,9 @@ const MANDATE = {
   broadWeaknessThreshold: 4, // if this many tickers have consecutive stop losses, AI
                            // prompt is flagged bearish (favour puts over calls).
   callBlockThreshold:  6,  // if this many tickers are in downtrend, block ALL Long Calls
+  downtrendMinBreachPct: 2, // a stop breach only counts as a "downtrend day" when price is at least
+                            // this % BELOW the stop. Oct 15: PANW missed its stop by 0.02% and AMZN
+                            // by 0.6% — both counted, pushing the tally to 7 and blocking every call.
                            // regardless of score. When 6+ names are hitting stop loss
                            // simultaneously the market is in risk-off regime — calls
                            // are structurally wrong. Sep 2026 confirmed: HOOD, NVDA,
@@ -226,11 +229,12 @@ const MANDATE = {
 // Previously only the AI's target cost was lowered, so a single contract costing
 // up to $1,000 could still be bought and the midday scan ignored validation mode.
 // A strict $250 cap would reject nearly every contract (a 3–7% OTM, 10–14 DTE
-// option on a $200+ stock usually costs $300–$800), so the default is $500;
-// set VALIDATION_MAX_TRADE in Railway to change it.
+// option on a $200+ stock usually costs $300–$800), so the default is $750
+// (raised from $500 on Oct 16: the cap was blocking MRVL $970 / CRWD $530 / CRWD $690);
+// a VALIDATION_MAX_TRADE variable in Railway overrides it.
 if (MANDATE.validationMode) {
-  const cap = parseInt(process.env.VALIDATION_MAX_TRADE || "500", 10);
-  MANDATE.maxPerTrade    = Math.max(MANDATE.minPerTrade, Number.isFinite(cap) ? cap : 500);
+  const cap = parseInt(process.env.VALIDATION_MAX_TRADE || "750", 10);
+  MANDATE.maxPerTrade    = Math.max(MANDATE.minPerTrade, Number.isFinite(cap) ? cap : 750);
   MANDATE.maxOpenPositions = 1;
   MANDATE.dailyCapMax    = Math.min(MANDATE.dailyCapMax, MANDATE.maxPerTrade * 2);
   MANDATE.dailyCapMin    = Math.min(MANDATE.dailyCapMin, MANDATE.maxPerTrade);
@@ -360,6 +364,10 @@ const state = {
   tradeStats:         {},   // per-strategy win/loss tracking
   downtrendCount:     {},   // { ticker: { count: N, lastDate: "YYYY-MM-DD" } }
   vixHistory:         [],   // last 5 daily VIX readings — used to detect trending direction
+  closeHistory:       {},   // { ticker: [{ d:"YYYY-MM-DD", c: prevClose }] } — one official close per
+                            // trading day (the quote's prev-close), newest last, max 40. Feeds the
+                            // RSI(14) SHADOW log only — RSI is recorded with each entry, never used
+                            // in a trade decision.
   momentumTickers:    {},   // { ticker: isoTimestamp } — names with TARGET_HIT or BIG_MOVE
                             // in last 24h. Used by the momentum gate in morningSession.
                             // Entries expire automatically (24h check at gate evaluation).
@@ -434,6 +442,7 @@ function saveState() {
       dynamicLevels:              state.dynamicLevels,
       weeklyHighs:                state.weeklyHighs,
       vixHistory:                 state.vixHistory,
+      closeHistory:               state.closeHistory,
       momentumTickers:            state.momentumTickers,
       alertsSent:                 [...state.alertsSent],
       savedAt:                    new Date().toISOString(),
@@ -484,6 +493,7 @@ function loadState() {
       if (n) console.log(`  🧹 Cleared ${n} stale downtrend counter(s) (one-time migration)`);
     }
     state.vixHistory       = persisted.vixHistory     || [];
+    state.closeHistory     = persisted.closeHistory   || {};
     state.momentumTickers   = persisted.momentumTickers || {};
     // Drop momentum entries recorded outside market hours (stale after-hours prices).
     for (const [t, ts] of Object.entries(state.momentumTickers)) {
@@ -766,6 +776,104 @@ async function tickersWithUsableExpiry(tickers) {
   return usable;
 }
 
+// ── AFFORDABILITY PRE-FILTER ────────────────────────────────────
+// Price the exact strike buildOptionsLegs would buy (first strike inside the OTM band,
+// nearest the money, ask > 0, first expiry inside the DTE window) for every candidate, on
+// both sides. The AI cannot see option prices, so on Oct 15 it proposed MRVL at $970 against
+// a $500 cap and the bot took no trade. Returns Map ticker → { call, put } = cost of ONE
+// contract in dollars (null = no buyable strike on that side, or its spread is wider than
+// maxSpreadPct — callWhy/putWhy say which). A ticker whose lookup fails
+// is simply absent from the map (fail open); returns null if every lookup failed.
+async function optionAffordability(stocks) {
+  const todayUTC = new Date(new Date().toISOString().slice(0, 10) + "T00:00:00Z");
+  const out = new Map();
+  let failed = 0;
+  const queue = stocks.filter(s => s.price > 0);
+  const total = queue.length;
+  const worker = async () => {
+    while (queue.length) {
+      const { ticker, price } = queue.shift();
+      try {
+        const nested   = await getNestedExpirations(ticker);
+        const dates    = [...new Set(nested.map(e => e["expiration-date"]))].sort();
+        const expDate  = dates.find(e => { const d = dteOf(e, todayUTC); return d >= MANDATE.targetMinDTE && d <= MANDATE.targetMaxDTE; });
+        if (!expDate) continue;                       // the expiry filter already handles this
+        const exp      = nested.find(e => e["expiration-date"] === expDate);
+        const strikes  = (exp?.strikes || []).map(s => ({ k: parseFloat(s["strike-price"]), call: s.call, put: s.put }));
+        const callBand = strikes.filter(s => s.call && s.k >= price * (1 + MANDATE.otmPctMin/100) && s.k <= price * (1 + MANDATE.otmPctMax/100)).sort((a,b) => a.k - b.k);
+        const putBand  = strikes.filter(s => s.put  && s.k <= price * (1 - MANDATE.otmPctMin/100) && s.k >= price * (1 - MANDATE.otmPctMax/100)).sort((a,b) => b.k - a.k);
+        const syms     = [...callBand.map(s => s.call), ...putBand.map(s => s.put)];
+        if (!syms.length) { out.set(ticker, { call: null, put: null }); continue; }
+        const quotes = await getQuotes(syms);
+        if (!quotes.length) { failed++; continue; }   // no data at all → unknown, keep the ticker
+        const quoteOf = {};
+        for (const q of quotes) quoteOf[q.symbol] = q;
+        // Same pick as buildOptionsLegs (first strike in the band with an ask), then the same
+        // spread gate as passesLiquidity — so a name whose strike would be rejected for a wide
+        // spread (CRWD put 16.9% on Oct 16) is dropped here instead of wasting the AI's pick.
+        const pick = (band, key) => {
+          for (const s of band) {
+            const q = quoteOf[fromTastySymbol(s[key])];
+            if (!(q?.ask > 0)) continue;
+            const cost = Math.round(q.ask * 100);
+            if (BROKER.sandbox) return { cost, why: null };
+            if (!(q.bid > 0)) return { cost: null, why: "no bid" };
+            const spr = ((q.ask - q.bid) / ((q.ask + q.bid) / 2)) * 100;
+            return spr > MANDATE.maxSpreadPct
+              ? { cost: null, why: `spread ${spr.toFixed(0)}%` }
+              : { cost, why: null };
+          }
+          return { cost: null, why: null };
+        };
+        const c = pick(callBand, "call"), p = pick(putBand, "put");
+        out.set(ticker, { call: c.cost, put: p.cost, callWhy: c.why, putWhy: p.why });
+      } catch (_) { failed++; }
+    }
+  };
+  await Promise.all([worker(), worker(), worker(), worker()]);
+  if (failed >= total && out.size === 0) return null;
+  return out;
+}
+
+// ── RSI(14) SHADOW LOG ──────────────────────────────────────────
+// Records one official close per trading day (the quote's prev-close) and computes Wilder
+// RSI(14) from them plus the live price as the newest bar. Used ONLY to log RSI next to each
+// entry so 30–50 trades can show whether an RSI filter would have helped. It never changes a
+// trade decision. Needs 15 closes, so it reads n/a for about three weeks after first deploy.
+function recordDailyCloses(stocks) {
+  const today = new Date().toISOString().slice(0, 10);
+  for (const s of stocks) {
+    if (!(s.prevClose > 0)) continue;
+    const h = state.closeHistory[s.ticker] || (state.closeHistory[s.ticker] = []);
+    if (h.length && h[h.length - 1].d === today) continue;
+    h.push({ d: today, c: s.prevClose });
+    if (h.length > 40) h.shift();
+  }
+}
+function rsi14(ticker, livePrice = null) {
+  const c = (state.closeHistory[ticker] || []).map(x => x.c);
+  if (livePrice > 0) c.push(livePrice);
+  if (c.length < 15) return null;
+  let g = 0, l = 0;
+  for (let i = 1; i <= 14; i++) { const d = c[i] - c[i-1]; if (d >= 0) g += d; else l -= d; }
+  let ag = g / 14, al = l / 14;
+  for (let i = 15; i < c.length; i++) {
+    const d = c[i] - c[i-1];
+    ag = (ag * 13 + Math.max(d, 0)) / 14;
+    al = (al * 13 + Math.max(-d, 0)) / 14;
+  }
+  if (al === 0) return ag === 0 ? 50 : 100;
+  return Math.round((100 - 100 / (1 + ag / al)) * 10) / 10;
+}
+function logEntryRSI(ticker, price) {
+  const rsi = rsi14(ticker, price);
+  const have = (state.closeHistory[ticker] || []).length;
+  console.log(rsi == null
+    ? `  📊 ${ticker} RSI(14) at entry: n/a (${have} daily closes stored, 14 needed) — shadow log only`
+    : `  📊 ${ticker} RSI(14) at entry: ${rsi} — shadow log only, not used in decisions`);
+  return rsi;
+}
+
 async function buildOptionsLegs(tradeRec, stockPrice, regime = null) {
   const { ticker, strategy } = tradeRec;
   try {
@@ -965,6 +1073,7 @@ async function fetchAllPrices() {
       const data = {
         ticker:    stock.ticker,
         price:     parseFloat(q.last),
+        prevClose: q.prevClose ?? null,
         change:    parseFloat(q.change ?? 0),
         changePct: parseFloat(q.change_percentage ?? 0),
         volume:    parseInt(q.volume ?? 0),
@@ -974,6 +1083,7 @@ async function fetchAllPrices() {
       state.priceCache[stock.ticker] = { ts: now, data };
       results.push({ ...stock, ...data });
     }
+    recordDailyCloses(results);
     console.log(`  ✓ Prices: ${results.length}/${PORTFOLIO.length}`);
     return results;
   } catch(e) {
@@ -1311,6 +1421,7 @@ async function getQuotes(symbols) {
           mark:              mark ?? last,
           bid:               numOrNull(q.bid) ?? 0,
           ask:               numOrNull(q.ask) ?? 0,
+          prevClose:         prevClose ?? null,
           change:            prevClose ? last - prevClose : 0,
           change_percentage: prevClose ? ((last - prevClose) / prevClose) * 100 : 0,
           volume:            Math.round(numOrNull(q.volume) ?? 0),
@@ -1889,7 +2000,7 @@ const HIGH_BETA_MIN_SCORE    = 9;  // high-beta: NVDA, TSLA, CRWD, COIN, HOOD, A
 // ── PROMPT BUILDER ────────────────────────────────────────────
 function buildTradePrompt({ today, optionable, regime, spyChange, sectorHealth,
                             weakSectors, earningsWarnings, effectiveMin,
-                            broadWeakness = false, weakTickers = [] }) {
+                            broadWeakness = false, weakTickers = [], optionCosts = null }) {
   const priceLines = optionable.map(p => {
     const health       = sectorHealth[p.ticker];
     const sectorNote   = !health?.healthy ? " ⚠️ SECTOR WEAK" : "";
@@ -1902,7 +2013,10 @@ function buildTradePrompt({ today, optionable, regime, spyChange, sectorHealth,
           : ` | ${pctFromHigh}% from week high`)
       : "";
     const highBetaNote = HIGH_BETA_TICKERS.includes(p.ticker) ? ` | HIGH-BETA (score≥${HIGH_BETA_MIN_SCORE})` : "";
-    return `${p.ticker}: $${p.price?.toFixed(2)} ${(p.changePct||0)>=0?"▲":"▼"}${Math.abs(p.changePct||0).toFixed(2)}% | IV:${p.ivProfile} | ${p.sector}${momentumNote}${sectorNote}${highBetaNote}`;
+    const oc = optionCosts?.get(p.ticker);
+    const fmt = (c, why) => c == null ? `n/a${why ? " (" + why + ")" : ""}` : c > MANDATE.maxPerTrade ? `$${c} ✗over cap` : `$${c}`;
+    const costNote = oc ? ` | 1 contract: call ${fmt(oc.call, oc.callWhy)}, put ${fmt(oc.put, oc.putWhy)}` : "";
+    return `${p.ticker}: $${p.price?.toFixed(2)} ${(p.changePct||0)>=0?"▲":"▼"}${Math.abs(p.changePct||0).toFixed(2)}% | IV:${p.ivProfile} | ${p.sector}${momentumNote}${sectorNote}${highBetaNote}${costNote}`;
   }).join("\n");
 
   const regimeNote =
@@ -1936,6 +2050,7 @@ ${openList}
 
 LIVE PRICES (${optionable.length} stocks):
 ${priceLines}
+${optionCosts ? `"1 contract" is the real cost of the exact option the bot would buy on that side. Only propose a side that is NOT marked "✗over cap" or "n/a" — those are rejected automatically.\n` : ""}
 
 ${weakSectors.length > 0 ? "⚠️ WEAK SECTORS:\n" + weakSectors.join("\n") + "\n" : ""}${earningsWarnings.length ? "⚠️ EARNINGS WITHIN 5 DAYS (skip — IV inflated for buying):\n" + earningsWarnings.join(", ") : "No earnings this week"}
 
@@ -2216,10 +2331,34 @@ async function generateTrades(portfolioData, preComputedRegime = null) {
     return [];
   }
 
+  // Affordability: price the strike the bot would actually buy on each side, drop names where
+  // neither side fits the per-trade cap, and show the AI the real per-contract cost.
+  const afford = await optionAffordability(promptList);
+  if (afford) {
+    const cap     = MANDATE.maxPerTrade;
+    const fits    = c => c != null && c <= cap;
+    const dropped = [];
+    promptList = promptList.filter(p => {
+      const a = afford.get(p.ticker);
+      if (!a) return true;                                   // unknown → keep
+      if (fits(a.call) || fits(a.put)) return true;
+      const side = (cost, why) => cost != null ? "$" + cost : (why || "–");
+      dropped.push(`${p.ticker}(C ${side(a.call, a.callWhy)}/P ${side(a.put, a.putWhy)})`);
+      return false;
+    });
+    console.log(`  💵 Affordability (cap $${cap}, spread ≤${MANDATE.maxSpreadPct}%): ${promptList.length} name(s) have a buyable call or put${dropped.length ? ` — dropped (over cap / wide spread): ${dropped.join(", ")}` : ""}`);
+  } else {
+    console.log(`  💵 Affordability check unavailable (quote lookups failed) — not filtering`);
+  }
+  if (!promptList.length) {
+    console.log(`  ⏭ Nothing affordable under the $${MANDATE.maxPerTrade} cap — no proposal.`);
+    return [];
+  }
+
   const prompt = buildTradePrompt({
     today, optionable: promptList, regime, spyChange, sectorHealth,
     weakSectors, earningsWarnings, effectiveMin,
-    broadWeakness, weakTickers,
+    broadWeakness, weakTickers, optionCosts: afford,
   });
 
   // max_tokens raised from 1000 → 3000 → 8192.
@@ -2291,8 +2430,21 @@ async function generateTrades(portfolioData, preComputedRegime = null) {
   const dtNames = Object.entries(state.downtrendCount).filter(([, dc]) => dc.count >= 1).map(([t, dc]) => `${t}(${dc.count}d)`);
   console.log(`  🧮 Call/put audit — downtrend names: ${dtNames.length} [${dtNames.join(", ") || "none"}] (calls need score 9 at ≥${MANDATE.broadWeaknessThreshold}, blocked at ≥${MANDATE.callBlockThreshold}) | broadWeakness: ${broadWeakness}`);
   console.log(`  🧮 AI proposed: ${tally(parsed)} — ${parsed.map(t => `${t.ticker} ${t.strategy === "Long Call" ? "C" : "P"}(${t.setupScore ?? t.score ?? "?"})`).join(", ") || "none"}`);
-  const kept = normaliseAndFilterTrades(parsed, effectiveMin, { broadWeakness });
+  let kept = normaliseAndFilterTrades(parsed, effectiveMin, { broadWeakness });
   console.log(`  🧮 After filters: ${tally(kept)}`);
+  // Drop any proposal on a side that doesn't fit the cap (the AI was told, but check anyway).
+  if (afford) {
+    kept = kept.filter(t => {
+      const a = afford.get(t.ticker);
+      if (!a) return true;
+      const c = t.strategy === "Long Call" ? a.call : a.put;
+      if (c == null || c > MANDATE.maxPerTrade) {
+        console.log(`  🚫 Blocked ${t.ticker} ${t.strategy} — one contract ${c == null ? "has no buyable strike (" + ((t.strategy === "Long Call" ? a.callWhy : a.putWhy) || "none in band") + ")" : "costs $" + c} (cap $${MANDATE.maxPerTrade})`);
+        return false;
+      }
+      return true;
+    });
+  }
   return kept;
 }
 
@@ -2315,6 +2467,14 @@ function effectiveTargetFor(stock) {
   if (ok(dynamic))      return dynamic;
   if (ok(stock.target)) return stock.target;
   return null;
+}
+
+// A STOP_LOSS only counts toward the downtrend tally when price is meaningfully below the
+// stop. Oct 15: PANW was 0.02% under its stop and AMZN 0.6% — both counted.
+const shallowBreachLogged = new Set();
+function isDeepBreach(stock) {
+  const stop = getStopLoss(stock.ticker, stock.stopLoss);
+  return !!stop && stock.price <= stop * (1 - MANDATE.downtrendMinBreachPct / 100);
 }
 
 function detectAlerts(stock) {
@@ -3384,7 +3544,8 @@ async function morningSession() {
       // Use what actually filled (live): quantity and cost can differ from the plan
       // after a partial fill or price improvement.
       const fill = applyFill(legs, result);
-      const ex = { ...trade, ...legs, ...fill, orderId:result.orderId||"SANDBOX", executedAt:new Date().toISOString(), executedCost:fill.cost, executedPrice:stockData.price, status:"OPEN" };
+      const entryRSI = logEntryRSI(trade.ticker, stockData.price);
+      const ex = { ...trade, ...legs, ...fill, orderId:result.orderId||"SANDBOX", executedAt:new Date().toISOString(), executedCost:fill.cost, executedPrice:stockData.price, entryRSI, status:"OPEN" };
       executed.push(ex);
       state.openPositions.push(ex);
       state.dailyTrades.push(ex);
@@ -3394,7 +3555,7 @@ async function morningSession() {
         type: "open", ticker: trade.ticker, strategy: trade.strategy,
         expiration: legs.expiration, executedCost: fill.cost,
         collateral: legs.collateral ?? null, executedPrice: stockData.price,
-        orderId: result.orderId || "SANDBOX", source: "morning",
+        orderId: result.orderId || "SANDBOX", source: "morning", entryRSI,
       });
       // Long options: "cost" not "premium/collateral" — you're buying, not selling
       const costLabel = legs.isCredit === false ? "cost" : "premium";
@@ -3573,7 +3734,8 @@ async function opportunisticScan() {
 
   if (result.success) {
     const fill = applyFill(legs, result);
-    const ex = { ...candidate, ...legs, ...fill, orderId:result.orderId, executedAt:new Date().toISOString(), executedCost:fill.cost, executedPrice:stockData.price, status:"OPEN", source:"opportunistic" };
+    const entryRSI = logEntryRSI(candidate.ticker, stockData.price);
+    const ex = { ...candidate, ...legs, ...fill, orderId:result.orderId, executedAt:new Date().toISOString(), executedCost:fill.cost, executedPrice:stockData.price, entryRSI, status:"OPEN", source:"opportunistic" };
     state.openPositions.push(ex);
     state.dailyTrades.push(ex);
     state.totalDeployedToday   += fill.cost;
@@ -3582,7 +3744,7 @@ async function opportunisticScan() {
       type: "open", ticker: candidate.ticker, strategy: candidate.strategy,
       expiration: legs.expiration, executedCost: fill.cost,
       collateral: legs.collateral ?? null, executedPrice: stockData.price,
-      orderId: result.orderId, source: "opportunistic",
+      orderId: result.orderId, source: "opportunistic", entryRSI,
     });
 
     await sendPush(
@@ -3678,6 +3840,14 @@ async function intradayCheck() {
       if (state.downtrendCount[stock.ticker]?.count > 0) {
         console.log(`  📈 ${stock.ticker} downtrend counter reset (TARGET_HIT after ${state.downtrendCount[stock.ticker].count} days)`);
         delete state.downtrendCount[stock.ticker];
+      }
+    } else if (alerts.some(a => a.type === "STOP_LOSS") && !isDeepBreach(stock)) {
+      // Shallow breach (price within downtrendMinBreachPct of the stop): not a real downtrend
+      // day. Leave the counter alone — neither count it nor decay it.
+      const k = `${stock.ticker}|${todayStr}`;
+      if (!shallowBreachLogged.has(k)) {
+        shallowBreachLogged.add(k);
+        console.log(`  ↔ ${stock.ticker} shallow stop breach ($${stock.price.toFixed(2)} vs stop $${getStopLoss(stock.ticker, stock.stopLoss).toFixed(2)}, < ${MANDATE.downtrendMinBreachPct}% below) — not counted as a downtrend day`);
       }
     } else if (alerts.some(a => a.type === "STOP_LOSS")) {
       if (!state.downtrendCount[stock.ticker]) {
