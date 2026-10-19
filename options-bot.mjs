@@ -841,11 +841,16 @@ async function optionAffordability(stocks) {
 // entry so 30–50 trades can show whether an RSI filter would have helped. It never changes a
 // trade decision. Needs 15 closes, so it reads n/a for about three weeks after first deploy.
 function recordDailyCloses(stocks) {
-  const today = new Date().toISOString().slice(0, 10);
+  const now = new Date();
+  const dow = now.getUTCDay();
+  if (dow === 0 || dow === 6) return;               // weekend start-up: prev-close is Friday's, already stored Monday
+  const today = now.toISOString().slice(0, 10);
   for (const s of stocks) {
     if (!(s.prevClose > 0)) continue;
     const h = state.closeHistory[s.ticker] || (state.closeHistory[s.ticker] = []);
     if (h.length && h[h.length - 1].d === today) continue;
+    // Market holiday: the quote's prev-close is unchanged, so skip it rather than store a duplicate bar.
+    if (h.length && h[h.length - 1].c === s.prevClose) continue;
     h.push({ d: today, c: s.prevClose });
     if (h.length > 40) h.shift();
   }
@@ -872,6 +877,20 @@ function logEntryRSI(ticker, price) {
     ? `  📊 ${ticker} RSI(14) at entry: n/a (${have} daily closes stored, 14 needed) — shadow log only`
     : `  📊 ${ticker} RSI(14) at entry: ${rsi} — shadow log only, not used in decisions`);
   return rsi;
+}
+
+// Entry-timing shadow log: how far the stock had ALREADY moved when we bought. Written to the
+// trade log beside RSI so ~15–20 trades can show whether entries after a big move do worse.
+// Never used in a decision.
+function entryContext(ticker, stockData) {
+  const price = stockData?.price;
+  const hi    = state.weeklyHighs[ticker];
+  const ctx = {
+    entryChangePct:    Number.isFinite(stockData?.changePct) ? Math.round(stockData.changePct * 100) / 100 : null,
+    entryPctFromWeekHigh: hi && price ? Math.round(((price - hi) / hi) * 1000) / 10 : null,
+  };
+  console.log(`  📊 ${ticker} entry timing: ${ctx.entryChangePct ?? "?"}% on the day, ${ctx.entryPctFromWeekHigh ?? "?"}% from week high — shadow log only`);
+  return ctx;
 }
 
 async function buildOptionsLegs(tradeRec, stockPrice, regime = null) {
@@ -3545,7 +3564,8 @@ async function morningSession() {
       // after a partial fill or price improvement.
       const fill = applyFill(legs, result);
       const entryRSI = logEntryRSI(trade.ticker, stockData.price);
-      const ex = { ...trade, ...legs, ...fill, orderId:result.orderId||"SANDBOX", executedAt:new Date().toISOString(), executedCost:fill.cost, executedPrice:stockData.price, entryRSI, status:"OPEN" };
+      const entryCtx = entryContext(trade.ticker, stockData);
+      const ex = { ...trade, ...legs, ...fill, orderId:result.orderId||"SANDBOX", executedAt:new Date().toISOString(), executedCost:fill.cost, executedPrice:stockData.price, entryRSI, ...entryCtx, status:"OPEN" };
       executed.push(ex);
       state.openPositions.push(ex);
       state.dailyTrades.push(ex);
@@ -3555,7 +3575,7 @@ async function morningSession() {
         type: "open", ticker: trade.ticker, strategy: trade.strategy,
         expiration: legs.expiration, executedCost: fill.cost,
         collateral: legs.collateral ?? null, executedPrice: stockData.price,
-        orderId: result.orderId || "SANDBOX", source: "morning", entryRSI,
+        orderId: result.orderId || "SANDBOX", source: "morning", entryRSI, ...entryCtx,
       });
       // Long options: "cost" not "premium/collateral" — you're buying, not selling
       const costLabel = legs.isCredit === false ? "cost" : "premium";
@@ -3735,7 +3755,8 @@ async function opportunisticScan() {
   if (result.success) {
     const fill = applyFill(legs, result);
     const entryRSI = logEntryRSI(candidate.ticker, stockData.price);
-    const ex = { ...candidate, ...legs, ...fill, orderId:result.orderId, executedAt:new Date().toISOString(), executedCost:fill.cost, executedPrice:stockData.price, entryRSI, status:"OPEN", source:"opportunistic" };
+    const entryCtx = entryContext(candidate.ticker, stockData);
+    const ex = { ...candidate, ...legs, ...fill, orderId:result.orderId, executedAt:new Date().toISOString(), executedCost:fill.cost, executedPrice:stockData.price, entryRSI, ...entryCtx, status:"OPEN", source:"opportunistic" };
     state.openPositions.push(ex);
     state.dailyTrades.push(ex);
     state.totalDeployedToday   += fill.cost;
@@ -3744,7 +3765,7 @@ async function opportunisticScan() {
       type: "open", ticker: candidate.ticker, strategy: candidate.strategy,
       expiration: legs.expiration, executedCost: fill.cost,
       collateral: legs.collateral ?? null, executedPrice: stockData.price,
-      orderId: result.orderId, source: "opportunistic", entryRSI,
+      orderId: result.orderId, source: "opportunistic", entryRSI, ...entryCtx,
     });
 
     await sendPush(
