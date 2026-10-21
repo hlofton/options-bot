@@ -108,11 +108,13 @@ const MANDATE = {
   // ── Capital ──────────────────────────────────────────────
   dailyCapMin:      1000,  // minimum to deploy per day ($)
   dailyCapMax:      2000,  // maximum to deploy per day ($)
-  minPerTrade:       250,  // minimum cost per option purchase ($) — lowered from $300
+  minPerTrade:       100,  // minimum cost per option purchase ($) — lowered from $250 on Oct 21 2026
+                           // (an NVDA call at $223 was blocked by the old floor). Not lower: below ~$100
+                           // the $0.05 tick and the 12% spread filter make the quotes too noisy to trade.
                            // $300 was rejecting valid $290-$299 setups on a $6 difference.
                            // Quality is controlled by setupScore, not an arbitrary floor.
   maxPerTrade:      1000,  // maximum cost per option purchase ($)
-  minPerTradeLive:   250,  // same floor in live
+  minPerTradeLive:   100,  // same floor in live
 
   // ── Option selection ─────────────────────────────────────
   targetMinDTE:        9,  // Oct 2026: widened from 10–14 to 9–15. Weekly options expire on
@@ -364,6 +366,9 @@ const state = {
   tradeStats:         {},   // per-strategy win/loss tracking
   downtrendCount:     {},   // { ticker: { count: N, lastDate: "YYYY-MM-DD" } }
   vixHistory:         [],   // last 5 daily VIX readings — used to detect trending direction
+  closedToday:        [],   // closed trades from the current ET trading day — feeds the RE-ENTRY shadow tag
+                            // only. [{ day, ticker, strategy, entryAt, entryOptPx, entryUnderlying, exitAt,
+                            // exitType, pnlPct, exitMid, exitSpreadPct, underlyingAtExit, underlyingStop, brokeUnderlyingStop }]
   closeHistory:       {},   // { ticker: [{ d:"YYYY-MM-DD", c: prevClose }] } — one official close per
                             // trading day (the quote's prev-close), newest last, max 40. Feeds the
                             // RSI(14) SHADOW log only — RSI is recorded with each entry, never used
@@ -443,6 +448,7 @@ function saveState() {
       weeklyHighs:                state.weeklyHighs,
       vixHistory:                 state.vixHistory,
       closeHistory:               state.closeHistory,
+      closedToday:                state.closedToday,
       momentumTickers:            state.momentumTickers,
       alertsSent:                 [...state.alertsSent],
       savedAt:                    new Date().toISOString(),
@@ -494,6 +500,7 @@ function loadState() {
     }
     state.vixHistory       = persisted.vixHistory     || [];
     state.closeHistory     = persisted.closeHistory   || {};
+    state.closedToday      = Array.isArray(persisted.closedToday) ? persisted.closedToday : [];
     state.momentumTickers   = persisted.momentumTickers || {};
     // Drop momentum entries recorded outside market hours (stale after-hours prices).
     for (const [t, ts] of Object.entries(state.momentumTickers)) {
@@ -877,6 +884,90 @@ function logEntryRSI(ticker, price) {
     ? `  📊 ${ticker} RSI(14) at entry: n/a (${have} daily closes stored, 14 needed) — shadow log only`
     : `  📊 ${ticker} RSI(14) at entry: ${rsi} — shadow log only, not used in decisions`);
   return rsi;
+}
+
+// ── RE-ENTRY SHADOW TAG (logging only) ──────────────────────────
+// Measures whether a same-day re-entry in the same ticker does worse than a first entry
+// (Oct 21: CRWD call closed on a trail at 1:46 PM, a second CRWD call opened at 3:02 PM).
+// NEVER blocks, delays or alters an order or an exit: every function here swallows its own
+// errors, and the entry tag runs only AFTER the order has been placed.
+const ET_TZ  = "America/New_York";
+const etDay  = d => new Date(d).toLocaleDateString("en-CA", { timeZone: ET_TZ });
+const etTime = d => new Date(d).toLocaleTimeString("en-US", { timeZone: ET_TZ, hour: "numeric", minute: "2-digit" });
+const fmtSignedPct = p => `${p >= 0 ? "+" : ""}${Number(p).toFixed(1)}%`;
+
+function exitTypeOf(closeReason, sweep) {
+  if (/TRAILING/i.test(closeReason))  return "TRAIL";
+  if (/STOP LOSS/i.test(closeReason)) return "STOP";
+  if (/TIME STOP/i.test(closeReason)) return sweep ? "SWEEP" : "TIME";
+  return "OTHER";
+}
+
+// Called once a close has been confirmed. Remembers enough to describe the exit later.
+function recordClosedTrade(ourTrade, g, { currentPct, closeReason, sweep, underlyingPrice }) {
+  try {
+    const now   = Date.now();
+    const today = etDay(now);
+    state.closedToday = (state.closedToday || []).filter(r => r.day === today);   // drop earlier days
+    // Underlying price: the map passed in, else the last price the 5-min check cached (≤10 min old).
+    let uPx = underlyingPrice ?? null;
+    if (uPx == null) {
+      const c = state.priceCache[ourTrade.ticker];
+      if (c && now - c.ts <= 10 * 60 * 1000) uPx = c.data?.price ?? null;
+    }
+    const staticStop = PORTFOLIO.find(p => p.ticker === ourTrade.ticker)?.stopLoss;
+    const uStop = getStopLoss(ourTrade.ticker, staticStop) ?? null;
+    state.closedToday.push({
+      day:               today,
+      ticker:            ourTrade.ticker,
+      strategy:          ourTrade.strategy,
+      entryAt:           ourTrade.executedAt ?? null,
+      entryOptPx:        ourTrade.executedCost / (g.qty * 100),
+      entryUnderlying:   ourTrade.executedPrice ?? null,
+      exitAt:            new Date(now).toISOString(),
+      exitType:          exitTypeOf(closeReason, sweep),
+      pnlPct:            parseFloat(currentPct.toFixed(1)),
+      exitMid:           g.currentValue,
+      exitSpreadPct:     g.spreadPct ?? null,
+      underlyingAtExit:  uPx,
+      underlyingStop:    uStop,
+      brokeUnderlyingStop: uPx != null && uStop != null ? uPx <= uStop : null,
+    });
+  } catch (e) {
+    console.warn(`  ⚠ Re-entry bookkeeping failed for ${ourTrade?.ticker} (${e.message}) — continuing`);
+  }
+}
+
+// Called right after a NEW order has been placed. Returns the fields to store on the trade
+// record ({} when this is a first entry or the lookup failed).
+function reEntryTag(ticker, newOptPx, newUnderlying) {
+  try {
+    const today = etDay(Date.now());
+    const prior = (state.closedToday || [])
+      .filter(r => r.ticker === ticker && r.day === today)
+      .sort((a, b) => (a.exitAt < b.exitAt ? 1 : -1))[0];
+    if (!prior) return {};
+    const mins = Math.round((Date.now() - new Date(prior.exitAt).getTime()) / 60000);
+    const vs   = newUnderlying != null && prior.entryUnderlying != null
+      ? `${newUnderlying > prior.entryUnderlying ? "above" : "below"} ($${Number(newUnderlying).toFixed(2)} vs $${Number(prior.entryUnderlying).toFixed(2)})`
+      : "unknown";
+    console.log(`  🔁 RE-ENTRY: ${ticker} — prior exit ${etTime(prior.exitAt)} (${prior.exitType}, ${fmtSignedPct(prior.pnlPct)}), prior entry $${prior.entryOptPx.toFixed(2)}, prior exit mid $${Number(prior.exitMid).toFixed(2)}, new entry $${Number(newOptPx).toFixed(2)}, minutes since exit ${mins}, stock vs prior entry-day trigger: ${vs}`);
+    if (prior.exitType === "STOP") {
+      const spr = prior.exitSpreadPct != null ? `${Number(prior.exitSpreadPct).toFixed(0)}%` : "unknown";
+      const und = prior.underlyingAtExit == null || prior.underlyingStop == null
+        ? "underlying vs its stop: unknown (no recent price)"
+        : prior.brokeUnderlyingStop
+          ? `underlying BROKE its own stop ($${prior.underlyingAtExit.toFixed(2)} ≤ $${prior.underlyingStop.toFixed(2)}) — a real failure`
+          : `underlying did NOT break its stop ($${prior.underlyingAtExit.toFixed(2)} > $${prior.underlyingStop.toFixed(2)}) — only the option price moved`;
+      const move = prior.underlyingAtExit != null && prior.entryUnderlying
+        ? `, underlying ${fmtSignedPct((prior.underlyingAtExit / prior.entryUnderlying - 1) * 100)} since the prior entry` : "";
+      console.log(`  🔁   prior STOP detail: option spread ${spr} at the stop; ${und}${move}`);
+    }
+    return { reEntry: true, priorExitReason: prior.exitType, priorPnlPct: prior.pnlPct };
+  } catch (e) {
+    console.warn(`  ⚠ Re-entry lookup failed for ${ticker} (${e.message}) — continuing without the tag`);
+    return {};
+  }
 }
 
 // Entry-timing shadow log: how far the stock had ALREADY moved when we bought. Written to the
@@ -2867,7 +2958,7 @@ const CONFIRM_WINDOW_MS   = 150_000; // a prior reading older than this doesn't 
 const NOISY_SPREAD_PCT    = 30;      // quote spread above this % of mid: don't trust it for a new peak
 const CLOSE_RETRY_WAIT_MS = 120_000;
 
-async function monitorOpenPositions(groups, underlyingPriceMap = {}, { fast = false } = {}) {
+async function monitorOpenPositions(groups, underlyingPriceMap = {}, { fast = false, sweep = false } = {}) {
   if (!groups || !groups.length) return;
   if (!fast) console.log(`  Monitoring ${groups.length} open trade(s) (grouped by all legs)...`);
 
@@ -3043,7 +3134,16 @@ async function monitorOpenPositions(groups, underlyingPriceMap = {}, { fast = fa
             isCredit:     ourTrade.isCredit,
             legs:         g.positions.length,
             source:       ourTrade.source ?? "morning",
+            ...(ourTrade.reEntry ? { reEntry: true, priorExitReason: ourTrade.priorExitReason ?? null, priorPnlPct: ourTrade.priorPnlPct ?? null } : {}),
           });
+
+          // Re-entry shadow tag: remember this close for later same-day entries, and label
+          // re-entry closes so they can be compared with first entries. Logging only.
+          recordClosedTrade(ourTrade, g, { currentPct, closeReason, sweep, underlyingPrice: underlyingPriceMap?.[ourTrade.ticker]?.price });
+          const reTagNote = ourTrade.reEntry
+            ? ` [re-entry] (prior exit: ${ourTrade.priorExitReason ?? "?"}${ourTrade.priorPnlPct != null ? ", " + fmtSignedPct(ourTrade.priorPnlPct) : ""})`
+            : "";
+          console.log(`  ◈ POSITION CLOSED${reTagNote}: ${ourTrade.ticker} ${abbrevStrategy(ourTrade.strategy)} — ${closeReason.replace(/[^\w\s%$:—.+\-()]/g, "").trim()} | P&L: ${currentPnL>=0?"+":""}$${currentPnL.toFixed(0)} (${currentPct.toFixed(1)}%)`);
 
           const winRate  = ts.wins + ts.losses > 0 ? ((ts.wins / (ts.wins + ts.losses)) * 100).toFixed(0) : "N/A";
           const avgWin   = ts.wins   > 0 ? (ts.totalWinPnL  / ts.wins).toFixed(0)   : "N/A";
@@ -3053,7 +3153,7 @@ async function monitorOpenPositions(groups, underlyingPriceMap = {}, { fast = fa
             : "";
 
           await sendPush(
-`◈ POSITION CLOSED
+`◈ POSITION CLOSED${reTagNote}
 ${ourTrade.ticker} ${ourTrade.strategy} (${g.positions.length} legs)
 ${closeReason}
 
@@ -3565,7 +3665,8 @@ async function morningSession() {
       const fill = applyFill(legs, result);
       const entryRSI = logEntryRSI(trade.ticker, stockData.price);
       const entryCtx = entryContext(trade.ticker, stockData);
-      const ex = { ...trade, ...legs, ...fill, orderId:result.orderId||"SANDBOX", executedAt:new Date().toISOString(), executedCost:fill.cost, executedPrice:stockData.price, entryRSI, ...entryCtx, status:"OPEN" };
+      const reTag    = reEntryTag(trade.ticker, fill.cost / ((fill.quantity || 1) * 100), stockData.price);
+      const ex = { ...trade, ...legs, ...fill, orderId:result.orderId||"SANDBOX", executedAt:new Date().toISOString(), executedCost:fill.cost, executedPrice:stockData.price, entryRSI, ...entryCtx, ...reTag, status:"OPEN" };
       executed.push(ex);
       state.openPositions.push(ex);
       state.dailyTrades.push(ex);
@@ -3575,7 +3676,7 @@ async function morningSession() {
         type: "open", ticker: trade.ticker, strategy: trade.strategy,
         expiration: legs.expiration, executedCost: fill.cost,
         collateral: legs.collateral ?? null, executedPrice: stockData.price,
-        orderId: result.orderId || "SANDBOX", source: "morning", entryRSI, ...entryCtx,
+        orderId: result.orderId || "SANDBOX", source: "morning", entryRSI, ...entryCtx, ...reTag,
       });
       // Long options: "cost" not "premium/collateral" — you're buying, not selling
       const costLabel = legs.isCredit === false ? "cost" : "premium";
@@ -3756,7 +3857,8 @@ async function opportunisticScan() {
     const fill = applyFill(legs, result);
     const entryRSI = logEntryRSI(candidate.ticker, stockData.price);
     const entryCtx = entryContext(candidate.ticker, stockData);
-    const ex = { ...candidate, ...legs, ...fill, orderId:result.orderId, executedAt:new Date().toISOString(), executedCost:fill.cost, executedPrice:stockData.price, entryRSI, ...entryCtx, status:"OPEN", source:"opportunistic" };
+    const reTag    = reEntryTag(candidate.ticker, fill.cost / ((fill.quantity || 1) * 100), stockData.price);
+    const ex = { ...candidate, ...legs, ...fill, orderId:result.orderId, executedAt:new Date().toISOString(), executedCost:fill.cost, executedPrice:stockData.price, entryRSI, ...entryCtx, ...reTag, status:"OPEN", source:"opportunistic" };
     state.openPositions.push(ex);
     state.dailyTrades.push(ex);
     state.totalDeployedToday   += fill.cost;
@@ -3765,7 +3867,7 @@ async function opportunisticScan() {
       type: "open", ticker: candidate.ticker, strategy: candidate.strategy,
       expiration: legs.expiration, executedCost: fill.cost,
       collateral: legs.collateral ?? null, executedPrice: stockData.price,
-      orderId: result.orderId, source: "opportunistic", entryRSI, ...entryCtx,
+      orderId: result.orderId, source: "opportunistic", entryRSI, ...entryCtx, ...reTag,
     });
 
     await sendPush(
@@ -3958,7 +4060,7 @@ async function preCloseExpirySweep() {
 
   if (expiringGroups.length > 0) {
     const underlyingPriceMap = Object.fromEntries(portfolioData.map(p => [p.ticker, p]));
-    await monitorOpenPositions(expiringGroups, underlyingPriceMap);
+    await monitorOpenPositions(expiringGroups, underlyingPriceMap, { sweep: true });
     console.log(`  ✅ Pre-close sweep complete — ${expiringGroups.length} position(s) processed.`);
   } else {
     console.log(`  ✓ No DTE≤${MANDATE.timeDTE} positions — nothing to force-close.`);
