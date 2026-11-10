@@ -363,6 +363,7 @@ const state = {
   totalDeployedToday: 0,
   dynamicLevels:      {},   // auto-updated stops + targets
   weeklyHighs:        {},   // highest price seen this week
+  shadowWeekHigh:     { week: null, highs: {} }, // logging-only week high per ticker (never read by decisions)
   tradeStats:         {},   // per-strategy win/loss tracking
   downtrendCount:     {},   // { ticker: { count: N, lastDate: "YYYY-MM-DD" } }
   vixHistory:         [],   // last 5 daily VIX readings — used to detect trending direction
@@ -446,6 +447,7 @@ function saveState() {
       _lastResetMonth:           state._lastResetMonth,
       dynamicLevels:              state.dynamicLevels,
       weeklyHighs:                state.weeklyHighs,
+      shadowWeekHigh:             state.shadowWeekHigh,
       vixHistory:                 state.vixHistory,
       closeHistory:               state.closeHistory,
       closedToday:                state.closedToday,
@@ -487,6 +489,7 @@ function loadState() {
     state.openPositions = persisted.openPositions || [];
     state.dynamicLevels = persisted.dynamicLevels || {};
     state.weeklyHighs   = persisted.weeklyHighs   || {};
+    state.shadowWeekHigh = persisted.shadowWeekHigh || { week: null, highs: {} };
     state.tradeStats        = persisted.tradeStats    || {};
     state.downtrendCount    = persisted.downtrendCount || {};
     // One-time migration (2026-10-12): counts built from never-clearing stops (and
@@ -847,6 +850,22 @@ async function optionAffordability(stocks) {
 // RSI(14) from them plus the live price as the newest bar. Used ONLY to log RSI next to each
 // entry so 30–50 trades can show whether an RSI filter would have helped. It never changes a
 // trade decision. Needs 15 closes, so it reads n/a for about three weeks after first deploy.
+// Logging-only week high (Mon–Fri, ET). state.weeklyHighs is never populated by the old code and
+// feeds the AI prompt, so it is left untouched; this separate record only feeds entryContext.
+function recordWeekHighs(stocks) {
+  try {
+    const now = new Date();
+    const etDate = new Date(now.toLocaleString("en-US", { timeZone: "America/New_York" }));
+    const mon = new Date(etDate); mon.setDate(etDate.getDate() - ((etDate.getDay() + 6) % 7));
+    const wk = `${mon.getFullYear()}-${String(mon.getMonth()+1).padStart(2,"0")}-${String(mon.getDate()).padStart(2,"0")}`;
+    if (!state.shadowWeekHigh || state.shadowWeekHigh.week !== wk) state.shadowWeekHigh = { week: wk, highs: {} };
+    for (const s of stocks) {
+      const hi = Math.max(s.price || 0, s.high || 0);
+      if (hi > 0 && hi > (state.shadowWeekHigh.highs[s.ticker] || 0)) state.shadowWeekHigh.highs[s.ticker] = hi;
+    }
+  } catch (e) { /* logging only */ }
+}
+
 function recordDailyCloses(stocks) {
   const now = new Date();
   const dow = now.getUTCDay();
@@ -975,12 +994,28 @@ function reEntryTag(ticker, newOptPx, newUnderlying) {
 // Never used in a decision.
 function entryContext(ticker, stockData) {
   const price = stockData?.price;
-  const hi    = state.weeklyHighs[ticker];
+  const hi    = state.shadowWeekHigh?.highs?.[ticker] ?? null;
+  // Prior-day move: how far the stock moved the session BEFORE today, and the 2-day run into the
+  // entry (today's price vs the close two sessions ago). Answers "are we buying a day late?".
+  // closeHistory stores one { d, c } per trading day where c is the previous session's close.
+  let priorDayChangePct = null, twoDayChangePct = null;
+  try {
+    const h = state.closeHistory[ticker] || [];
+    const yClose = stockData?.prevClose > 0 ? stockData.prevClose : null;   // yesterday's close
+    const today  = new Date().toISOString().slice(0, 10);
+    const rest   = h.length && h[h.length - 1].d === today ? h.slice(0, -1) : h;
+    const base   = rest.length ? rest[rest.length - 1].c : null;            // close two sessions ago
+    if (yClose && base > 0 && base !== yClose) {
+      priorDayChangePct = Math.round(((yClose - base) / base) * 1000) / 10;
+      if (price > 0) twoDayChangePct = Math.round(((price - base) / base) * 1000) / 10;
+    }
+  } catch (e) { /* logging only */ }
   const ctx = {
     entryChangePct:    Number.isFinite(stockData?.changePct) ? Math.round(stockData.changePct * 100) / 100 : null,
     entryPctFromWeekHigh: hi && price ? Math.round(((price - hi) / hi) * 1000) / 10 : null,
+    priorDayChangePct, twoDayChangePct,
   };
-  console.log(`  📊 ${ticker} entry timing: ${ctx.entryChangePct ?? "?"}% on the day, ${ctx.entryPctFromWeekHigh ?? "?"}% from week high — shadow log only`);
+  console.log(`  📊 ${ticker} entry timing: ${ctx.entryChangePct ?? "?"}% on the day, prior day ${ctx.priorDayChangePct ?? "?"}%, 2-day ${ctx.twoDayChangePct ?? "?"}%, ${ctx.entryPctFromWeekHigh ?? "?"}% from week high — shadow log only`);
   return ctx;
 }
 
@@ -1194,6 +1229,7 @@ async function fetchAllPrices() {
       results.push({ ...stock, ...data });
     }
     recordDailyCloses(results);
+    recordWeekHighs(results);
     console.log(`  ✓ Prices: ${results.length}/${PORTFOLIO.length}`);
     return results;
   } catch(e) {
@@ -1694,6 +1730,19 @@ async function waitForFill(orderId, requestedQty, timeoutMs = MANDATE.fillWaitMs
 }
 
 // Single-leg long options use "Buy to Open" action.
+// Entry fill-vs-mid log (logging only): what we actually paid per share vs the planned limit/mid.
+function entryFillInfo(ticker, legs, result) {
+  try {
+    const plannedQty = legs.quantity || 1;
+    const mid  = legs.limitPrice != null ? parseFloat(legs.limitPrice) : (legs.cost != null ? legs.cost / plannedQty / 100 : null);
+    const fillPx = result.fillPrice ?? null;
+    if (fillPx == null || mid == null) return {};
+    const diff = Math.round((fillPx - mid) * 100) / 100;
+    console.log(`  🧾 ENTRY FILL: ${ticker} filled $${fillPx.toFixed(2)} vs mid/limit $${mid.toFixed(2)} (${diff>=0?"+":""}$${diff.toFixed(2)}/sh)`);
+    return { entryFillPrice: Math.round(fillPx * 100) / 100, entryMidPrice: Math.round(mid * 100) / 100, entryFillDiff: diff };
+  } catch (e) { return {}; }
+}
+
 async function placeOrder(trade) {
   const { ticker, strategy, legs, quantity, limitPrice } = trade;
   console.log(`  📤 Placing ${strategy} on ${ticker} (Tastytrade)...`);
@@ -1767,17 +1816,27 @@ async function closePosition(position) {
     const MAX_TRIES = 3;
     let remaining   = Math.abs(position.quantity);
     let lastOrderId;
+    // Fill-logging only (never affects the close): weighted average fill and the bid/ask at submission.
+    let fillQtySum = 0, fillValueSum = 0;
+    const finalizeFill = (attempt, orderId, bid, ask) => ({
+      orderId, attempt, bid, ask,
+      fillPrice: fillQtySum > 0 ? fillValueSum / fillQtySum : null,
+    });
+    let subBid = null, subAsk = null;
 
     for (let attempt = 1; attempt <= MAX_TRIES; attempt++) {
       try {
+        subBid = null; subAsk = null;
         // Re-quote every attempt so a retry doesn't reuse a stale midpoint.
         // The final attempt goes to market: getting out beats a better price
         // when two limit attempts have already failed to fill.
         let limitPrice;
-        if (attempt < MAX_TRIES) {
-          const quotes = await getQuotes(fromTastySymbol(position.symbol));
-          const q = quotes[0];
-          if (q?.bid != null && q?.ask != null && q.bid > 0) {
+        {
+          let q = null;
+          try { q = (await getQuotes(fromTastySymbol(position.symbol)))[0]; }
+          catch (e) { if (attempt < MAX_TRIES) throw e; /* final market attempt: quote is for logging only */ }
+          if (q?.bid != null && q?.ask != null) { subBid = q.bid; subAsk = q.ask; }
+          if (attempt < MAX_TRIES && q?.bid != null && q?.ask != null && q.bid > 0) {
             // Tastytrade rejects limits off the option tick ($0.05) with 422
             // invalid_price_increment — round the midpoint like the entry path does.
             const mid = (q.bid + q.ask) / 2;
@@ -1802,13 +1861,14 @@ async function closePosition(position) {
         if (orderId && ["Received","Routed","Live","Filled"].includes(status)) {
           lastOrderId = orderId;
           console.log(`  ✅ Tasty close order accepted: ${orderId} (${status}, attempt ${attempt})`);
-          if (BROKER.sandbox) return { success:true, orderId };
+          if (BROKER.sandbox) return { success:true, orderId, ...finalizeFill(attempt, orderId, subBid, subAsk) };
 
           const fill = await waitForFill(orderId, remaining);
+          if (fill.filledQty > 0 && fill.avgPrice != null) { fillQtySum += fill.filledQty; fillValueSum += fill.avgPrice * fill.filledQty; }
           remaining -= fill.filledQty;
           if (remaining <= 0) {
             console.log(`  ✅ Close filled: ${position.symbol}`);
-            return { success:true, orderId };
+            return { success:true, ...finalizeFill(attempt, orderId, subBid, subAsk) };
           }
           console.error(`  ✗ Close attempt ${attempt}: ${remaining} contract(s) of ${position.symbol} still open (${fill.status})`);
         } else {
@@ -2808,6 +2868,7 @@ Not financial advice.`
     if (!quote) { g.missingQuote = true; continue; }
     const legSign = pos.quantity > 0 ? 1 : -1;
     const legMid  = (quote.bid + quote.ask) / 2;
+    g.quoteSig = (g.quoteSig ? g.quoteSig + "|" : "") + `${quote.bid}/${quote.ask}`;
     g.netValue += legSign * legMid;
     g.spreadPct = Math.max(g.spreadPct || 0, legMid > 0 ? ((quote.ask - quote.bid) / legMid) * 100 : 100);
   }
@@ -2851,7 +2912,7 @@ Not financial advice.`
     if (g.missingQuote) { results.push({ ourTrade, positions: g.positions, valid: false }); continue; }
     const qty          = ourTrade.quantity || Math.abs(g.positions[0]?.quantity || 1);
     const currentValue = Math.abs(g.netValue);
-    results.push({ ourTrade, positions: g.positions, valid: true, currentValue, qty, spreadPct: g.spreadPct || 0 });
+    results.push({ ourTrade, positions: g.positions, valid: true, currentValue, qty, spreadPct: g.spreadPct || 0, quoteSig: g.quoteSig || null });
   }
 
   // ── STALE POSITION CLEANUP ─────────────────────────────────────
@@ -3050,17 +3111,29 @@ async function monitorOpenPositions(groups, underlyingPriceMap = {}, { fast = fa
       // ── TWO-READING CONFIRMATION (trail / stop only; time stop is deterministic) ──
       // A first breach is held for one more reading when a recent previous reading exists
       // (i.e. the 30-s watcher is running). If none exists, behaviour is unchanged: exit now.
+      // A confirming reading must come from a NEW quote: if the bid/ask is identical to the
+      // breaching reading's, it is the same (frozen/repeated) quote and does not confirm anything.
       const rawBreach = shouldClose;
       const nowReadMs = Date.now();
       const prevRead  = lastReading.get(ourTrade);
+      const curSig    = g.quoteSig ?? null;
+      let staleHold   = false;
       if (shouldClose && dte > MANDATE.timeDTE) {
         const recentPrev = prevRead && (nowReadMs - prevRead.t) <= CONFIRM_WINDOW_MS;
         if (recentPrev && !prevRead.breached) {
           console.log(`  ⏳ ${ourTrade.ticker}: first breach (${closeReason.slice(0, 60)}) — waiting for a confirming reading`);
           shouldClose = false;
+        } else if (recentPrev && prevRead.breached && curSig && prevRead.sig && curSig === prevRead.sig) {
+          console.log(`  ⏳ ${ourTrade.ticker}: confirmation skipped: stale quote (bid/ask ${curSig} unchanged) — holding, waiting for a fresh quote`);
+          shouldClose = false;
+          staleHold   = true;
         }
       }
-      lastReading.set(ourTrade, { t: nowReadMs, breached: rawBreach });
+      // On a stale hold keep the earlier breaching reading (and its quote) so the next fresh
+      // breaching quote confirms; only the timestamp moves forward.
+      lastReading.set(ourTrade, staleHold
+        ? { t: nowReadMs, breached: true, sig: prevRead.sig }
+        : { t: nowReadMs, breached: rawBreach, sig: curSig });
 
       if (shouldClose) {
         closingNow.add(ourTrade); // synchronous — no await between decision and marker
@@ -3096,6 +3169,28 @@ async function monitorOpenPositions(groups, underlyingPriceMap = {}, { fast = fa
         const allClosed = closeResult.success;
         if (allClosed) {
           ourTrade.closeFailureCount = 0; // reset on success
+          // Fill-based P&L (logging only; the books below still use the mid-based figure).
+          // Single-leg long options only — multileg legacy closes have no single fill.
+          let fillLog = null;
+          try {
+            if (g.positions.length === 1 && closeResult.fillPrice != null && !ourTrade.isCredit) {
+              const q0 = Math.abs(g.positions[0].quantity) || g.qty;
+              const openPx = ourTrade.executedCost / g.qty / 100;
+              const realPnL = (closeResult.fillPrice - openPx) * q0 * 100;
+              const realPct = openPx ? (closeResult.fillPrice - openPx) / openPx * 100 : 0;
+              fillLog = {
+                closeFillPrice: Math.round(closeResult.fillPrice * 100) / 100,
+                closeBid: closeResult.bid ?? null, closeAsk: closeResult.ask ?? null,
+                closeOrderId: closeResult.orderId ?? null, closeAttempt: closeResult.attempt ?? null,
+                midPnL: Math.round(currentPnL), realPnL: Math.round(realPnL),
+                realPnlPct: parseFloat(realPct.toFixed(1)),
+                fillDiff: Math.round(realPnL - currentPnL),
+              };
+              console.log(`  🧾 CLOSE FILL: ${ourTrade.ticker} filled $${fillLog.closeFillPrice} (bid ${fillLog.closeBid ?? "?"} / ask ${fillLog.closeAsk ?? "?"} at submit) order ${fillLog.closeOrderId} attempt ${fillLog.closeAttempt} | real P&L ${realPnL>=0?"+":""}$${realPnL.toFixed(0)} (${realPct.toFixed(1)}%) vs mid ${currentPnL>=0?"+":""}$${currentPnL.toFixed(0)} (${currentPct.toFixed(1)}%) | diff ${fillLog.fillDiff>=0?"+":""}$${fillLog.fillDiff}`);
+            } else {
+              console.log(`  🧾 CLOSE FILL: ${ourTrade.ticker} fill price not available (order ${closeResult.orderId ?? "?"}) — mid-based P&L only`);
+            }
+          } catch (e) { console.log(`  ⚠ fill log failed: ${e.message}`); }
           state.dailyPnL   += currentPnL;
           state.weeklyPnL  += currentPnL;
           state.monthlyPnL += currentPnL;
@@ -3134,6 +3229,7 @@ async function monitorOpenPositions(groups, underlyingPriceMap = {}, { fast = fa
             isCredit:     ourTrade.isCredit,
             legs:         g.positions.length,
             source:       ourTrade.source ?? "morning",
+            ...(fillLog || {}),
             ...(ourTrade.reEntry ? { reEntry: true, priorExitReason: ourTrade.priorExitReason ?? null, priorPnlPct: ourTrade.priorPnlPct ?? null } : {}),
           });
 
@@ -3157,7 +3253,7 @@ async function monitorOpenPositions(groups, underlyingPriceMap = {}, { fast = fa
 ${ourTrade.ticker} ${ourTrade.strategy} (${g.positions.length} legs)
 ${closeReason}
 
-P&L: ${currentPnL>=0?"+":""}$${currentPnL.toFixed(0)} (${currentPct.toFixed(1)}%)
+P&L: ${currentPnL>=0?"+":""}$${currentPnL.toFixed(0)} (${currentPct.toFixed(1)}%)${fillLog ? `\nFill: $${fillLog.closeFillPrice} → real ${fillLog.realPnL>=0?"+":""}$${fillLog.realPnL} (${fillLog.realPnlPct}%)` : ""}
 
 TODAY:   ${state.dailyPnL>=0?"+":""}$${state.dailyPnL.toFixed(0)}
 WEEK:    ${state.weeklyPnL>=0?"+":""}$${state.weeklyPnL.toFixed(0)}
@@ -3244,15 +3340,17 @@ async function getFastGroups() {
       quantity: (String(l.side || "").startsWith("buy") ? 1 : -1) * qty,
     }));
     let net = 0, spreadPct = 0, valid = true;
+    const sigParts = [];
     for (const p of positions) {
       const q = quoteMap[p.symbol];
       if (!q || q.bid == null || q.ask == null || !(q.ask > 0)) { valid = false; break; }
+      sigParts.push(`${q.bid}/${q.ask}`);
       const mid = (q.bid + q.ask) / 2;
       net += (p.quantity > 0 ? 1 : -1) * mid;
       spreadPct = Math.max(spreadPct, mid > 0 ? ((q.ask - q.bid) / mid) * 100 : 100);
     }
     if (!valid) return { ourTrade, positions, valid: false };
-    return { ourTrade, positions, valid: true, currentValue: Math.abs(net), qty, spreadPct };
+    return { ourTrade, positions, valid: true, currentValue: Math.abs(net), qty, spreadPct, quoteSig: sigParts.join("|") };
   });
 }
 
@@ -3666,7 +3764,8 @@ async function morningSession() {
       const entryRSI = logEntryRSI(trade.ticker, stockData.price);
       const entryCtx = entryContext(trade.ticker, stockData);
       const reTag    = reEntryTag(trade.ticker, fill.cost / ((fill.quantity || 1) * 100), stockData.price);
-      const ex = { ...trade, ...legs, ...fill, orderId:result.orderId||"SANDBOX", executedAt:new Date().toISOString(), executedCost:fill.cost, executedPrice:stockData.price, entryRSI, ...entryCtx, ...reTag, status:"OPEN" };
+      const entryFill = entryFillInfo(trade.ticker, legs, result);
+      const ex = { ...trade, ...legs, ...fill, orderId:result.orderId||"SANDBOX", executedAt:new Date().toISOString(), executedCost:fill.cost, executedPrice:stockData.price, entryRSI, ...entryCtx, ...reTag, ...entryFill, status:"OPEN" };
       executed.push(ex);
       state.openPositions.push(ex);
       state.dailyTrades.push(ex);
@@ -3676,7 +3775,7 @@ async function morningSession() {
         type: "open", ticker: trade.ticker, strategy: trade.strategy,
         expiration: legs.expiration, executedCost: fill.cost,
         collateral: legs.collateral ?? null, executedPrice: stockData.price,
-        orderId: result.orderId || "SANDBOX", source: "morning", entryRSI, ...entryCtx, ...reTag,
+        orderId: result.orderId || "SANDBOX", source: "morning", entryRSI, ...entryCtx, ...reTag, ...entryFill,
       });
       // Long options: "cost" not "premium/collateral" — you're buying, not selling
       const costLabel = legs.isCredit === false ? "cost" : "premium";
@@ -3858,7 +3957,8 @@ async function opportunisticScan() {
     const entryRSI = logEntryRSI(candidate.ticker, stockData.price);
     const entryCtx = entryContext(candidate.ticker, stockData);
     const reTag    = reEntryTag(candidate.ticker, fill.cost / ((fill.quantity || 1) * 100), stockData.price);
-    const ex = { ...candidate, ...legs, ...fill, orderId:result.orderId, executedAt:new Date().toISOString(), executedCost:fill.cost, executedPrice:stockData.price, entryRSI, ...entryCtx, ...reTag, status:"OPEN", source:"opportunistic" };
+    const entryFill = entryFillInfo(candidate.ticker, legs, result);
+    const ex = { ...candidate, ...legs, ...fill, orderId:result.orderId, executedAt:new Date().toISOString(), executedCost:fill.cost, executedPrice:stockData.price, entryRSI, ...entryCtx, ...reTag, ...entryFill, status:"OPEN", source:"opportunistic" };
     state.openPositions.push(ex);
     state.dailyTrades.push(ex);
     state.totalDeployedToday   += fill.cost;
@@ -3867,7 +3967,7 @@ async function opportunisticScan() {
       type: "open", ticker: candidate.ticker, strategy: candidate.strategy,
       expiration: legs.expiration, executedCost: fill.cost,
       collateral: legs.collateral ?? null, executedPrice: stockData.price,
-      orderId: result.orderId, source: "opportunistic", entryRSI, ...entryCtx, ...reTag,
+      orderId: result.orderId, source: "opportunistic", entryRSI, ...entryCtx, ...reTag, ...entryFill,
     });
 
     await sendPush(
