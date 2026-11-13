@@ -237,8 +237,10 @@ const MANDATE = {
 if (MANDATE.validationMode) {
   const cap = parseInt(process.env.VALIDATION_MAX_TRADE || "750", 10);
   MANDATE.maxPerTrade    = Math.max(MANDATE.minPerTrade, Number.isFinite(cap) ? cap : 750);
-  MANDATE.maxOpenPositions = 1;
-  MANDATE.dailyCapMax    = Math.min(MANDATE.dailyCapMax, MANDATE.maxPerTrade * 2);
+  // Max concurrent positions in validation mode: VALIDATION_MAX_POSITIONS in Railway (default 1, range 1–3).
+  const posCap = parseInt(process.env.VALIDATION_MAX_POSITIONS || "1", 10);
+  MANDATE.maxOpenPositions = Number.isFinite(posCap) ? Math.min(3, Math.max(1, posCap)) : 1;
+  MANDATE.dailyCapMax    = Math.min(MANDATE.dailyCapMax, MANDATE.maxPerTrade * Math.max(2, MANDATE.maxOpenPositions));
   MANDATE.dailyCapMin    = Math.min(MANDATE.dailyCapMin, MANDATE.maxPerTrade);
 }
 
@@ -3580,10 +3582,10 @@ async function morningSession() {
   await brokerLogin();
 
   // Validation mode: cap exposure while testing Tastytrade integration
-  const effectiveMaxPositions = MANDATE.validationMode ? 1 : MANDATE.maxOpenPositions;
+  const effectiveMaxPositions = MANDATE.maxOpenPositions; // validation mode already set it at startup
   const effectiveMaxTrade     = MANDATE.maxPerTrade; // already tightened at startup in validation mode
   if (MANDATE.validationMode) {
-    console.log(`  ⚠ VALIDATION MODE: max ${MANDATE.maxOpenPositions} position, $${MANDATE.maxPerTrade}/trade, $${MANDATE.dailyCapMax}/day — full limits resume after validation`);
+    console.log(`  ⚠ VALIDATION MODE: max ${MANDATE.maxOpenPositions} position(s), $${MANDATE.maxPerTrade}/trade, $${MANDATE.dailyCapMax}/day — full limits resume after validation`);
   }
 
   state.dailyTrades               = [];
