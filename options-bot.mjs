@@ -107,13 +107,13 @@ function fetchWithTimeout(url, opts = {}, timeoutMs = HTTP_TIMEOUT_MS) {
 const MANDATE = {
   // ── Capital ──────────────────────────────────────────────
   dailyCapMin:      1000,  // minimum to deploy per day ($)
-  dailyCapMax:      2000,  // maximum to deploy per day ($)
+  dailyCapMax:      3300,  // maximum to deploy per day ($) — raised from $2,000 on Nov 18 2026
   minPerTrade:       100,  // minimum cost per option purchase ($) — lowered from $250 on Oct 21 2026
                            // (an NVDA call at $223 was blocked by the old floor). Not lower: below ~$100
                            // the $0.05 tick and the 12% spread filter make the quotes too noisy to trade.
                            // $300 was rejecting valid $290-$299 setups on a $6 difference.
                            // Quality is controlled by setupScore, not an arbitrary floor.
-  maxPerTrade:      1000,  // maximum cost per option purchase ($)
+  maxPerTrade:      1100,  // maximum cost per option purchase ($) — raised from $1,000 on Nov 18 2026
   minPerTradeLive:   100,  // same floor in live
 
   // ── Option selection ─────────────────────────────────────
@@ -201,12 +201,12 @@ const MANDATE = {
                            // simultaneously the market is in risk-off regime — calls
                            // are structurally wrong. Sep 2026 confirmed: HOOD, NVDA,
                            // META calls all placed/held during 6+ name downtrend periods.
-  dailyMaxLoss:      750,  // circuit breaker: halt new trades if day P&L hits -$750.
+  dailyMaxLoss:     1100,  // circuit breaker: halt new trades if day P&L hits -$1,100 (was $750; scaled x1.47 with the $1,100 trade cap, Nov 18 2026).
                            // Was $2,000 (= dailyCapMax), which only tripped after the whole
                            // day's capital was gone. $750 stops a bad day at roughly one
                            // full stop-out plus change.
-  weeklyMaxLoss:    1500,  // drawdown stop: no new entries once week P&L <= -$1,500.
-  monthlyMaxLoss:   3000,  // drawdown stop: no new entries once month P&L <= -$3,000.
+  weeklyMaxLoss:    2200,  // drawdown stop: no new entries once week P&L <= -$2,200 (was $1,500).
+  monthlyMaxLoss:   4400,  // drawdown stop: no new entries once month P&L <= -$4,400 (was $3,000).
 
   // ── Execution quality (live only) ─────────────────────────
   maxSpreadPct:       12,  // reject strikes whose (ask-bid)/mid exceeds this %.
@@ -235,12 +235,14 @@ const MANDATE = {
 // (raised from $500 on Oct 16: the cap was blocking MRVL $970 / CRWD $530 / CRWD $690);
 // a VALIDATION_MAX_TRADE variable in Railway overrides it.
 if (MANDATE.validationMode) {
-  const cap = parseInt(process.env.VALIDATION_MAX_TRADE || "750", 10);
-  MANDATE.maxPerTrade    = Math.max(MANDATE.minPerTrade, Number.isFinite(cap) ? cap : 750);
+  const cap = parseInt(process.env.VALIDATION_MAX_TRADE || "1100", 10);   // $750 until Nov 18 2026
+  MANDATE.maxPerTrade    = Math.max(MANDATE.minPerTrade, Number.isFinite(cap) ? cap : 1100);
   // Max concurrent positions in validation mode: VALIDATION_MAX_POSITIONS in Railway (default 1, range 1–3).
   const posCap = parseInt(process.env.VALIDATION_MAX_POSITIONS || "1", 10);
   MANDATE.maxOpenPositions = Number.isFinite(posCap) ? Math.min(3, Math.max(1, posCap)) : 1;
-  MANDATE.dailyCapMax    = Math.min(MANDATE.dailyCapMax, MANDATE.maxPerTrade * Math.max(2, MANDATE.maxOpenPositions));
+  // Daily deploy cap in validation mode: VALIDATION_DAILY_CAP in Railway (default $3,300).
+  const dayCap = parseInt(process.env.VALIDATION_DAILY_CAP || "3300", 10);
+  MANDATE.dailyCapMax    = Math.max(MANDATE.maxPerTrade, Number.isFinite(dayCap) ? dayCap : 3300);
   MANDATE.dailyCapMin    = Math.min(MANDATE.dailyCapMin, MANDATE.maxPerTrade);
 }
 
